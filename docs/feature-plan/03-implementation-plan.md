@@ -6,16 +6,16 @@ Authoritative task-level plan (complete code, TDD steps, commit points): `docs/s
 
 | # | Task (plan §) | Files owned | Depends on |
 |---|---|---|---|
-| 1 | Scaffold (Task 1) | package.json, tsconfig.json, .gitignore, tests/smoke.test.ts | — |
+| 1 | Scaffold (Task 1) | package.json, tsconfig.json, tsconfig.test.json, .gitignore, src/types.ts (placeholder), tests/smoke.test.ts | — |
 | 2 | exec boundary + types (Task 2) | src/types.ts, src/exec.ts, tests/exec.test.ts | 1 |
 | 3a | Codex adapter (Task 3) | src/adapters/codex.ts, tests/adapters/codex.test.ts | 2 |
 | 3b | Cursor adapter (Task 4) | src/adapters/cursor.ts, tests/adapters/cursor.test.ts | 2 |
 | 3c | OpenCode adapter (Task 5) | src/adapters/opencode.ts, tests/adapters/opencode.test.ts | 2 |
 | 4 | Registry (Task 6) | src/registry.ts, tests/registry.test.ts | 3a–3c |
 | 5 | Server + run_all (Tasks 7–8) | src/server.ts, tests/server.test.ts | 4 |
-| 6 | Bin entry + README (Task 9) | src/index.ts, README.md | 5 |
+| 6 | Bin entry + guards + README (Task 9) | src/index.ts, tests/constraints.test.ts, README.md | 5 |
 
-Deviation from the plan doc: adapter tests split into `tests/adapters/*.test.ts` (one file per adapter) so workflow agents 3a–3c own disjoint files and run in parallel. Tasks 7 and 8 merge into one agent (same files).
+The plan doc (rev 2) already encodes the per-adapter test files with correct `../../src/...` import depth, the `buildInvocation → {args, stdin?}` adapter contract, and the Task 8 tool-list assertion update — workflow agents 3a–3c own disjoint files and run in parallel. Tasks 7 and 8 merge into one agent (same files).
 
 ## Execution model
 - Orchestrator (main session): git commits after verifying each phase (subagents never commit), phase gating, final verification.

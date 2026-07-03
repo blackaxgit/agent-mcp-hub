@@ -1,10 +1,12 @@
-# agent-mcp-hub Implementation Plan
+# agent-mcp-hub Implementation Plan (rev 2 — post plan-review)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+>
+> **Subagent execution note:** when tasks run as subagents (workflow), SKIP every "Commit" step — subagents never commit; the orchestrator verifies and commits per phase.
 
 **Goal:** Build `agent-mcp-hub` — a single stdio MCP server that lets any MCP client (Claude Code, Cursor, VS Code, …) delegate prompts to the Codex, Cursor, and OpenCode CLI agents, modeled on [tuannvm/codex-mcp-server](https://github.com/tuannvm/codex-mcp-server) but multi-agent.
 
-**Architecture:** Adapter pattern with strict layering. Each CLI agent is a pure adapter (`name` + `binary` + `buildArgs()` — no I/O), all subprocess side effects are isolated in one `exec.ts` boundary module, and `server.ts` wires adapters into MCP tools. Tools exposed: one per agent (`codex`, `cursor`, `opencode`), plus `run_all` (parallel fan-out), `list_agents` (availability probe), and `ping`.
+**Architecture:** Adapter pattern with strict layering. Each CLI agent is a pure adapter (`name` + `binary` + `buildInvocation()` → `{args, stdin?}` — no I/O), all subprocess side effects are isolated in one `exec.ts` boundary module, and `server.ts` wires adapters into MCP tools. Prompts are delivered via stdin where the CLI documents it (codex `-` sentinel, cursor piped print mode) to avoid option-parser injection; opencode takes a positional prompt with a leading-dash guard. Tools exposed: `codex`, `cursor`, `opencode`, `run_all` (parallel fan-out), `list_agents` (availability probe), `ping`.
 
 **Tech Stack:** TypeScript (strict, ESM), Node ≥20, `@modelcontextprotocol/sdk` ^1.29, `zod` ^3.25, `vitest` ^2 for tests, `tsx` for dev, plain `tsc` for build.
 
@@ -12,9 +14,12 @@
 
 - Node engine: `>=20`; `"type": "module"`; TS `strict: true`, module `NodeNext`.
 - Package/bin name: `agent-mcp-hub` (bin: `agent-mcp-hub`).
-- Adapters MUST be pure (no imports of `node:child_process`); the ONLY module that spawns processes is `src/exec.ts`.
+- Adapters MUST be pure (no imports of `node:child_process`); the ONLY module that spawns processes is `src/exec.ts` (guard-tested).
+- Never `shell: true`; prompt travels as one argv element or via stdin.
+- Server never writes to stdout outside the MCP transport; diagnostics go to stderr (guard-tested).
 - Every tool handler must handle success, non-zero exit, spawn failure, and timeout explicitly.
 - Default subprocess timeout: `300_000` ms; availability probes: `10_000` ms.
+- `npm run typecheck` must cover BOTH `src/` and `tests/` (via `tsconfig.test.json`).
 - Commit format: `<type>(<scope>): <subject>`; NO AI signatures or `Co-Authored-By` trailers ever.
 - Never push without the pre-push security gate (gitleaks/trufflehog).
 
@@ -23,23 +28,28 @@
 ```
 agent-mcp-hub/
 ├── package.json              # metadata, deps, bin, scripts
-├── tsconfig.json             # strict ESM NodeNext config
+├── tsconfig.json             # strict ESM NodeNext config (build: src only)
+├── tsconfig.test.json        # typecheck config covering src + tests
 ├── src/
-│   ├── types.ts              # AgentAdapter, AgentRunOptions contracts
+│   ├── types.ts              # AgentAdapter, AgentInvocation, AgentRunOptions
 │   ├── exec.ts               # runCommand() — ONLY subprocess boundary
 │   ├── adapters/
-│   │   ├── codex.ts          # wraps `codex exec …`
-│   │   ├── cursor.ts         # wraps `cursor-agent -p …`
-│   │   └── opencode.ts       # wraps `opencode run …`
+│   │   ├── codex.ts          # `codex exec … -` (prompt via stdin)
+│   │   ├── cursor.ts         # `cursor-agent -p …` (prompt via stdin)
+│   │   └── opencode.ts       # `opencode run … <prompt>` (+ dash guard)
 │   ├── registry.ts           # allAdapters(), checkAvailability()
 │   ├── server.ts             # buildServer() — MCP tool wiring
 │   └── index.ts              # bin entry: stdio transport
 ├── tests/
 │   ├── smoke.test.ts
 │   ├── exec.test.ts
-│   ├── adapters.test.ts
+│   ├── adapters/
+│   │   ├── codex.test.ts     # per-adapter files → disjoint parallel ownership
+│   │   ├── cursor.test.ts
+│   │   └── opencode.test.ts
 │   ├── registry.test.ts
-│   └── server.test.ts
+│   ├── server.test.ts
+│   └── constraints.test.ts   # C1/C5 architecture guard
 └── README.md
 ```
 
@@ -50,21 +60,18 @@ agent-mcp-hub/
 **Files:**
 - Create: `package.json`
 - Create: `tsconfig.json`
+- Create: `tsconfig.test.json`
 - Create: `.gitignore`
+- Create: `src/types.ts` (placeholder — Task 2 fills it)
 - Test: `tests/smoke.test.ts`
 
 **Interfaces:**
 - Consumes: nothing (first task).
 - Produces: a working `npm test` / `npm run typecheck` toolchain every later task relies on.
 
-> Note: this is a brand-new project in an empty directory; `git init` here is authorized by approval of this plan.
+> Note: `git init` was already run by the orchestrator (user-provided repo `git@github.com:blackaxgit/agent-mcp-hub.git`).
 
-- [ ] **Step 1: Initialize repo and npm project**
-
-```bash
-cd /Users/blackax/Projects/mcps/agent-mcp-hub
-git init
-```
+- [ ] **Step 1: Create the project files**
 
 Create `package.json`:
 
@@ -82,7 +89,7 @@ Create `package.json`:
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/index.ts",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc -p tsconfig.test.json"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
@@ -116,6 +123,21 @@ Create `tsconfig.json`:
 }
 ```
 
+Create `tsconfig.test.json` (typechecks tests too; never emits):
+
+```json
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "noEmit": true,
+    "declaration": false,
+    "sourceMap": false
+  },
+  "include": ["src", "tests"]
+}
+```
+
 Create `.gitignore`:
 
 ```
@@ -123,6 +145,12 @@ node_modules/
 dist/
 *.log
 .env
+```
+
+Create placeholder `src/types.ts` (so both tsconfigs have inputs before Task 2):
+
+```ts
+export {};
 ```
 
 - [ ] **Step 2: Install dependencies**
@@ -147,12 +175,12 @@ describe("toolchain smoke", () => {
 - [ ] **Step 4: Run tests and typecheck**
 
 Run: `npm test && npm run typecheck`
-Expected: 1 test PASS, typecheck clean (no `src` files yet is fine — add an empty `src/types.ts` placeholder ONLY if tsc errors on empty include; Task 2 fills it).
+Expected: 1 test PASS, typecheck clean.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Commit** *(skip if running as subagent)*
 
 ```bash
-git add package.json package-lock.json tsconfig.json .gitignore tests/smoke.test.ts
+git add package.json package-lock.json tsconfig.json tsconfig.test.json .gitignore src/types.ts tests/smoke.test.ts
 git commit -m "chore(scaffold): init agent-mcp-hub TypeScript project"
 ```
 
@@ -161,7 +189,7 @@ git commit -m "chore(scaffold): init agent-mcp-hub TypeScript project"
 ### Task 2: Types + Subprocess Boundary (`exec.ts`)
 
 **Files:**
-- Create: `src/types.ts`
+- Modify: `src/types.ts` (replace placeholder)
 - Create: `src/exec.ts`
 - Test: `tests/exec.test.ts`
 
@@ -169,10 +197,12 @@ git commit -m "chore(scaffold): init agent-mcp-hub TypeScript project"
 - Consumes: nothing.
 - Produces:
   - `interface AgentRunOptions { model?: string }`
-  - `interface AgentAdapter { readonly name: string; readonly binary: string; buildArgs(prompt: string, options?: AgentRunOptions): string[] }`
+  - `interface AgentInvocation { args: string[]; stdin?: string }`
+  - `interface AgentAdapter { readonly name: string; readonly binary: string; buildInvocation(prompt: string, options?: AgentRunOptions): AgentInvocation }`
   - `interface ExecResult { stdout: string; stderr: string; exitCode: number | null }`
-  - `type Exec = (binary: string, args: string[], opts?: { cwd?: string; timeoutMs?: number }) => Promise<ExecResult>`
-  - `runCommand: Exec` — rejects on spawn failure and on timeout; resolves with `exitCode` otherwise.
+  - `type Exec = (binary: string, args: string[], opts?: { cwd?: string; timeoutMs?: number; input?: string }) => Promise<ExecResult>`
+  - `runCommand: Exec` — rejects on spawn failure and on timeout (rejection happens from the `close` handler AFTER the kill, so no process outlives the promise); resolves with `exitCode` otherwise. `input`, when set, is piped to the child's stdin.
+  - `DEFAULT_TIMEOUT_MS = 300_000`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -180,7 +210,7 @@ Create `tests/exec.test.ts`:
 
 ```ts
 import { describe, expect, it } from "vitest";
-import { runCommand } from "../src/exec.js";
+import { DEFAULT_TIMEOUT_MS, runCommand } from "../src/exec.js";
 
 describe("runCommand", () => {
   it("captures stdout and exit code 0 on success", async () => {
@@ -195,6 +225,14 @@ describe("runCommand", () => {
     expect(r.exitCode).toBe(3);
   });
 
+  it("pipes input to the child's stdin", async () => {
+    const r = await runCommand("node", ["-e", "process.stdin.pipe(process.stdout)"], {
+      input: "echo me",
+    });
+    expect(r.stdout).toBe("echo me");
+    expect(r.exitCode).toBe(0);
+  });
+
   it("rejects with an actionable error for a missing binary", async () => {
     await expect(runCommand("definitely-not-a-binary-xyz", [])).rejects.toThrow(
       /Is it installed and on PATH/,
@@ -206,6 +244,10 @@ describe("runCommand", () => {
       runCommand("node", ["-e", "setTimeout(() => {}, 10000)"], { timeoutMs: 200 }),
     ).rejects.toThrow(/timed out after 200ms/);
   });
+
+  it("defaults the timeout to 300000ms", () => {
+    expect(DEFAULT_TIMEOUT_MS).toBe(300_000);
+  });
 });
 ```
 
@@ -216,11 +258,18 @@ Expected: FAIL — cannot resolve `../src/exec.js`.
 
 - [ ] **Step 3: Implement types and exec**
 
-Create `src/types.ts`:
+Replace `src/types.ts`:
 
 ```ts
 export interface AgentRunOptions {
   model?: string;
+}
+
+export interface AgentInvocation {
+  /** argv passed to the binary (no shell involved). */
+  args: string[];
+  /** When set, the executor must pipe this to the child's stdin. */
+  stdin?: string;
 }
 
 export interface AgentAdapter {
@@ -228,8 +277,8 @@ export interface AgentAdapter {
   readonly name: string;
   /** Executable looked up on PATH, e.g. "cursor-agent". */
   readonly binary: string;
-  /** Pure function: prompt + options -> argv. No I/O allowed here. */
-  buildArgs(prompt: string, options?: AgentRunOptions): string[];
+  /** Pure function: prompt + options -> invocation. No I/O allowed here. */
+  buildInvocation(prompt: string, options?: AgentRunOptions): AgentInvocation;
 }
 ```
 
@@ -247,7 +296,7 @@ export interface ExecResult {
 export type Exec = (
   binary: string,
   args: string[],
-  opts?: { cwd?: string; timeoutMs?: number },
+  opts?: { cwd?: string; timeoutMs?: number; input?: string },
 ) => Promise<ExecResult>;
 
 export const DEFAULT_TIMEOUT_MS = 300_000;
@@ -257,20 +306,27 @@ export const runCommand: Exec = (binary, args, opts = {}) => {
   return new Promise<ExecResult>((resolve, reject) => {
     const child = spawn(binary, args, {
       cwd: opts.cwd,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [opts.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
     });
-    let stdout = "";
-    let stderr = "";
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let timedOut = false;
     let settled = false;
 
     const timer = setTimeout(() => {
-      settled = true;
+      timedOut = true;
       child.kill("SIGKILL");
-      reject(new Error(`"${binary}" timed out after ${timeoutMs}ms`));
     }, timeoutMs);
 
-    child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
-    child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+    if (opts.input !== undefined) {
+      // Swallow EPIPE if the child exits before reading its stdin.
+      child.stdin?.on("error", () => {});
+      child.stdin?.write(opts.input);
+      child.stdin?.end();
+    }
+
+    child.stdout?.on("data", (chunk: Buffer) => stdoutChunks.push(chunk));
+    child.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
 
     child.on("error", (err) => {
       clearTimeout(timer);
@@ -285,7 +341,15 @@ export const runCommand: Exec = (binary, args, opts = {}) => {
       clearTimeout(timer);
       if (settled) return;
       settled = true;
-      resolve({ stdout, stderr, exitCode: code });
+      if (timedOut) {
+        reject(new Error(`"${binary}" timed out after ${timeoutMs}ms`));
+        return;
+      }
+      resolve({
+        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+        stderr: Buffer.concat(stderrChunks).toString("utf8"),
+        exitCode: code,
+      });
     });
   });
 };
@@ -294,13 +358,13 @@ export const runCommand: Exec = (binary, args, opts = {}) => {
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `npx vitest run tests/exec.test.ts && npm run typecheck`
-Expected: 4 tests PASS, typecheck clean.
+Expected: 6 tests PASS, typecheck clean.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Commit** *(skip if running as subagent)*
 
 ```bash
 git add src/types.ts src/exec.ts tests/exec.test.ts
-git commit -m "feat(exec): add adapter contracts and subprocess boundary with timeout handling"
+git commit -m "feat(exec): add adapter contracts and stdin-capable subprocess boundary"
 ```
 
 ---
@@ -309,37 +373,39 @@ git commit -m "feat(exec): add adapter contracts and subprocess boundary with ti
 
 **Files:**
 - Create: `src/adapters/codex.ts`
-- Test: `tests/adapters.test.ts`
+- Test: `tests/adapters/codex.test.ts`
 
 **Interfaces:**
-- Consumes: `AgentAdapter`, `AgentRunOptions` from `src/types.ts`.
-- Produces: `codexAdapter: AgentAdapter` with `name: "codex"`, `binary: "codex"`.
+- Consumes: `AgentAdapter`, `AgentInvocation`, `AgentRunOptions` from `src/types.ts`.
+- Produces: `codexAdapter: AgentAdapter` with `name: "codex"`, `binary: "codex"`. Prompt travels via stdin using Codex's documented `-` sentinel (immune to option-parser injection).
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `tests/adapters.test.ts`:
+Create `tests/adapters/codex.test.ts`:
 
 ```ts
 import { describe, expect, it } from "vitest";
-import { codexAdapter } from "../src/adapters/codex.js";
+import { codexAdapter } from "../../src/adapters/codex.js";
 
 describe("codexAdapter", () => {
-  it("builds non-interactive exec args", () => {
-    expect(codexAdapter.buildArgs("fix the bug")).toEqual([
-      "exec",
-      "--skip-git-repo-check",
-      "fix the bug",
-    ]);
+  it("pipes the prompt via stdin using the '-' sentinel", () => {
+    expect(codexAdapter.buildInvocation("fix the bug")).toEqual({
+      args: ["exec", "--skip-git-repo-check", "-"],
+      stdin: "fix the bug",
+    });
   });
 
-  it("inserts --model before the prompt when given", () => {
-    expect(codexAdapter.buildArgs("fix the bug", { model: "o3" })).toEqual([
-      "exec",
-      "--skip-git-repo-check",
-      "--model",
-      "o3",
-      "fix the bug",
-    ]);
+  it("inserts --model before the stdin sentinel when given", () => {
+    expect(codexAdapter.buildInvocation("fix the bug", { model: "o3" })).toEqual({
+      args: ["exec", "--skip-git-repo-check", "--model", "o3", "-"],
+      stdin: "fix the bug",
+    });
+  });
+
+  it("is injection-safe for prompts that look like flags", () => {
+    const inv = codexAdapter.buildInvocation("--help me understand this");
+    expect(inv.args).toEqual(["exec", "--skip-git-repo-check", "-"]);
+    expect(inv.stdin).toBe("--help me understand this");
   });
 
   it("exposes correct identity", () => {
@@ -351,38 +417,39 @@ describe("codexAdapter", () => {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `npx vitest run tests/adapters.test.ts`
-Expected: FAIL — cannot resolve `../src/adapters/codex.js`.
+Run: `npx vitest run tests/adapters/codex.test.ts`
+Expected: FAIL — cannot resolve `../../src/adapters/codex.js`.
 
 - [ ] **Step 3: Implement the adapter**
 
 Create `src/adapters/codex.ts`:
 
 ```ts
-import type { AgentAdapter, AgentRunOptions } from "../types.js";
+import type { AgentAdapter, AgentInvocation, AgentRunOptions } from "../types.js";
 
 export const codexAdapter: AgentAdapter = {
   name: "codex",
   binary: "codex",
-  buildArgs(prompt: string, options: AgentRunOptions = {}): string[] {
+  buildInvocation(prompt: string, options: AgentRunOptions = {}): AgentInvocation {
     const args = ["exec", "--skip-git-repo-check"];
     if (options.model) args.push("--model", options.model);
-    args.push(prompt);
-    return args;
+    // "-" = read the prompt from stdin (documented Codex CLI sentinel).
+    args.push("-");
+    return { args, stdin: prompt };
   },
 };
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `npx vitest run tests/adapters.test.ts`
-Expected: 3 tests PASS.
+Run: `npx vitest run tests/adapters/codex.test.ts`
+Expected: 4 tests PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Commit** *(skip if running as subagent)*
 
 ```bash
-git add src/adapters/codex.ts tests/adapters.test.ts
-git commit -m "feat(adapters): add codex adapter wrapping codex exec"
+git add src/adapters/codex.ts tests/adapters/codex.test.ts
+git commit -m "feat(adapters): add codex adapter with stdin prompt delivery"
 ```
 
 ---
@@ -391,38 +458,39 @@ git commit -m "feat(adapters): add codex adapter wrapping codex exec"
 
 **Files:**
 - Create: `src/adapters/cursor.ts`
-- Modify: `tests/adapters.test.ts` (append a describe block)
+- Test: `tests/adapters/cursor.test.ts`
 
 **Interfaces:**
-- Consumes: `AgentAdapter`, `AgentRunOptions` from `src/types.ts`.
-- Produces: `cursorAdapter: AgentAdapter` with `name: "cursor"`, `binary: "cursor-agent"`.
+- Consumes: `AgentAdapter`, `AgentInvocation`, `AgentRunOptions` from `src/types.ts`.
+- Produces: `cursorAdapter: AgentAdapter` with `name: "cursor"`, `binary: "cursor-agent"`. Prompt travels via piped stdin (documented print-mode input path — no positional prompt).
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `tests/adapters.test.ts`:
+Create `tests/adapters/cursor.test.ts`:
 
 ```ts
-import { cursorAdapter } from "../src/adapters/cursor.js";
+import { describe, expect, it } from "vitest";
+import { cursorAdapter } from "../../src/adapters/cursor.js";
 
 describe("cursorAdapter", () => {
-  it("builds print-mode args with text output", () => {
-    expect(cursorAdapter.buildArgs("explain this repo")).toEqual([
-      "-p",
-      "--output-format",
-      "text",
-      "explain this repo",
-    ]);
+  it("builds print-mode args and pipes the prompt via stdin", () => {
+    expect(cursorAdapter.buildInvocation("explain this repo")).toEqual({
+      args: ["-p", "--output-format", "text"],
+      stdin: "explain this repo",
+    });
   });
 
-  it("inserts --model before the prompt when given", () => {
-    expect(cursorAdapter.buildArgs("explain this repo", { model: "gpt-5" })).toEqual([
-      "-p",
-      "--output-format",
-      "text",
-      "--model",
-      "gpt-5",
-      "explain this repo",
-    ]);
+  it("appends --model when given", () => {
+    expect(cursorAdapter.buildInvocation("explain this repo", { model: "gpt-5" })).toEqual({
+      args: ["-p", "--output-format", "text", "--model", "gpt-5"],
+      stdin: "explain this repo",
+    });
+  });
+
+  it("is injection-safe for prompts that look like flags", () => {
+    const inv = cursorAdapter.buildInvocation("--force what does this flag do");
+    expect(inv.args).toEqual(["-p", "--output-format", "text"]);
+    expect(inv.stdin).toBe("--force what does this flag do");
   });
 
   it("exposes correct identity", () => {
@@ -434,38 +502,38 @@ describe("cursorAdapter", () => {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `npx vitest run tests/adapters.test.ts`
-Expected: FAIL — cannot resolve `../src/adapters/cursor.js`.
+Run: `npx vitest run tests/adapters/cursor.test.ts`
+Expected: FAIL — cannot resolve `../../src/adapters/cursor.js`.
 
 - [ ] **Step 3: Implement the adapter**
 
 Create `src/adapters/cursor.ts`:
 
 ```ts
-import type { AgentAdapter, AgentRunOptions } from "../types.js";
+import type { AgentAdapter, AgentInvocation, AgentRunOptions } from "../types.js";
 
 export const cursorAdapter: AgentAdapter = {
   name: "cursor",
   binary: "cursor-agent",
-  buildArgs(prompt: string, options: AgentRunOptions = {}): string[] {
+  buildInvocation(prompt: string, options: AgentRunOptions = {}): AgentInvocation {
     const args = ["-p", "--output-format", "text"];
     if (options.model) args.push("--model", options.model);
-    args.push(prompt);
-    return args;
+    // No positional prompt: cursor-agent reads it from piped stdin in print mode.
+    return { args, stdin: prompt };
   },
 };
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `npx vitest run tests/adapters.test.ts`
-Expected: 6 tests PASS.
+Run: `npx vitest run tests/adapters/cursor.test.ts`
+Expected: 4 tests PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Commit** *(skip if running as subagent)*
 
 ```bash
-git add src/adapters/cursor.ts tests/adapters.test.ts
-git commit -m "feat(adapters): add cursor adapter wrapping cursor-agent print mode"
+git add src/adapters/cursor.ts tests/adapters/cursor.test.ts
+git commit -m "feat(adapters): add cursor adapter with stdin prompt delivery"
 ```
 
 ---
@@ -474,31 +542,39 @@ git commit -m "feat(adapters): add cursor adapter wrapping cursor-agent print mo
 
 **Files:**
 - Create: `src/adapters/opencode.ts`
-- Modify: `tests/adapters.test.ts` (append a describe block)
+- Test: `tests/adapters/opencode.test.ts`
 
 **Interfaces:**
-- Consumes: `AgentAdapter`, `AgentRunOptions` from `src/types.ts`.
-- Produces: `opencodeAdapter: AgentAdapter` with `name: "opencode"`, `binary: "opencode"`.
+- Consumes: `AgentAdapter`, `AgentInvocation`, `AgentRunOptions` from `src/types.ts`.
+- Produces: `opencodeAdapter: AgentAdapter` with `name: "opencode"`, `binary: "opencode"`. OpenCode documents neither stdin nor `--`, so the prompt is positional; `buildInvocation` THROWS an actionable error for prompts starting with `-` (the server maps thrown errors to `isError`).
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `tests/adapters.test.ts`:
+Create `tests/adapters/opencode.test.ts`:
 
 ```ts
-import { opencodeAdapter } from "../src/adapters/opencode.js";
+import { describe, expect, it } from "vitest";
+import { opencodeAdapter } from "../../src/adapters/opencode.js";
 
 describe("opencodeAdapter", () => {
-  it("builds run args", () => {
-    expect(opencodeAdapter.buildArgs("write tests")).toEqual(["run", "write tests"]);
+  it("builds run args with a positional prompt", () => {
+    expect(opencodeAdapter.buildInvocation("write tests")).toEqual({
+      args: ["run", "write tests"],
+    });
   });
 
   it("inserts --model before the prompt when given", () => {
-    expect(opencodeAdapter.buildArgs("write tests", { model: "anthropic/claude-sonnet-5" })).toEqual([
-      "run",
-      "--model",
-      "anthropic/claude-sonnet-5",
-      "write tests",
-    ]);
+    expect(
+      opencodeAdapter.buildInvocation("write tests", { model: "anthropic/claude-sonnet-5" }),
+    ).toEqual({
+      args: ["run", "--model", "anthropic/claude-sonnet-5", "write tests"],
+    });
+  });
+
+  it("rejects prompts starting with '-' with an actionable error", () => {
+    expect(() => opencodeAdapter.buildInvocation("--help me")).toThrow(
+      /prompts that start with '-'/,
+    );
   });
 
   it("exposes correct identity", () => {
@@ -510,38 +586,45 @@ describe("opencodeAdapter", () => {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `npx vitest run tests/adapters.test.ts`
-Expected: FAIL — cannot resolve `../src/adapters/opencode.js`.
+Run: `npx vitest run tests/adapters/opencode.test.ts`
+Expected: FAIL — cannot resolve `../../src/adapters/opencode.js`.
 
 - [ ] **Step 3: Implement the adapter**
 
 Create `src/adapters/opencode.ts`:
 
 ```ts
-import type { AgentAdapter, AgentRunOptions } from "../types.js";
+import type { AgentAdapter, AgentInvocation, AgentRunOptions } from "../types.js";
 
 export const opencodeAdapter: AgentAdapter = {
   name: "opencode",
   binary: "opencode",
-  buildArgs(prompt: string, options: AgentRunOptions = {}): string[] {
+  buildInvocation(prompt: string, options: AgentRunOptions = {}): AgentInvocation {
+    if (prompt.startsWith("-")) {
+      // opencode documents neither stdin input nor a "--" delimiter, so a
+      // dash-leading prompt could be parsed as a flag by its CLI.
+      throw new Error(
+        "opencode cannot safely run prompts that start with '-' (its CLI may parse them as flags). Rephrase the prompt to start with a word, e.g. \"explain --help ...\".",
+      );
+    }
     const args = ["run"];
     if (options.model) args.push("--model", options.model);
     args.push(prompt);
-    return args;
+    return { args };
   },
 };
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `npx vitest run tests/adapters.test.ts`
-Expected: 9 tests PASS.
+Run: `npx vitest run tests/adapters/opencode.test.ts`
+Expected: 4 tests PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Commit** *(skip if running as subagent)*
 
 ```bash
-git add src/adapters/opencode.ts tests/adapters.test.ts
-git commit -m "feat(adapters): add opencode adapter wrapping opencode run"
+git add src/adapters/opencode.ts tests/adapters/opencode.test.ts
+git commit -m "feat(adapters): add opencode adapter with dash-prompt guard"
 ```
 
 ---
@@ -553,10 +636,10 @@ git commit -m "feat(adapters): add opencode adapter wrapping opencode run"
 - Test: `tests/registry.test.ts`
 
 **Interfaces:**
-- Consumes: `codexAdapter`, `cursorAdapter`, `opencodeAdapter`; `Exec`, `ExecResult` from `src/exec.ts`.
+- Consumes: `codexAdapter`, `cursorAdapter`, `opencodeAdapter`; `Exec` from `src/exec.ts`.
 - Produces:
   - `allAdapters(): AgentAdapter[]` — returns `[codexAdapter, cursorAdapter, opencodeAdapter]`.
-  - `checkAvailability(adapter: AgentAdapter, exec: Exec): Promise<boolean>` — `true` iff `<binary> --version` exits 0 within 10s; never throws.
+  - `checkAvailability(adapter: AgentAdapter, exec: Exec): Promise<boolean>` — `true` iff `<binary> --version` (top-level, NOT a subcommand flag) exits 0 within 10s; never throws.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -630,7 +713,7 @@ export async function checkAvailability(adapter: AgentAdapter, exec: Exec): Prom
 Run: `npx vitest run tests/registry.test.ts && npm run typecheck`
 Expected: 4 tests PASS, typecheck clean.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Commit** *(skip if running as subagent)*
 
 ```bash
 git add src/registry.ts tests/registry.test.ts
@@ -646,8 +729,8 @@ git commit -m "feat(registry): add adapter registry and availability probe"
 - Test: `tests/server.test.ts`
 
 **Interfaces:**
-- Consumes: `AgentAdapter`; `Exec`, `runCommand`, `DEFAULT_TIMEOUT_MS` from `src/exec.ts`; `checkAvailability` from `src/registry.ts`.
-- Produces: `buildServer(adapters: AgentAdapter[], exec?: Exec): McpServer` exposing tools `ping`, `list_agents`, and one tool per adapter (named after the adapter) with input `{ prompt: string; model?: string; cwd?: string; timeoutMs?: number }`.
+- Consumes: `AgentAdapter`; `Exec`, `runCommand` from `src/exec.ts`; `checkAvailability` from `src/registry.ts`.
+- Produces: `buildServer(adapters: AgentAdapter[], exec?: Exec): McpServer` exposing tools `ping`, `list_agents`, and one tool per adapter (named after the adapter) with input `{ prompt: string; model?: string; cwd?: string; timeoutMs?: number }`. NOTE: Task 8 adds `run_all` and UPDATES this task's tool-list assertion to six tools.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -669,13 +752,17 @@ async function connectedClient(exec: Exec) {
   return client;
 }
 
+function textOf(res: Awaited<ReturnType<Client["callTool"]>>): string {
+  return (res.content as Array<{ type: string; text: string }>).map((c) => c.text).join("\n");
+}
+
 const okExec: Exec = vi.fn(async () => ({ stdout: "agent says hi\n", stderr: "", exitCode: 0 }));
 
 describe("buildServer", () => {
   it("responds to ping", async () => {
     const client = await connectedClient(okExec);
     const res = await client.callTool({ name: "ping", arguments: {} });
-    expect((res.content as Array<{ type: string; text: string }>)[0].text).toBe("pong");
+    expect(textOf(res)).toBe("pong");
   });
 
   it("exposes one tool per adapter plus ping and list_agents", async () => {
@@ -685,17 +772,17 @@ describe("buildServer", () => {
     expect(names).toEqual(["codex", "cursor", "list_agents", "opencode", "ping"]);
   });
 
-  it("runs an agent tool through exec with adapter args", async () => {
+  it("runs an agent tool through exec with the adapter invocation", async () => {
     const exec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
     const client = await connectedClient(exec);
     const res = await client.callTool({ name: "codex", arguments: { prompt: "hello", model: "o3" } });
     expect(exec).toHaveBeenCalledWith(
       "codex",
-      ["exec", "--skip-git-repo-check", "--model", "o3", "hello"],
-      { cwd: undefined, timeoutMs: undefined },
+      ["exec", "--skip-git-repo-check", "--model", "o3", "-"],
+      { cwd: undefined, timeoutMs: undefined, input: "hello" },
     );
     expect(res.isError).toBeFalsy();
-    expect((res.content as Array<{ type: string; text: string }>)[0].text).toBe("done");
+    expect(textOf(res)).toBe("done");
   });
 
   it("returns isError with stderr on non-zero exit", async () => {
@@ -703,29 +790,47 @@ describe("buildServer", () => {
     const client = await connectedClient(exec);
     const res = await client.callTool({ name: "cursor", arguments: { prompt: "x" } });
     expect(res.isError).toBe(true);
-    expect((res.content as Array<{ type: string; text: string }>)[0].text).toContain("exit 2");
-    expect((res.content as Array<{ type: string; text: string }>)[0].text).toContain("auth required");
+    expect(textOf(res)).toContain("exit 2");
+    expect(textOf(res)).toContain("auth required");
   });
 
-  it("returns isError when exec rejects (missing binary / timeout)", async () => {
+  it("returns isError when exec rejects with a spawn failure", async () => {
     const exec: Exec = vi.fn(async () => {
       throw new Error('Failed to start "opencode": ENOENT. Is it installed and on PATH?');
     });
     const client = await connectedClient(exec);
     const res = await client.callTool({ name: "opencode", arguments: { prompt: "x" } });
     expect(res.isError).toBe(true);
-    expect((res.content as Array<{ type: string; text: string }>)[0].text).toContain("Is it installed");
+    expect(textOf(res)).toContain("Is it installed");
+  });
+
+  it("returns isError with the timeout message when exec times out", async () => {
+    const exec: Exec = vi.fn(async () => {
+      throw new Error('"cursor-agent" timed out after 50ms');
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({ name: "cursor", arguments: { prompt: "x", timeoutMs: 50 } });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain("timed out after 50ms");
+  });
+
+  it("returns isError for opencode prompts starting with '-' without calling exec", async () => {
+    const exec: Exec = vi.fn(async () => ({ stdout: "", stderr: "", exitCode: 0 }));
+    const client = await connectedClient(exec);
+    const res = await client.callTool({ name: "opencode", arguments: { prompt: "--help me" } });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain("prompts that start with '-'");
+    expect(exec).not.toHaveBeenCalled();
   });
 
   it("list_agents reports availability per adapter", async () => {
-    const exec: Exec = vi.fn(async (binary) => {
+    const exec: Exec = vi.fn(async (binary: string) => {
       if (binary === "codex") return { stdout: "1.0\n", stderr: "", exitCode: 0 };
       throw new Error("missing");
     });
     const client = await connectedClient(exec);
     const res = await client.callTool({ name: "list_agents", arguments: {} });
-    const text = (res.content as Array<{ type: string; text: string }>)[0].text;
-    const parsed = JSON.parse(text) as Array<{ name: string; available: boolean }>;
+    const parsed = JSON.parse(textOf(res)) as Array<{ name: string; available: boolean }>;
     expect(parsed).toEqual([
       { name: "codex", available: true },
       { name: "cursor", available: false },
@@ -755,7 +860,12 @@ const agentInputSchema = {
   prompt: z.string().describe("The task or question to send to the agent"),
   model: z.string().optional().describe("Model override passed to the agent CLI"),
   cwd: z.string().optional().describe("Working directory for the agent process"),
-  timeoutMs: z.number().int().positive().optional().describe("Kill the agent after this many ms (default 300000)"),
+  timeoutMs: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe("Kill the agent after this many ms (default 300000)"),
 };
 
 export function buildServer(adapters: AgentAdapter[], exec: Exec = runCommand): McpServer {
@@ -787,9 +897,11 @@ export function buildServer(adapters: AgentAdapter[], exec: Exec = runCommand): 
       },
       async ({ prompt, model, cwd, timeoutMs }) => {
         try {
-          const result = await exec(adapter.binary, adapter.buildArgs(prompt, { model }), {
+          const invocation = adapter.buildInvocation(prompt, { model });
+          const result = await exec(adapter.binary, invocation.args, {
             cwd,
             timeoutMs,
+            input: invocation.stdin,
           });
           if (result.exitCode !== 0) {
             return {
@@ -820,13 +932,13 @@ export function buildServer(adapters: AgentAdapter[], exec: Exec = runCommand): 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `npx vitest run tests/server.test.ts && npm run typecheck`
-Expected: 6 tests PASS, typecheck clean.
+Expected: 8 tests PASS, typecheck clean.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Commit** *(skip if running as subagent)*
 
 ```bash
 git add src/server.ts tests/server.test.ts
-git commit -m "feat(server): wire adapters into MCP tools with error handling"
+git commit -m "feat(server): wire adapters into MCP tools with full failure-path handling"
 ```
 
 ---
@@ -834,29 +946,33 @@ git commit -m "feat(server): wire adapters into MCP tools with error handling"
 ### Task 8: `run_all` Fan-Out Tool
 
 **Files:**
-- Modify: `src/server.ts` (add one `registerTool` block before the `return server;` line)
-- Modify: `tests/server.test.ts` (append a describe block)
+- Modify: `src/server.ts` (add one `registerTool` block before `return server;`)
+- Modify: `tests/server.test.ts` (UPDATE the tool-list assertion AND append a describe block)
 
 **Interfaces:**
 - Consumes: `buildServer` internals from Task 7.
-- Produces: MCP tool `run_all` with input `{ prompt: string; cwd?: string; timeoutMs?: number }`; runs every adapter in parallel and returns one text block per agent formatted as `## <name> (ok|failed)\n<output>`.
+- Produces: MCP tool `run_all` with input `{ prompt: string; cwd?: string; timeoutMs?: number }`; runs every adapter in parallel and returns one text block per agent formatted `## <name> (ok|failed)` + output. Total tool count becomes SIX (spec F2).
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `tests/server.test.ts`:
+FIRST, in `tests/server.test.ts`, UPDATE the existing tool-list expectation (Task 7 wrote five names) to include `run_all`:
+
+```ts
+    expect(names).toEqual(["codex", "cursor", "list_agents", "opencode", "ping", "run_all"]);
+```
+
+THEN append:
 
 ```ts
 describe("run_all", () => {
-  it("fans out to every adapter in parallel and labels each result", async () => {
-    const exec: Exec = vi.fn(async (binary) => {
+  it("fans out to every adapter and labels ok/failed per agent", async () => {
+    const exec: Exec = vi.fn(async (binary: string) => {
       if (binary === "cursor-agent") return { stdout: "", stderr: "not logged in", exitCode: 1 };
       return { stdout: `${binary} answer\n`, stderr: "", exitCode: 0 };
     });
     const client = await connectedClient(exec);
     const res = await client.callTool({ name: "run_all", arguments: { prompt: "compare" } });
-    const text = (res.content as Array<{ type: string; text: string }>)
-      .map((c) => c.text)
-      .join("\n");
+    const text = textOf(res);
     expect(text).toContain("## codex (ok)");
     expect(text).toContain("codex answer");
     expect(text).toContain("## cursor (failed)");
@@ -864,13 +980,39 @@ describe("run_all", () => {
     expect(text).toContain("## opencode (ok)");
     expect(res.isError).toBeFalsy();
   });
+
+  it("starts all agents before any finishes and forwards options", async () => {
+    let started = 0;
+    const resolvers: Array<(r: { stdout: string; stderr: string; exitCode: number | null }) => void> = [];
+    const exec: Exec = vi.fn((binary: string) => {
+      started += 1;
+      void binary;
+      return new Promise((resolve) => {
+        resolvers.push(resolve);
+      });
+    });
+    const client = await connectedClient(exec);
+    const pending = client.callTool({
+      name: "run_all",
+      arguments: { prompt: "p", cwd: "/tmp", timeoutMs: 1234 },
+    });
+    await vi.waitFor(() => expect(started).toBe(3));
+    for (const resolve of resolvers) resolve({ stdout: "ok\n", stderr: "", exitCode: 0 });
+    const res = await pending;
+    expect(exec).toHaveBeenCalledWith("codex", ["exec", "--skip-git-repo-check", "-"], {
+      cwd: "/tmp",
+      timeoutMs: 1234,
+      input: "p",
+    });
+    expect(textOf(res)).toContain("## codex (ok)");
+  });
 });
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `npx vitest run tests/server.test.ts`
-Expected: FAIL — tool `run_all` not found.
+Expected: FAIL — tool-list assertion fails (no `run_all` yet) and `run_all` tool not found.
 
 - [ ] **Step 3: Implement run_all**
 
@@ -889,18 +1031,25 @@ In `src/server.ts`, insert before `return server;`:
     },
     async ({ prompt, cwd, timeoutMs }) => {
       const settled = await Promise.allSettled(
-        adapters.map((a) => exec(a.binary, a.buildArgs(prompt, {}), { cwd, timeoutMs })),
+        adapters.map(async (adapter) => {
+          const invocation = adapter.buildInvocation(prompt, {});
+          return exec(adapter.binary, invocation.args, { cwd, timeoutMs, input: invocation.stdin });
+        }),
       );
       const content = settled.map((outcome, i) => {
         const name = adapters[i].name;
         if (outcome.status === "rejected") {
-          const msg = outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason);
+          const msg =
+            outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason);
           return { type: "text" as const, text: `## ${name} (failed)\n${msg}` };
         }
         const { stdout, stderr, exitCode } = outcome.value;
         return exitCode === 0
           ? { type: "text" as const, text: `## ${name} (ok)\n${stdout.trim()}` }
-          : { type: "text" as const, text: `## ${name} (failed)\nexit ${exitCode}: ${stderr || stdout}` };
+          : {
+              type: "text" as const,
+              text: `## ${name} (failed)\nexit ${exitCode}: ${stderr || stdout}`,
+            };
       });
       return { content };
     },
@@ -909,10 +1058,10 @@ In `src/server.ts`, insert before `return server;`:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `npx vitest run tests/server.test.ts`
-Expected: 7 tests PASS.
+Run: `npx vitest run tests/server.test.ts && npm run typecheck`
+Expected: 10 tests PASS, typecheck clean.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Commit** *(skip if running as subagent)*
 
 ```bash
 git add src/server.ts tests/server.test.ts
@@ -921,17 +1070,54 @@ git commit -m "feat(server): add run_all parallel fan-out tool"
 
 ---
 
-### Task 9: Bin Entry, Build, and README
+### Task 9: Bin Entry, Constraint Guard, Build, README
 
 **Files:**
 - Create: `src/index.ts`
+- Create: `tests/constraints.test.ts`
 - Create: `README.md`
 
 **Interfaces:**
 - Consumes: `buildServer` from `src/server.ts`, `allAdapters` from `src/registry.ts`.
-- Produces: `agent-mcp-hub` executable (stdio MCP server) and user-facing docs.
+- Produces: `agent-mcp-hub` executable (stdio MCP server), architecture guard tests (C1/C5), and user-facing docs.
 
-- [ ] **Step 1: Write the entry point**
+- [ ] **Step 1: Write the constraint guard tests**
+
+Create `tests/constraints.test.ts`:
+
+```ts
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { describe, expect, it } from "vitest";
+
+const SRC = fileURLToPath(new URL("../src", import.meta.url));
+
+function walk(dir: string): string[] {
+  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
+    entry.isDirectory() ? walk(join(dir, entry.name)) : [join(dir, entry.name)],
+  );
+}
+
+describe("architecture constraints", () => {
+  it("only exec.ts imports node:child_process (C1)", () => {
+    const offenders = walk(SRC).filter(
+      (file) => !file.endsWith("exec.ts") && readFileSync(file, "utf8").includes("child_process"),
+    );
+    expect(offenders).toEqual([]);
+  });
+
+  it("nothing writes to stdout outside the MCP transport (C5)", () => {
+    const offenders = walk(SRC).filter((file) => {
+      const source = readFileSync(file, "utf8");
+      return source.includes("console.log(") || source.includes("process.stdout.write(");
+    });
+    expect(offenders).toEqual([]);
+  });
+});
+```
+
+- [ ] **Step 2: Write the entry point**
 
 Create `src/index.ts`:
 
@@ -953,15 +1139,15 @@ main().catch((err: unknown) => {
 });
 ```
 
-- [ ] **Step 2: Build and smoke-test the binary**
+- [ ] **Step 3: Build and smoke-test the binary**
 
 Run: `npm run build && npm test && npm run typecheck`
-Expected: `dist/index.js` produced, all tests PASS.
+Expected: `dist/index.js` produced, all tests PASS (smoke 1 + exec 6 + adapters 12 + registry 4 + server 10 + constraints 2 = 35), typecheck clean.
 
 Run: `printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}\n' | node dist/index.js`
-Expected: one JSON-RPC response line containing `"name":"agent-mcp-hub"`.
+Expected: one JSON-RPC response line containing `"name":"agent-mcp-hub"` and `"version":"0.1.0"`.
 
-- [ ] **Step 3: Write the README**
+- [ ] **Step 4: Write the README**
 
 Create `README.md`:
 
@@ -976,14 +1162,17 @@ Like [codex-mcp-server](https://github.com/tuannvm/codex-mcp-server), but multi-
 
 | Tool | Description |
 |---|---|
-| `codex` | Delegate a prompt to `codex exec` |
-| `cursor` | Delegate a prompt to `cursor-agent -p` |
+| `codex` | Delegate a prompt to `codex exec` (prompt piped via stdin) |
+| `cursor` | Delegate a prompt to `cursor-agent -p` (prompt piped via stdin) |
 | `opencode` | Delegate a prompt to `opencode run` |
 | `run_all` | Same prompt to all agents in parallel, results side by side |
 | `list_agents` | Which agent CLIs are installed and on PATH |
 | `ping` | Health check |
 
-All agent tools accept `prompt` (required), `model`, `cwd`, `timeoutMs`.
+Agent tools accept `prompt` (required), `model`, `cwd`, `timeoutMs` (default 300000).
+
+Known limitation: `opencode` prompts may not start with `-` (its CLI could parse
+them as flags); the tool returns an actionable error instead of guessing.
 
 ## Prerequisites
 
@@ -1018,28 +1207,29 @@ claude mcp add agent-hub -- npx -y agent-mcp-hub
 
 ```bash
 npm install
-npm test        # vitest
-npm run dev     # run from source over stdio
-npm run build   # emit dist/
+npm test           # vitest
+npm run typecheck  # strict TS over src + tests
+npm run dev        # run from source over stdio
+npm run build      # emit dist/
 ```
 
 ## Architecture
 
-Pure adapters (`src/adapters/*` — prompt → argv, no I/O) → one subprocess
-boundary (`src/exec.ts`) → MCP wiring (`src/server.ts`). Adding an agent =
-one ~15-line adapter file + one line in `src/registry.ts`.
+Pure adapters (`src/adapters/*` — prompt → `{args, stdin?}`, no I/O) → one
+subprocess boundary (`src/exec.ts`) → MCP wiring (`src/server.ts`). Adding an
+agent = one ~15-line adapter file + one line in `src/registry.ts`.
 ```
 
-- [ ] **Step 4: Verify full suite one last time**
+- [ ] **Step 5: Run the full suite one last time**
 
 Run: `npm run build && npm test && npm run typecheck`
-Expected: all PASS, clean build.
+Expected: 35 tests PASS, clean build and typecheck.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit** *(skip if running as subagent)*
 
 ```bash
-git add src/index.ts README.md
-git commit -m "feat(cli): add stdio bin entry and README"
+git add src/index.ts tests/constraints.test.ts README.md
+git commit -m "feat(cli): add stdio bin entry, constraint guards, and README"
 ```
 
 ---
@@ -1051,3 +1241,4 @@ git commit -m "feat(cli): add stdio bin entry and README"
 - Config file / env vars to enable-disable agents and set default models.
 - `npm publish` (run the pre-push security gate first; verify the `agent-mcp-hub` npm name is free at publish time).
 - Claude Code CLI adapter (`claude -p`) as a fourth agent.
+- Revisit opencode dash-guard if/when opencode ships `--stdin` (tracked upstream as a feature request).
