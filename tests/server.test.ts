@@ -33,13 +33,24 @@ describe("buildServer", () => {
     const client = await connectedClient(okExec);
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
-    expect(names).toEqual(["claude", "codex", "cursor", "list_agents", "opencode", "ping", "run_all"]);
+    expect(names).toEqual([
+      "claude",
+      "codex",
+      "cursor",
+      "list_agents",
+      "opencode",
+      "ping",
+      "run_all",
+    ]);
   });
 
   it("runs an agent tool through exec with the adapter invocation", async () => {
     const exec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
     const client = await connectedClient(exec);
-    const res = await client.callTool({ name: "codex", arguments: { prompt: "hello", model: "o3" } });
+    const res = await client.callTool({
+      name: "codex",
+      arguments: { prompt: "hello", model: "o3" },
+    });
     expect(exec).toHaveBeenCalledWith(
       "codex",
       ["exec", "--skip-git-repo-check", "--model", "o3", "-"],
@@ -73,7 +84,10 @@ describe("buildServer", () => {
       throw new Error('"cursor-agent" timed out after 50ms');
     });
     const client = await connectedClient(exec);
-    const res = await client.callTool({ name: "cursor", arguments: { prompt: "x", timeoutMs: 50 } });
+    const res = await client.callTool({
+      name: "cursor",
+      arguments: { prompt: "x", timeoutMs: 50 },
+    });
     expect(res.isError).toBe(true);
     expect(textOf(res)).toContain("timed out after 50ms");
   });
@@ -192,7 +206,9 @@ describe("run_all", () => {
 
   it("starts all agents before any finishes and forwards options", async () => {
     let started = 0;
-    const resolvers: Array<(r: { stdout: string; stderr: string; exitCode: number | null }) => void> = [];
+    const resolvers: Array<
+      (r: { stdout: string; stderr: string; exitCode: number | null }) => void
+    > = [];
     const exec: Exec = vi.fn((binary: string) => {
       started += 1;
       void binary;

@@ -91,9 +91,9 @@ describe("runCommand output cap", () => {
       "const b=Buffer.alloc(2048,120);" +
       "function w(){if(process.stdout.write(b))setImmediate(w);else process.stdout.once('drain',w);}" +
       "w();";
-    await expect(
-      runCommand("node", ["-e", flood], { maxOutputBytes: 1024 }),
-    ).rejects.toThrow(/exceeded output limit of 1024 bytes/);
+    await expect(runCommand("node", ["-e", flood], { maxOutputBytes: 1024 })).rejects.toThrow(
+      /exceeded output limit of 1024 bytes/,
+    );
   });
 
   it("does not echo captured bytes in the limit error", async () => {
@@ -140,16 +140,11 @@ describe("runCommand concurrency semaphore", () => {
 
     const runs = [];
     for (let i = 0; i < MAX_CONCURRENT_AGENTS * 2; i++) {
-      runs.push(
-        runCommand("node", ["-e", script, markersDir, resultsFile, String(i)]),
-      );
+      runs.push(runCommand("node", ["-e", script, markersDir, resultsFile, String(i)]));
     }
     await Promise.all(runs);
 
-    const observed = readFileSync(resultsFile, "utf8")
-      .trim()
-      .split("\n")
-      .map(Number);
+    const observed = readFileSync(resultsFile, "utf8").trim().split("\n").map(Number);
     expect(observed.length).toBe(MAX_CONCURRENT_AGENTS * 2);
     expect(Math.max(...observed)).toBeLessThanOrEqual(MAX_CONCURRENT_AGENTS);
   });

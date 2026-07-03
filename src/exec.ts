@@ -55,11 +55,7 @@ export class ServerBusyError extends Error {
  * kill path is best-effort: it never throws, so it can never mask the
  * timeout-or-output-limit error being surfaced to the caller.
  */
-function killGroup(
-  pid: number | undefined,
-  signal: NodeJS.Signals,
-  fallback: () => void,
-): void {
+function killGroup(pid: number | undefined, signal: NodeJS.Signals, fallback: () => void): void {
   if (pid == null) return;
   try {
     process.kill(-pid, signal);
