@@ -49,6 +49,47 @@ claude mcp add agent-hub -- npx -y agent-mcp-hub
 }
 ```
 
+## Run with Docker
+
+Build and start the server (HTTP transport) with Docker Compose:
+
+```bash
+docker compose up -d --build
+```
+
+The server listens on `http://localhost:3919/mcp`; health check is at
+`http://localhost:3919/healthz`.
+
+Point an MCP client at it via `mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "agent-hub": {
+      "url": "http://localhost:3919/mcp"
+    }
+  }
+}
+```
+
+Or with Claude Code:
+
+```bash
+claude mcp add --transport http agent-hub http://localhost:3919/mcp
+```
+
+**Auth:** the wrapped CLIs need credentials. Either pass API keys as env vars
+(`OPENAI_API_KEY`, `CURSOR_API_KEY`) — a `.env` file next to `docker-compose.yml`
+is picked up automatically — or reuse your host CLI logins by uncommenting the
+read-only login-dir mounts in `docker-compose.yml`.
+
+**Workspace:** mount the project you want the agents to work on into `/workspace`
+(the `./workspace` bind mount is preconfigured) and pass `cwd: "/workspace"` in
+your tool calls.
+
+Prefer stdio? `npx agent-mcp-hub` still works without Docker (see
+[Install](#install)).
+
 ## Development
 
 ```bash
