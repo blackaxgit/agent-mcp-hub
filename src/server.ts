@@ -1,8 +1,48 @@
+import { createRequire } from "node:module";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { runCommand, type Exec } from "./exec.js";
+import { runCommand, type Exec, type ExecResult } from "./exec.js";
 import { checkAvailability } from "./registry.js";
 import type { AgentAdapter } from "./types.js";
+
+const { version } = createRequire(import.meta.url)("../package.json") as { version: string };
+
+/**
+ * Single execution path for every agent tool: build the invocation, run it, and
+ * emit one structured audit line to stderr (never stdout — C5). Both the
+ * per-agent tools and run_all funnel through here so exec-path behavior stays in
+ * one place.
+ */
+async function runAdapter(
+  adapter: AgentAdapter,
+  exec: Exec,
+  params: { prompt: string; model?: string; cwd?: string; timeoutMs?: number },
+): Promise<ExecResult> {
+  const invocation = adapter.buildInvocation(params.prompt, { model: params.model });
+  const start = Date.now();
+  const audit = (exitCode: number | null | undefined) =>
+    console.error(
+      JSON.stringify({
+        evt: "agent_run",
+        agent: adapter.name,
+        cwd: params.cwd ?? null,
+        ms: Date.now() - start,
+        exitCode,
+      }),
+    );
+  try {
+    const result = await exec(adapter.binary, invocation.args, {
+      cwd: params.cwd,
+      timeoutMs: params.timeoutMs,
+      input: invocation.stdin,
+    });
+    audit(result.exitCode);
+    return result;
+  } catch (err) {
+    audit(undefined);
+    throw err;
+  }
+}
 
 const agentInputSchema = {
   prompt: z.string().describe("The task or question to send to the agent"),
@@ -17,7 +57,7 @@ const agentInputSchema = {
 };
 
 export function buildServer(adapters: AgentAdapter[], exec: Exec = runCommand): McpServer {
-  const server = new McpServer({ name: "agent-mcp-hub", version: "0.1.0" });
+  const server = new McpServer({ name: "agent-mcp-hub", version });
 
   server.registerTool(
     "ping",
@@ -45,12 +85,7 @@ export function buildServer(adapters: AgentAdapter[], exec: Exec = runCommand): 
       },
       async ({ prompt, model, cwd, timeoutMs }) => {
         try {
-          const invocation = adapter.buildInvocation(prompt, { model });
-          const result = await exec(adapter.binary, invocation.args, {
-            cwd,
-            timeoutMs,
-            input: invocation.stdin,
-          });
+          const result = await runAdapter(adapter, exec, { prompt, model, cwd, timeoutMs });
           if (result.exitCode !== 0) {
             return {
               isError: true,
@@ -79,16 +114,14 @@ export function buildServer(adapters: AgentAdapter[], exec: Exec = runCommand): 
       description: "Send the same prompt to every wrapped agent in parallel and return all answers",
       inputSchema: {
         prompt: z.string().describe("The task or question to send to all agents"),
+        model: z.string().optional().describe("Model override passed to every agent CLI"),
         cwd: z.string().optional().describe("Working directory for the agent processes"),
         timeoutMs: z.number().int().positive().optional().describe("Per-agent timeout in ms"),
       },
     },
-    async ({ prompt, cwd, timeoutMs }) => {
+    async ({ prompt, model, cwd, timeoutMs }) => {
       const settled = await Promise.allSettled(
-        adapters.map(async (adapter) => {
-          const invocation = adapter.buildInvocation(prompt, {});
-          return exec(adapter.binary, invocation.args, { cwd, timeoutMs, input: invocation.stdin });
-        }),
+        adapters.map((adapter) => runAdapter(adapter, exec, { prompt, model, cwd, timeoutMs })),
       );
       const content = settled.map((outcome, i) => {
         const name = adapters[i].name;
