@@ -14,9 +14,12 @@ services:
       MCP_TOKEN: ${MCP_TOKEN:-}
       # Extra allowed browser Origins (comma-separated); loopback is always allowed.
       MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-}
+      # Comma-separated allowlist of agents to expose (codex,cursor,opencode,claude); empty = all.
+      MCP_AGENTS: ${MCP_AGENTS:-}
       # Credential passthrough for the wrapped CLIs (set the ones you use):
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       CURSOR_API_KEY: ${CURSOR_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     volumes:
       # Directory the agents operate on (pass cwd: "/workspace" in tool calls)
       - ./workspace:/workspace
