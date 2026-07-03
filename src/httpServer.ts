@@ -68,15 +68,16 @@ export async function startHttpServer(port: number, host = "127.0.0.1"): Promise
       return;
     }
     if (req.method !== "POST") {
-      res
-        .writeHead(405, { "content-type": "application/json", allow: "POST" })
-        .end(
-          JSON.stringify({
-            jsonrpc: "2.0",
-            error: { code: -32000, message: "Method not allowed: stateless server accepts POST only" },
-            id: null,
-          }),
-        );
+      res.writeHead(405, { "content-type": "application/json", allow: "POST" }).end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          error: {
+            code: -32000,
+            message: "Method not allowed: stateless server accepts POST only",
+          },
+          id: null,
+        }),
+      );
       return;
     }
     const token = process.env.MCP_TOKEN;

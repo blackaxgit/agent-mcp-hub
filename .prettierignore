@@ -1,0 +1,7 @@
+dist/
+coverage/
+node_modules/
+package-lock.json
+
+# Markdown docs are prose — not formatted by the code gate
+*.md

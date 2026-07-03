@@ -4,9 +4,16 @@
   "description": "One MCP server bridging the Codex, Cursor, OpenCode, and Claude CLI agents",
   "license": "MIT",
   "type": "module",
-  "bin": { "agent-mcp-hub": "dist/index.js", "agent-mcp-hub-http": "dist/http.js" },
-  "files": ["dist"],
-  "engines": { "node": ">=22" },
+  "bin": {
+    "agent-mcp-hub": "dist/index.js",
+    "agent-mcp-hub-http": "dist/http.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/index.ts",
@@ -14,6 +21,8 @@
     "typecheck": "tsc -p tsconfig.test.json",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
     "prepublishOnly": "npm run build && npm run typecheck && npm test"
   },
   "dependencies": {
@@ -24,6 +33,8 @@
     "@eslint/js": "^9.0.0",
     "@types/node": "^26.1.0",
     "eslint": "^9.0.0",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.9.4",
     "tsx": "^4.19.0",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.0.0",
