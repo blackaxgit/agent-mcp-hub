@@ -57,5 +57,18 @@ jobs:
       # vendor's curl|bash installer.
       - run: docker build --build-arg INSTALL_CURSOR=false -t agent-mcp-hub:ci .
       - run: docker image ls agent-mcp-hub:ci
+      - name: Smoke-test the image
+        run: |
+          docker run -d --name hub-ci -e HOST=0.0.0.0 -p 3919:3919 agent-mcp-hub:ci
+          for i in $(seq 1 15); do
+            if curl -fsS http://localhost:3919/healthz >/dev/null 2>&1; then echo "healthy"; exit 0; fi
+            sleep 2
+          done
+          echo "container did not become healthy" >&2
+          docker logs hub-ci || true
+          exit 1
+      - name: Tear down smoke container
+        if: always()
+        run: docker rm -f hub-ci || true
       - run: docker system prune -af
         if: always()
