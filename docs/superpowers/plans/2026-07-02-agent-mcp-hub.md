@@ -6,7 +6,7 @@
 
 **Architecture:** Adapter pattern with strict layering. Each CLI agent is a pure adapter (`name` + `binary` + `buildArgs()` — no I/O), all subprocess side effects are isolated in one `exec.ts` boundary module, and `server.ts` wires adapters into MCP tools. Tools exposed: one per agent (`codex`, `cursor`, `opencode`), plus `run_all` (parallel fan-out), `list_agents` (availability probe), and `ping`.
 
-**Tech Stack:** TypeScript (strict, ESM), Node ≥20, `@modelcontextprotocol/sdk` ^1.12, `zod` ^3.24, `vitest` ^2 for tests, `tsx` for dev, plain `tsc` for build.
+**Tech Stack:** TypeScript (strict, ESM), Node ≥20, `@modelcontextprotocol/sdk` ^1.29, `zod` ^3.25, `vitest` ^2 for tests, `tsx` for dev, plain `tsc` for build.
 
 ## Global Constraints
 
@@ -85,8 +85,8 @@ Create `package.json`:
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.0",
-    "zod": "^3.24.0"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.25.0"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
