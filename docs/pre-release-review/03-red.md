@@ -1,33 +1,33 @@
 # 03 — Red Team (adversarial findings)
 
-5 findings, raw (pre-filter). Verification outcomes are cross-referenced in `07-filtered.md`.
+RE-REVIEW (round-2, post-hardening). 5 findings, raw (pre-filter). Verification outcomes are cross-referenced in `07-filtered.md`.
 
-## R1 — RCE-capable endpoint binds public interfaces with no authentication enforced
-- **Severity:** High
-- **file:line:** `src/httpServer.ts:27-64` (with `Dockerfile:38` `ENV HOST=0.0.0.0`)
-- **Problem:** The `/mcp` endpoint spawns autonomous coding agents (`codex exec`, `claude -p`, etc.) that run arbitrary code/file operations as the host user. Authentication is optional: `MCP_TOKEN` is only checked if set (lines 58-59). The Dockerfile hardcodes `HOST=0.0.0.0`, and the server binds any interface without a token. Running `node dist/http.js` with `HOST=0.0.0.0` and no `MCP_TOKEN` exposes an unauthenticated RCE surface to the whole network. The README's "mandatory before exposing the port" guidance is a comment, not a control. The Origin check does not help: non-browser clients send no Origin and `isOriginAllowed` returns true (line 14).
-- **Fix:** Fail fast at startup — in `startHttpServer`, if `host` is not loopback (`127.0.0.1`/`::1`/`localhost`) and `MCP_TOKEN` is empty, `throw` before binding. Turns the documented rule into an enforced invariant.
+## R1 — Fail-open auth: default image binds 0.0.0.0 with no token = unauthenticated remote code execution
+- **severity:** critical
+- **file:** `src/httpServer.ts:74-80` (with `Dockerfile:40` `ENV HOST=0.0.0.0`, `docker-compose.yml:14` `MCP_TOKEN` default empty)
+- **problem:** The `/mcp` endpoint spawns arbitrary coding-agent CLIs (claude/codex/cursor/opencode) against a caller-supplied prompt and cwd — i.e. full code execution on the host. Authentication is entirely optional: `const token = process.env.MCP_TOKEN; if (token && !isTokenValid(...))`. When MCP_TOKEN is unset the token branch is skipped and every POST is accepted. The Dockerfile ships `ENV HOST=0.0.0.0` and docker-compose defaults `MCP_TOKEN` to empty, so `docker run -p 3919:3919 agent-mcp-hub` (publishing on all interfaces, the common case) yields an unauthenticated network endpoint that any reachable host can drive to execute code, read/write files, and use the mounted OPENAI/ANTHROPIC/CURSOR API keys. The Origin check is no barrier: non-browser clients (curl) send no Origin, and `isOriginAllowed(undefined)` returns true, so the token is the only real gate — and it is off by default.
+- **fix:** Fail closed: refuse to start (or refuse every request) when bound to a non-loopback host without a token. At the top of startHttpServer add: `const token = process.env.MCP_TOKEN; const isLoopback = host === '127.0.0.1' || host === '::1' || host === 'localhost'; if (!isLoopback && !token) throw new Error('MCP_TOKEN is required when HOST is not loopback — refusing to expose an unauthenticated agent-execution endpoint');`. Reuse that resolved `token` in the per-request check. Remove `ENV HOST=0.0.0.0` from the Dockerfile (or pair it with a mandatory MCP_TOKEN and document that publishing beyond loopback requires the token).
 
-## R2 — Non-constant-time comparison of bearer token enables timing attack
-- **Severity:** Medium
-- **file:line:** `src/httpServer.ts:59`
-- **Problem:** `req.headers.authorization !== \`Bearer ${token}\`` uses JS string `!==`, which short-circuits on the first differing byte. An attacker reaching the endpoint can measure response-time differences to recover `MCP_TOKEN` byte-by-byte, defeating the only auth control guarding an RCE endpoint.
-- **Fix:** Use `timingSafeEqual` from `node:crypto`. Build Buffers for the expected `Bearer ${token}` and received header, guard the length check against a random buffer to avoid leaking length, and reject on mismatch.
+## R2 — Origin allowlist is not authentication and is trivially bypassed by non-browser clients
+- **severity:** medium
+- **file:** `src/httpServer.ts:29-41`
+- **problem:** `isOriginAllowed(undefined)` returns true, so any client that simply omits the Origin header (all non-browser HTTP clients, e.g. curl or a compromised LAN host) passes the origin gate. The header-based DNS-rebinding defense only constrains real browsers; it provides zero protection against direct HTTP attackers. Code comments and README present this check as a security boundary for an endpoint that can spawn coding agents, which invites operators to expose the service relying on origin filtering instead of the (optional) token.
+- **fix:** Do not treat the Origin check as an access-control boundary. Keep it strictly as an anti-DNS-rebinding measure and make the bearer token the required gate for any non-loopback bind (see R1). Update README/comments to state explicitly that the Origin allowlist is not authentication and that MCP_TOKEN is mandatory whenever the port is reachable beyond loopback.
 
-## R3 — Unbounded timeoutMs and no concurrency limit allow resource-exhaustion DoS
-- **Severity:** Medium
-- **file:line:** `src/server.ts:11-16`
-- **Problem:** `timeoutMs` is validated only as a positive integer (agentInputSchema; run_all line 83), so a caller can pass a huge value to pin a spawned agent process open. No cap on concurrent invocations, and `run_all` spawns every adapter in parallel with no limit — repeated calls fork unbounded long-lived child processes (each a full coding-agent runtime), exhausting CPU/memory/PID.
-- **Fix:** Clamp timeout to a hard max in `exec.ts`/`server.ts` (e.g. `MAX_TIMEOUT_MS ≈ 600_000`) and add a bounded concurrency gate (semaphore/queue) around the exec call so the endpoint cannot be driven into fork exhaustion.
+## R3 — Unbounded semaphore waiter queue enables memory-exhaustion DoS
+- **severity:** medium
+- **file:** `src/exec.ts:61-84` (queueing at 86-96; fan-out at `src/server.ts:122-125`)
+- **problem:** runCommand routes every spawn through a Semaphore whose `waiters` array grows without limit. Each POST /mcp can enqueue up to N agents (run_all fans out to every adapter), and there is no cap on concurrent requests, queued waiters, or in-flight prompt buffers. An attacker who can reach the endpoint (unauthenticated per R1, or any authorized caller) can issue many concurrent run_all calls; excess invocations pile up in `waiters` along with their retained prompt strings and pending promises, exhausting memory while the concurrency cap only throttles actual spawns. There is also no request-body / prompt size limit backing this.
+- **fix:** Bound the queue: give Semaphore a max-waiters limit and reject `acquire()` with a 'server busy' error once exceeded, surfacing a 429/`-32000` to the client instead of buffering unboundedly. Additionally cap concurrent in-flight /mcp requests and enforce a maximum request body size in startHttpServer before invoking the transport.
 
-## R4 — Agent stderr/stdout returned verbatim to caller leaks secrets and internals
-- **Severity:** Low
-- **file:line:** `src/server.ts:60`
-- **Problem:** On non-zero exit the tool returns `result.stderr || result.stdout` directly to the MCP client (also `run_all` line 105). Coding-agent CLIs commonly print environment/config, absolute host paths, and on auth failures echo token/API-key fragments and stack traces. A caller can deliberately induce failures to harvest internal information (`OPENAI_API_KEY`/`ANTHROPIC_API_KEY`, host filesystem layout).
-- **Fix:** Do not forward raw stderr. Return a generic failure message with exit code, log full stderr server-side (`console.error`), and redact known secret-shaped patterns before returning anything.
+## R4 — Unvalidated cwd lets callers run agents in any directory (arbitrary read/write/exfiltration)
+- **severity:** medium
+- **file:** `src/server.ts:50` (`cwd: z.string()`), passed to spawn at `src/exec.ts:102-106`
+- **problem:** The `cwd` tool parameter is an unconstrained string handed straight to `spawn({ cwd })`. There is no allowlist or containment, so a caller can point an agent at any path the server process can access (e.g. /etc, another repo containing secrets, ~/.ssh) and, because the spawned coding agent can read/write files and call outbound APIs using the container's mounted credentials, exfiltrate or tamper with data far outside the intended /workspace mount. On the default unauthenticated image this is remotely reachable.
+- **fix:** Enforce a cwd allowlist rooted at a configured base (e.g. MCP_WORKSPACE_ROOT, defaulting to /workspace): resolve the requested path with path.resolve and reject anything that does not stay within the root (`resolved === root || resolved.startsWith(root + path.sep)`), returning an actionable error before spawning. Document that cwd must live under the workspace root.
 
-## R5 — Unvalidated cwd lets callers run agents in any directory on the host
-- **Severity:** Low
-- **file:line:** `src/server.ts:46-53`
-- **Problem:** The caller-supplied `cwd` string is passed straight to `child_process.spawn` (server.ts:49 → exec.ts:21) with no validation/allowlist. In the Docker setup only `/workspace` is intended, but a caller can set `cwd` to any path (`/home/mcp/.codex`, `/`, mounted dirs), widening the blast radius.
-- **Fix:** Add an optional allowlist (`MCP_ALLOWED_CWD` or configured workspace root). Resolve with `path.resolve` and reject any cwd outside an allowed root; default to the workspace root when unset.
+## R5 — Unbounded caller-supplied timeoutMs allows indefinite slot/resource holding
+- **severity:** low
+- **file:** `src/server.ts:51-56` and `119`
+- **problem:** timeoutMs is validated only as a positive integer with no upper bound. A caller can pass a huge value (e.g. Number.MAX_SAFE_INTEGER) so a spawned agent holds one of the limited concurrency slots effectively forever, and repeating this across the slot count wedges the server for all users. Combined with the unauthenticated default, an outsider can pin all slots. (Verification caveat: Node clamps setTimeout delays > 2^31-1 ms to ~1 ms, so MAX_SAFE_INTEGER does not hold forever — the realistic worst case is ~24.8 days.)
+- **fix:** Clamp the timeout to a sane maximum (e.g. cap at the intended 300000 ms ceiling, `Math.min(requested, MAX_TIMEOUT_MS)`), so no single invocation can hold a slot beyond an operationally reasonable bound.

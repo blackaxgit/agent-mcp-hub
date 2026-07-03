@@ -1,31 +1,23 @@
-# VERIFICATION — pre-release bug fixes (2026-07-03)
+# VERIFICATION — re-review round 2 fixes (2026-07-03)
 
-Suite: **62/62 tests pass (11 files, +9 regression tests over the 53 baseline)**, typecheck clean, build clean, stdio smoke OK.
-Gate #2: Codex AGREES (94) · four-eyes double-check PASS (92) · orchestrator integrated run green.
+(Round-1 VERIFICATION preserved in git history at this path.)
+
+Gates: **format:check PASS · lint PASS · 66/66 tests · typecheck clean · build clean.** Compose fail-closed confirmed (`docker compose config` errors without MCP_TOKEN, valid with it).
+Gate #2: four-eyes double-check **PASS (97)** · Codex fix-verify (6/7 FIXED + one fair "format" scope catch, now closed → all 7) · orchestrator integrated run green.
 
 | # | Issue | Status | Root cause | Fix (where) | Regression test | Confidence |
 |---|---|---|---|---|---|---|
-| 1 | Orphaned subprocess trees on timeout | FIXED | direct-child SIGKILL leaves group members | detached spawn + `process.kill(-pid)` group kill w/ ESRCH-swallow + EPERM fallback (`src/exec.ts`) | "group-kills a grandchild that outlives the timed-out child" (differentiating) | 98% |
-| 2 | Unbounded output buffering | FIXED | no byte ceiling | cap + stop-accumulate + kill group, reject w/o concat (`src/exec.ts`) | output-cap kill + "does not echo captured bytes" (differentiating: hangs pre-fix) | 98% |
-| 3 | No spawn concurrency cap | FIXED | unbounded parallel spawns | FIFO semaphore, `MCP_MAX_CONCURRENT_AGENTS` (`src/exec.ts`) | "never runs more than MAX_CONCURRENT_AGENTS" (differentiating) | 97% |
-| 4 | startHttpServer never rejects on listen error | FIXED | no `error` handler on listen | `once("error", reject)`/`once("listening", resolve)` (`src/httpServer.ts`) | "rejects a request whose port is already bound" (differentiating) | 98% |
-| 5 | Unpinned agent CLIs | FIXED | floating `npm -g` | pinned `@0.142.5/@1.17.13/@2.1.199` (`Dockerfile`) | inspection + CI build | 99% |
-| 6 | publish ships stale dist | FIXED | no prepublish build | `prepublishOnly: build && typecheck && test` (`package.json`) | inspection | 98% |
-| 7 | CI never runs the image | FIXED | build-only job | boot + poll `/healthz` + teardown (`ci.yml`) | the CI run itself | 97% |
-| 8 | run_all duplicates exec logic / no model | FIXED | copy-paste divergence | shared `runAdapter()` both paths (`src/server.ts`) | "forwards model to every adapter invocation" (differentiating) | 98% |
-| 9 | Non-constant-time token compare | FIXED | `!==` on secret | `timingSafeEqual(sha256,sha256)` (`src/httpServer.ts`) | 401-parity test (NON-differentiating — timing not unit-testable; verified by inspection + Codex + four-eyes) | 97% |
-| 10 | HEALTHCHECK hardcodes port | FIXED | exec-form, no env | shell-form `${PORT:-3919}` (`Dockerfile`) | inspection | 98% |
-| 11 | No origin/malformed-Origin tests | FIXED | test debt | allow/block/malformed tests (`tests/http.test.ts`) | 3 new origin tests (differentiating for the branches) | 99% |
-| 12 | No per-run observability | FIXED | no logging | one stderr `agent_run` line, no prompt/output (`src/server.ts`) | "emits exactly one structured agent_run line…no prompt" (differentiating) | 97% |
-| 13 | Server version hardcoded | FIXED | duplicated literal | `createRequire(...package.json).version` (`src/server.ts`) | version-parity test (NON-differentiating at current 0.1.0 parity; verified by inspection) | 97% |
-| 14 | Description omits claude | FIXED | stale text | updated (`package.json`) | inspection | 100% |
+| P1.1 | Fail-open auth on RCE endpoint | FIXED | unset MCP_TOKEN ⇒ every POST accepted; image bound 0.0.0.0 | fail-closed startup guard: refuse non-loopback bind without MCP_TOKEN (`src/httpServer.ts`); drop `ENV HOST=0.0.0.0` (`Dockerfile`); require token in compose (`${MCP_TOKEN:?}`) | "refuses to bind a non-loopback host without MCP_TOKEN" (differentiating) | 99% |
+| P2.1 | Semaphore no fast-fail / unbounded queue | FIXED | `acquire()` only resolved, `waiters[]` unbounded | bounded queue → `ServerBusyError` before enqueue (`MCP_MAX_QUEUE`, `src/exec.ts`) → isError | "rejects with ServerBusyError when the queue is full" (differentiating) | 98% |
+| P3.1 | engines node>=20 vs Node 22 | FIXED | advisory floor below real floor | `"engines": {"node": ">=22"}` (`package.json`) | inspection | 99% |
+| P3.2 | Node PID 1, no init (zombie reaping) | FIXED | no init to reap re-parented orphans | bake `tini` as `ENTRYPOINT` (`Dockerfile`) | inspection + CI image smoke | 98% |
+| P3.3 | No lint/format gate | FIXED | no ESLint, no formatter | ESLint 9 flat config w/ `no-floating-promises` (src) + Prettier `format:check`; both wired into CI | `npm run lint` + `npm run format:check` exit 0 + CI steps | 98% |
+| P3.4 | compose image tag hardcodes version | FIXED | duplicated version literal | `image: agent-mcp-hub:${APP_VERSION:-latest}` (`docker-compose.yml`) | inspection | 98% |
 
-## Honest caveats (transparent, non-blocking)
-- **#9 and #13 regression tests are non-differentiating** (pass on pre-fix code too): timing-safety is not unit-observable and version parity is currently 0.1.0=0.1.0. Both fixes are correct in code — confirmed by inspection AND both independent reviewers. #13 will catch future drift.
-- **Observability gap (minor, non-regressive):** `runAdapter` builds the invocation before its timed try, so an opencode dash-guard rejection emits no `agent_run` line. Arguably correct (no process ran); observability is new so nothing regressed. Logged for a future pass.
-- **cursor-agent stays installer-based/unpinned** (vendor publishes no checksum) — intentional, commented in the Dockerfile.
-- **Docker smoke runs on main-push only** (disk-constrained self-hosted runner) — documented CI decision.
+## Notes / honest caveats
+- **P3.3 "format" half:** Codex's fix-verification (04b) correctly flagged that the finding title said "lint/**format**" and only lint had shipped. Closed by adding Prettier (`.prettierrc.json`, `format`/`format:check` scripts, `eslint-config-prettier`, CI `format:check` step). Markdown is excluded from the formatter (prose, not code) — the gate governs code files. ESLint `no-floating-promises` found ZERO floating promises in src, confirming the round-1/round-2 `void`-discard patterns are correct.
+- **P3.3 test-scope:** `no-floating-promises` is scoped to `src/**` only (tsconfig `include` is `src`, so tests aren't in the type-checked project). Accepted, documented — tests aren't the code-execution surface; `no-unused-vars` still lints tests. (four-eyes DOWNGRADE reason; not an open defect.)
+- **Codex PLAN review (gate #1) was inconclusive** this round (forwarder issue, 03b) — compensated by 4-team re-review CONFIRMED findings + independent research + the Codex/four-eyes VERIFICATION at gate #2. The plan gate leaned on research rather than an independent engine; the fix gate had both.
 
-## Codex: agrees (94). Four-eyes double-check: **PASSED** (92), recommends SHIP.
-
-All 14 root causes resolved in code, not masked or moved. Per-issue confidence ≥97%.
+## Codex: agrees (after format closed). Four-eyes double-check: **PASSED (97)**.
+All 7 findings resolved at root cause, not masked or moved. Per-issue confidence ≥98%.
