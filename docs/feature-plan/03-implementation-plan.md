@@ -8,15 +8,26 @@
 - Create `src/adapters/claude.ts`: `claudeAdapter: AgentAdapter`, `buildInvocation(prompt, {model}) → { args: [<research-confirmed print-mode flags>, ...model], stdin: prompt }`.
 - Create `tests/adapters/claude.test.ts`: 4 tests mirroring cursor's (no-model, model, flag-like prompt via stdin, identity). TDD order.
 
-### T2 — Registry filtering (deps: T1)
+### T2 — Registry filtering (deps: T1) — rev per gate reviews
 - `src/registry.ts`:
   - Import + append `claudeAdapter` to `allAdapters()` (order: codex, cursor, opencode, claude).
-  - Add `export function enabledAdapters(agentsSpec = process.env.MCP_AGENTS): AgentAdapter[]` — unset/blank → all; else split on `,`, trim, drop empties, dedupe; unknown name → `throw new Error("Unknown agent \"<name>\" in MCP_AGENTS. Valid agents: codex, cursor, opencode, claude")`; return adapters filtered to the set, registry order preserved.
-- `tests/registry.test.ts`: update order assertion; add enabledAdapters tests (unset→4, subset, whitespace/dedupe, unknown-throws incl. message content).
+  - Add `export function enabledAdapters(agentsSpec = process.env.MCP_AGENTS): AgentAdapter[]`:
+    1. Parse: split on `,`, trim, drop empties, dedupe.
+    2. **If the parsed list is empty (covers unset, `""`, `","`, `" , "`) → return `allAdapters()`** (never an empty server).
+    3. **Validate BEFORE filtering:** for each requested name not in the known set, throw `new Error(\`Unknown agent "<name>" in MCP_AGENTS. Valid agents: ${allAdapters().map(a => a.name).join(", ")}\`)` — the valid list is GENERATED, not hardcoded; plain filtering would silently drop typos.
+    4. Return `allAdapters().filter(a => set.has(a.name))` (registry order preserved, dedupe free).
+- `tests/registry.test.ts`: update order assertion to 4 names; enabledAdapters tests: unset→4, `","`→4, subset `"codex, claude"` (whitespace) → exact order-preserving pair, duplicates deduped, unknown name throws with the name AND the valid list in the message.
 
-### T3 — Wiring (deps: T2)
-- `src/index.ts` and `src/httpServer.ts`: `allAdapters()` → `enabledAdapters()`. In httpServer, call ONCE at `startHttpServer` top (fail fast at startup per G4), pass the array into the per-request `buildServer` closure.
-- `tests/server.test.ts`: tool-list assertion → 7 names (`["claude","codex","cursor","list_agents","opencode","ping","run_all"]`); extend run_all forwarding test with claude; add a test building the server from `enabledAdapters("codex,opencode")` asserting only those agent tools + list_agents/run_all/ping exist and list_agents reports exactly that subset.
+### T3 — Wiring (deps: T2) — rev per gate reviews
+- `src/index.ts`: `allAdapters()` → `enabledAdapters()` (throw lands inside async `main()` → existing fatal handler — already safe).
+- `src/httpServer.ts`: **declare `startHttpServer` `async`** and call `const adapters = enabledAdapters()` as its first statement — a validation throw becomes a rejected promise → `http.ts`'s `.catch()` fatal path (a sync throw from a non-async function would bypass it). Pass `adapters` into the per-request `buildServer` closure. Fails before binding the port.
+- `tests/server.test.ts` — EVERY changed assertion enumerated:
+  1. Tool list → `["claude","codex","cursor","list_agents","opencode","ping","run_all"]`.
+  2. `list_agents reports availability per adapter` → 4th element `{name:"claude", available:false}` (mock throws for non-codex).
+  3. run_all parallelism test: `started` 3→4; add `expect(exec).toHaveBeenCalledWith("claude", ["-p","--output-format","text"], {cwd:"/tmp", timeoutMs:1234, input:"p"})`.
+  4. run_all mixed-labels test: add `## claude (ok)` and `claude answer` assertions (claude mock hits the default ok branch).
+  5. NEW filtered-build test: `buildServer(enabledAdapters("codex,opencode"), exec)` → listTools exactly `["codex","list_agents","opencode","ping","run_all"]`; `list_agents` returns only those two; `run_all` fans out to exactly two exec calls.
+- Confirmed UNAFFECTED (reviewer-verified): constraints, e2e, http, exec, smoke tests.
 
 ### T4 — Packaging + docs (deps: T1–T3 for accuracy, file-disjoint)
 - `Dockerfile`: install claude CLI in runtime stage (npm package per research).

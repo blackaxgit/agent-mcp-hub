@@ -22,7 +22,7 @@ Per-agent default models/timeouts, runtime toggling, config files, session resum
 
 ## Acceptance criteria
 - B1 — `tests/adapters/claude.test.ts`: invocation without model, with model, flag-like-prompt safety (stdin), identity — mirroring the other adapters.
-- B2 — Registry: `allAdapters()` order `codex,cursor,opencode,claude`; `enabledAdapters` returns all when `MCP_AGENTS` unset/empty; returns exactly the named subset (order preserved, whitespace trimmed); throws naming the invalid entry and listing valid names for unknown agents.
+- B2 — Registry: `allAdapters()` order `codex,cursor,opencode,claude`; `enabledAdapters` returns all when `MCP_AGENTS` is unset, empty, or parses to no names (explicit `","` test); returns exactly the named subset (order preserved, whitespace trimmed, duplicates deduped); throws naming the invalid entry and listing valid names (generated from the registry) for unknown agents — validation happens before filtering so typos are never silently dropped.
 - B3 — Server: tool list becomes the seven sorted names incl. `claude` and `run_all`; a server built from a filtered registry exposes only the enabled agent tools and `list_agents`/`run_all` reflect the same subset (test with `MCP_AGENTS`-style filtered list).
 - B4 — `run_all` forwarding test extended to assert claude's exec call (binary `claude`, stdin prompt, options forwarded).
 - B5 — Full suite + typecheck + build green locally AND in CI (self-hosted runner) after push.

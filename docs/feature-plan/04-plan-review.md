@@ -1,28 +1,21 @@
-# Plan Review Reconciliation — confidence gate
+# Plan Review Reconciliation — Feature 2 confidence gate
 
-Inputs: internal stress-test reviewer (verdict NEEDS REVISION, 40/100 pre-fix), Codex outside engine (codex-cli 0.142.5, gpt-5.5 — verdict NEEDS REVISION, 88/100; see 04b-codex-plan-review.md), plus a targeted follow-up research pass on `--`/stdin delimiter behavior. All findings reconciled; the plan was rewritten as **rev 2** and the spec updated. Resolution map:
+(v0.1 reconciliation preserved in git history at this path.)
 
-| Finding (source) | Severity | Resolution in rev 2 |
-|---|---|---|
-| Task 8 never updates Task 7's five-tool assertion → red suite, F2 unverified (both reviewers) | BLOCKER | Task 8 Step 1 now explicitly updates the assertion to the six sorted names |
-| Split adapter test files kept `../src/` import depth (internal #2) | BLOCKER | Per-adapter files `tests/adapters/*.test.ts` written out with `../../src/...` imports |
-| `child.stdout`/`stderr` nullable under strict TS (Codex #1, internal #5) | BLOCKER/MINOR | `child.stdout?.on(...)` optional chaining throughout exec.ts |
-| `--`-prefixed prompt = CLI option-parser injection (Codex #4, internal #3) | MAJOR | Design change grounded in delimiter research: codex + cursor deliver the prompt via documented stdin paths (`-` sentinel / piped print mode); opencode (no documented stdin or `--`) gets an explicit dash-guard throw mapped to `isError` (spec F11). Injection-safety tests added per adapter + server-level guard test |
-| Timeout rejects before child actually closes (Codex #3) | MAJOR | `timedOut` flag; kill then reject from the `close` handler |
-| Subagents would run embedded commit steps (internal #4) | MAJOR | Plan header + every Step 5 marked "skip if running as subagent"; orchestrator commits per phase (git init already done by orchestrator with user-provided repo) |
-| Task 1 typecheck with empty `src` (Codex #6) | MAJOR | Scaffold creates placeholder `src/types.ts` (`export {}`), replaced in Task 2 |
-| Tests never typechecked (Codex #7, internal #7) | MAJOR | `tsconfig.test.json` (extends base, includes `src`+`tests`, noEmit); `npm run typecheck` uses it |
-| Multibyte chunk corruption via per-chunk `toString()` (Codex #8) | MINOR | Buffer[] accumulation, single `Buffer.concat(...).toString("utf8")` on close |
-| Timeout message shape untested at server level (Codex #9) | MINOR | Dedicated timeout-rejection server test added |
-| run_all parallelism/option-forwarding unproven (Codex #10) | MINOR | Deferred-promise test: all 3 execs started before any resolves + `{cwd, timeoutMs, input}` forwarding assert |
-| C1/C5 constraints unenforced (internal #6) | MINOR | `tests/constraints.test.ts` guard (greps src for child_process outside exec.ts and stdout writes) |
-| F1 version / F9 default asserted nowhere (internal #8) | MINOR | Smoke grep extended to `"0.1.0"`; `DEFAULT_TIMEOUT_MS` unit assertion added |
+Inputs: internal stress-test reviewer (NEEDS REVISION, 58/100 verbatim → ~95 with fixes) and Codex outside engine (NEEDS REVISION, 88/100; 04b-codex-plan-review.md). The two reviews independently converged on the same three majors. All findings folded into plan rev (03-implementation-plan.md T2/T3) and spec B2.
 
-Both reviewers independently confirmed: SDK `registerTool`/`InMemoryTransport` usage matches current SDK source; exec double-settle guarding, `allSettled` fan-out, error mapping, dependency matrix (SDK ^1.29 / zod ^3.25 / vitest ^2 / Node ≥20 / NodeNext) are sound.
+| Finding (sources) | Resolution |
+|---|---|
+| `list_agents` availability test breaks un-enumerated (internal F1 ≡ Codex #3) | T3 item 2: expectation gains `{name:"claude", available:false}` |
+| `MCP_AGENTS=","` → plan yields ZERO adapters vs spec "all" (F2 ≡ #1) | T2 step 2: empty-after-parse → `allAdapters()`; B2 + registry test for `","` |
+| HTTP fail-fast throw bypasses `.catch` (sync throw from non-async fn) (F3 ≡ #2) | T3: `startHttpServer` declared `async`; validation as first statement → rejected promise → clean fatal path, before port bind |
+| Assertion breakpoints: tool list 7, registry order 4, `started` 3→4, claude exec assert (F4 ≡ #4) | T3 items 1 & 3, enumerated exactly |
+| Mixed-labels run_all test weak without claude (Codex #5) | T3 item 4 |
+| Silent-drop risk: filter without validation defeats G4 (F5) | T2 step 3: validate before filter |
+| Hardcoded valid-names list drifts (F7) | T2 step 3: generated from `allAdapters()` |
+| G5 (claude --version probe) lacks direct criterion (F6) | Accepted: structurally guaranteed by `checkAvailability(adapter.binary, ["--version"])`; indirectly covered by the availability test's 4th entry |
 
-## Residual risks (accepted, non-blocking)
-- Real-CLI behavioral drift (e.g. cursor stdin inference nuances) can't be proven by the mocked-exec suite; mitigated by graceful `isError` paths and `list_agents` probing. Acceptance criteria are satisfiable without the CLIs installed.
-- opencode dash-guard slightly restricts inputs by design (documented in README + spec F11).
+Both reviewers verified: registry-order consistency across all docs, claude argv matches ground-truth research, no layering/CLAUDE.md/stateless-HTTP conflicts, constraints/e2e/http/exec/smoke tests unaffected.
 
 ## Verdict
-Plan rev 2 addresses every finding from both reviews with concrete code in the plan itself. **Confidence: 98%.** Gate PASSED — proceed to implementation.
+Every major and minor addressed with concrete plan text. **Confidence: 98%.** Gate PASSED — proceed to implementation. Residual 2%: real `claude` CLI runtime behavior in the Docker image (unverifiable in unit CI; exercised only by the image build + runtime use).
