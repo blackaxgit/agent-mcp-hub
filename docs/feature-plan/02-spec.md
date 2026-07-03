@@ -1,42 +1,39 @@
-# Feature Spec — agent-mcp-hub v0.1
+# Feature Spec — Feature 2: Claude adapter + agent enable/disable
+
+(v0.1 spec preserved in git history; its F/C/A numbering continues to hold for shipped behavior. This spec covers the delta.)
 
 ## Requirements (functional)
-1. F1 — Runs as a stdio MCP server via `npx agent-mcp-hub` (bin → `dist/index.js`), name `agent-mcp-hub`, version `0.1.0`.
-2. F2 — Exposes exactly six tools: `codex`, `cursor`, `opencode`, `run_all`, `list_agents`, `ping`.
-3. F3 — Each agent tool accepts `{ prompt: string (required), model?: string, cwd?: string, timeoutMs?: positive int }` and executes the corresponding CLI non-interactively as a subprocess, returning trimmed stdout as a single text content block on exit 0. Prompt delivery: piped stdin for codex (documented `-` sentinel) and cursor (documented print-mode piped input); positional argv for opencode.
-4. F4 — On non-zero exit, the tool returns `isError: true` with a message containing the agent name, exit code, and stderr (falling back to stdout).
-5. F5 — On spawn failure (binary missing) the message names the binary and says it must be installed and on PATH; on timeout the message names the binary and the timeout in ms. Neither crashes the server.
-6. F6 — `run_all` accepts `{ prompt, cwd?, timeoutMs? }`, runs ALL registered agents in parallel (`Promise.allSettled`), and returns one text block per agent formatted `## <name> (ok|failed)` followed by the output or error. Individual agent failure never fails the tool call.
-7. F7 — `list_agents` probes each adapter with `<binary> --version` (10 s timeout) and returns JSON `[{ name, available }]` in registry order; probe errors map to `available: false`, never a thrown error.
-8. F8 — `ping` returns text `pong`.
-9. F9 — Default subprocess timeout 300 000 ms, overridable per call via `timeoutMs`.
-10. F10 — Exact invocations per agent as confirmed by research (docs/feature-plan/01-approach.md + delimiter follow-up): codex `exec --skip-git-repo-check [--model m] -` with prompt on stdin; cursor `-p --output-format text [--model m]` with prompt on stdin; opencode `run [--model m] <prompt>` positional. Adapters (`buildInvocation → {args, stdin?}`) are the single place invocations are built.
-11. F11 — An opencode prompt starting with `-` is rejected with an actionable `isError` (no subprocess spawned): opencode documents neither stdin input nor a `--` delimiter, so such prompts could parse as CLI flags.
+1. G1 — New `claude` agent tool wrapping the Claude Code CLI: adapter `name: "claude"`, `binary: "claude"`, non-interactive print mode with the prompt delivered via stdin (injection-safe like codex/cursor); `model` option maps to `--model`. Exact argv per research (01-approach.md).
+2. G2 — Registry order becomes `[claude, codex, cursor, opencode]`… **correction:** append to preserve existing order: `[codex, cursor, opencode, claude]` (stable order matters to `list_agents`/`run_all` tests and users).
+3. G3 — `MCP_AGENTS` env var (comma-separated, whitespace-tolerant, case-sensitive names) selects which agents are exposed. Unset or empty → all four. Applied at startup (stdio entry) / server-build (HTTP): disabled agents get NO tool, are absent from `list_agents`, and are NOT fanned out by `run_all`.
+4. G4 — An unknown name in `MCP_AGENTS` throws at wiring time with an actionable message listing valid names (fail fast; stdio entry exits 1 via existing fatal handler; HTTP entry fails at startup, not per-request).
+5. G5 — `list_agents` availability probe for claude uses `claude --version`.
+6. G6 — Docker image installs the claude CLI; compose passes `MCP_AGENTS` and `ANTHROPIC_API_KEY` through.
+7. G7 — README documents the new tool, the toggle, and claude auth in Docker.
 
 ## Constraints (must NOT)
-- C1 — No module other than `src/exec.ts` may import `node:child_process` (adapters stay pure).
-- C2 — No shell interpolation: prompts travel as a single argv element or via piped stdin through `spawn(binary, args)` (never `shell: true`).
-- C3 — No network calls from the server itself; all intelligence lives in the wrapped CLIs.
-- C4 — No new runtime dependencies beyond `@modelcontextprotocol/sdk` and `zod`.
-- C5 — Server must not write to stdout outside the MCP transport (stdio protocol safety); diagnostics go to stderr.
+- H1 — All v0.1 constraints hold (C1–C5: adapter purity, argv/stdin no-shell, no network in server, no new runtime deps, no stdout writes).
+- H2 — No second toggle mechanism (no deny-list, no config file) in this iteration.
+- H3 — `buildServer` signature/behavior unchanged — filtering happens in the registry layer before `buildServer(adapters, …)` is called.
+- H4 — Default behavior with no env set is identical to today plus the added `claude` tool (additive only).
 
-## Out of scope (v0.1)
-Session resume/multi-turn, streaming/progress, config files or env-var agent config, Claude CLI adapter, npm publish, Windows CI validation.
+## Out of scope
+Per-agent default models/timeouts, runtime toggling, config files, session resume, npm publish.
 
-## Acceptance criteria (testable)
-- A1 — `npm test` passes; suite covers: exec success/failure/missing-binary/timeout/stdin-piping + default-timeout value; each adapter's invocation (with and without `model`, flag-like prompt safety, opencode dash-guard throw); registry order + availability true/false/throws; server ping, tool listing (exactly the six tools), agent tool success path (exec called with adapter invocation and `{cwd, timeoutMs, input}`), non-zero-exit → `isError` with exit code + stderr, spawn-failure and timeout-message rejections → `isError` with actionable text, opencode dash-prompt → `isError` without spawning; `run_all` mixed ok/failed labeling + all-started-before-any-finishes parallelism + option forwarding; C1/C5 architecture guard test.
-- A2 — `npm run typecheck` (tsconfig.test.json covering `src/**` AND `tests/**`) and `npm run build` pass clean.
-- A3 — Piping an MCP `initialize` JSON-RPC request into `node dist/index.js` returns a response containing `"agent-mcp-hub"` and `"0.1.0"`.
-- A4 — `README.md` documents tools, prerequisites, and Claude Code + generic `mcp.json` install snippets.
-- A5 — Conventional commits per logical unit on `main`, pushed to origin only after a clean security-gate (gitleaks/trufflehog) run.
+## Acceptance criteria
+- B1 — `tests/adapters/claude.test.ts`: invocation without model, with model, flag-like-prompt safety (stdin), identity — mirroring the other adapters.
+- B2 — Registry: `allAdapters()` order `codex,cursor,opencode,claude`; `enabledAdapters` returns all when `MCP_AGENTS` unset/empty; returns exactly the named subset (order preserved, whitespace trimmed); throws naming the invalid entry and listing valid names for unknown agents.
+- B3 — Server: tool list becomes the seven sorted names incl. `claude` and `run_all`; a server built from a filtered registry exposes only the enabled agent tools and `list_agents`/`run_all` reflect the same subset (test with `MCP_AGENTS`-style filtered list).
+- B4 — `run_all` forwarding test extended to assert claude's exec call (binary `claude`, stdin prompt, options forwarded).
+- B5 — Full suite + typecheck + build green locally AND in CI (self-hosted runner) after push.
+- B6 — Docker: `docker compose config -q` clean; Dockerfile installs the claude CLI (verified in CI docker job build).
+- B7 — README shows the `claude` tool row, `MCP_AGENTS` usage (stdio env + compose), and `ANTHROPIC_API_KEY` note.
 
 ## Edge cases
-- Binary missing / not executable → F5 path (per-tool and inside `run_all`).
-- Agent CLI hangs → timeout kill (SIGKILL) + rejection mapped to `isError`.
-- Agent writes errors to stdout with exit ≠ 0 → stderr-empty fallback to stdout (F4).
-- Prompt containing quotes/newlines → safe (argv/stdin, no shell). Flag-like `-`/`--` prompt prefix → safe via stdin delivery for codex/cursor; explicitly rejected with an actionable error for opencode (F11) since argv-passing alone does not prevent CLI option-parser injection.
-- Empty stdout on success → empty text block, not an error.
-- Concurrent `run_all` with one slow agent → others' results not blocked past `Promise.allSettled` semantics (single call returns when all settle or time out).
+- `MCP_AGENTS="codex, claude"` (spaces) → works; `MCP_AGENTS=""` → all; `MCP_AGENTS=","` → treated as empty → all; duplicate names → deduped (or harmless duplicates prevented — spec: dedupe).
+- `MCP_AGENTS=clade` (typo, from the user's own message!) → fail-fast error listing `codex, cursor, opencode, claude` — this is the motivating case for G4.
+- Recursive use (hub called from Claude Code invoking `claude`) → allowed; `MCP_AGENTS` lets operators disable claude to prevent it.
+- Claude CLI unauthenticated in container → tool returns the CLI's stderr via existing exit-code path; `list_agents` still reports installed.
 
 ## Open questions
-None — CLI invocations, `--`/stdin delimiter behavior, and SDK API were all verified by research (01-approach.md) and the plan was revised through the two-review gate (04-plan-review.md) before implementation.
+None — pending only research confirmation of exact claude argv/package (gate blocks on it).

@@ -1,21 +1,31 @@
-# Codebase Analysis — agent-mcp-hub
+# Codebase Analysis — Feature 2: Claude adapter + agent toggles
 
-## Current state
-Greenfield. The repository (`git@github.com:blackaxgit/agent-mcp-hub.git`, empty remote, fresh local `main`) contains only documentation:
+(v0.1 greenfield analysis preserved in git history at this path.)
 
-- `docs/superpowers/plans/2026-07-02-agent-mcp-hub.md` — approved 9-task TDD implementation plan (source of truth for design).
-- `docs/feature-plan/*` — this pipeline's artifacts.
-
-No source code, no package.json, no CI, no existing conventions to inherit. No project CLAUDE.md; the user's global CLAUDE.md applies (strict layering, subagents never commit, conventional commits without AI trailers, mandatory pre-push security gate).
-
-## Target stack (from the approved plan)
-- TypeScript strict ESM (`NodeNext`), Node ≥20.
-- `@modelcontextprotocol/sdk` (McpServer + StdioServerTransport), `zod` input schemas.
-- `vitest` tests; in-memory MCP client/server pair for integration tests.
-- Layering: pure adapters (`src/adapters/*`) → single subprocess boundary (`src/exec.ts`) → MCP wiring (`src/server.ts`) → bin entry (`src/index.ts`).
+## Current state (post-v0.1 + Docker/HTTP + CI)
+TypeScript strict ESM (NodeNext), Node ≥20. 43 tests green, CI on self-hosted runner (secrets → test → docker jobs). Layering: pure adapters → `src/exec.ts` subprocess boundary → `src/server.ts` MCP wiring → entries (`src/index.ts` stdio, `src/http.ts`/`src/httpServer.ts` streamable HTTP, stateless per-request `buildServer`).
 
 ## Feature touchpoints
-Everything is created new; nothing breaks, no migrations. External touchpoints are the three CLI binaries on PATH (`codex`, `cursor-agent`, `opencode`) — integration with them is subprocess-only, validated at runtime by `list_agents` and per-call error handling.
+| File | Change |
+|---|---|
+| `src/adapters/claude.ts` (new) | `claudeAdapter` — `buildInvocation → {args, stdin}` like codex/cursor |
+| `tests/adapters/claude.test.ts` (new) | same 4-test pattern as other adapters |
+| `src/registry.ts` | register claudeAdapter; add `enabledAdapters(env)` filtering by `MCP_AGENTS` (allowlist, unset → all, unknown name → throw actionable error) |
+| `tests/registry.test.ts` | order/filter/fail-fast tests |
+| `src/index.ts`, `src/httpServer.ts` | use `enabledAdapters()` instead of `allAdapters()` |
+| `tests/server.test.ts` | tool-list assertion gains `claude` (6→7 tools); add filtered-adapters test |
+| `tests/http.test.ts` | unaffected (ping only) — verify |
+| `Dockerfile` | install claude CLI in runtime stage |
+| `docker-compose.yml` | pass `MCP_AGENTS`, `ANTHROPIC_API_KEY` through |
+| `README.md` | tools table + config section |
 
-## Build/test/deploy
-`npm run build` (tsc → dist), `npm test` (vitest), bin `agent-mcp-hub`. Deploy = git push to origin (npm publish out of scope).
+## Constraints to preserve
+- C1/C5 guard tests (adapters stay pure; no stdout writes).
+- `run_all` and `list_agents` operate on the SAME filtered adapter list the tools are built from (single source: adapters array passed to `buildServer` — filtering happens before `buildServer`, so no changes inside server.ts itself).
+- exec/timeout/error contracts unchanged.
+
+## Breakage risk
+The server tool-list test (`exactly six tools`) and spec F2 need updating to seven; `run_all` forwarding test asserts per-adapter argv — claude addition extends it. No migrations; no external breakage (new tool is additive; toggles default to all-on).
+
+## Interleaving hazard
+Dependabot PR triage is running concurrently on `main` (merges will move origin/main; `git pull --rebase` before each push of this feature).
