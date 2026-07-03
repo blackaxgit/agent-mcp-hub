@@ -4,7 +4,7 @@
   "description": "One MCP server bridging the Codex, Cursor, and OpenCode CLI agents",
   "license": "MIT",
   "type": "module",
-  "bin": { "agent-mcp-hub": "dist/index.js" },
+  "bin": { "agent-mcp-hub": "dist/index.js", "agent-mcp-hub-http": "dist/http.js" },
   "files": ["dist"],
   "engines": { "node": ">=20" },
   "scripts": {
