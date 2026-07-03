@@ -3,9 +3,17 @@ services:
     build: .
     image: agent-mcp-hub:0.1.0
     ports:
-      - "3919:3919"
+      # Loopback-only publish: the /mcp endpoint can spawn coding agents, so
+      # never expose it beyond this host without setting MCP_TOKEN and a TLS
+      # reverse proxy in front.
+      - "127.0.0.1:3919:3919"
     environment:
       PORT: 3919
+      # Optional shared-secret auth: when set, POST /mcp requires
+      # "Authorization: Bearer <token>".
+      MCP_TOKEN: ${MCP_TOKEN:-}
+      # Extra allowed browser Origins (comma-separated); loopback is always allowed.
+      MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-}
       # Credential passthrough for the wrapped CLIs (set the ones you use):
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       CURSOR_API_KEY: ${CURSOR_API_KEY:-}

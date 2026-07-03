@@ -87,6 +87,16 @@ read-only login-dir mounts in `docker-compose.yml`.
 (the `./workspace` bind mount is preconfigured) and pass `cwd: "/workspace"` in
 your tool calls.
 
+**Security:** the `/mcp` endpoint can spawn coding agents, so treat it like a
+shell. The server binds `127.0.0.1` by default (`HOST=0.0.0.0` only inside the
+container) and compose publishes the port on loopback only. Browser requests
+from non-loopback Origins get 403 (DNS-rebinding guard; extend via
+`MCP_ALLOWED_ORIGINS`). Set `MCP_TOKEN` to require
+`Authorization: Bearer <token>` on every call — mandatory before exposing the
+port beyond this host (plus TLS via a reverse proxy). The cursor CLI installs
+via the vendor's `curl | bash` script (no published checksums); opt out with
+`docker build --build-arg INSTALL_CURSOR=false .`
+
 Prefer stdio? `npx agent-mcp-hub` still works without Docker (see
 [Install](#install)).
 

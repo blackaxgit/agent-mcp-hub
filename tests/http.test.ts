@@ -43,3 +43,48 @@ describe("streamable HTTP transport", () => {
     expect(res.status).toBe(404);
   });
 });
+
+describe("security hardening", () => {
+  it("rejects non-loopback Origin with 403 (DNS-rebinding guard)", async () => {
+    const res = await fetch(`${baseUrl}/mcp`, {
+      method: "POST",
+      headers: { origin: "http://evil.example.com" },
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it("allows loopback Origins", async () => {
+    const res = await fetch(`${baseUrl}/mcp`, {
+      method: "GET",
+      headers: { origin: "http://localhost:3000" },
+    });
+    // Passes the origin gate and reaches the method check instead of 403.
+    expect(res.status).toBe(405);
+  });
+
+  it("requires the bearer token when MCP_TOKEN is set", async () => {
+    process.env.MCP_TOKEN = "s3cret";
+    try {
+      const missing = await fetch(`${baseUrl}/mcp`, { method: "POST" });
+      expect(missing.status).toBe(401);
+
+      const wrong = await fetch(`${baseUrl}/mcp`, {
+        method: "POST",
+        headers: { authorization: "Bearer nope" },
+      });
+      expect(wrong.status).toBe(401);
+
+      const client = new Client({ name: "http-test-auth", version: "0.0.0" });
+      await client.connect(
+        new StreamableHTTPClientTransport(new URL(`${baseUrl}/mcp`), {
+          requestInit: { headers: { authorization: "Bearer s3cret" } },
+        }),
+      );
+      const res = await client.callTool({ name: "ping", arguments: {} });
+      expect((res.content as Array<{ type: string; text: string }>)[0].text).toBe("pong");
+      await client.close();
+    } finally {
+      delete process.env.MCP_TOKEN;
+    }
+  });
+});
