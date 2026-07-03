@@ -1,39 +1,41 @@
-# Fix Plan — pre-release hardening
+# Fix Plan — re-review round 2
 
-Design constraints: no new runtime deps; adapters stay pure (only `exec.ts` spawns); audit/log to stderr only (C5); TDD (failing test first) for every behavioral fix. Grouped by file for disjoint agent ownership.
+Constraints: no new RUNTIME deps (ESLint is devDeps only); TDD for behavioral fixes; disjoint file ownership. Grouped by file.
 
-## Group A — `src/exec.ts` (#1 tree-kill, #2 output cap, #3 semaphore) — FOUNDATIONAL, done first
-- Spawn with `detached: true` (child becomes group leader). Do NOT `unref()` (we await output).
-- Replace `child.kill("SIGKILL")` with `killTree(child)`: `try { process.kill(-child.pid, "SIGKILL") } catch (ESRCH) {} ` + fallback `child.kill("SIGKILL")`. Used by timeout AND output-cap breach.
-- Add `maxOutputBytes` opt (default `10 * 1024 * 1024`). Track running byte count across stdout+stderr chunks; on breach set `killedForOutput=true`, `killTree`, and on close reject with `"<binary> exceeded output limit of Nmb"` (never echo captured bytes).
-- Add module-level async semaphore `withSlot<T>(fn)`: `MAX_CONCURRENT_AGENTS` (default 4, `process.env.MCP_MAX_CONCURRENT_AGENTS` override, parsed once). `runCommand` acquires a slot before spawn, releases in `finally`. Queue is FIFO; no fast-fail (queue) to keep behavior simple and correct.
-- `Exec` type gains `maxOutputBytes?`. Signatures otherwise unchanged (backward compatible).
-- Tests (`tests/exec.test.ts`): (a) grandchild-survivor — spawn `node -e` that forks a `setTimeout` grandchild writing a marker file; timeout; assert grandchild dead (poll marker not updated) — Linux/macOS process-group. (b) output-cap — child dumps > limit; assert reject with limit message and process killed. (c) semaphore — launch N>cap slow spawns; assert no more than cap run concurrently (instrument via a shared counter through an injected fake, or count live PIDs). Keep existing 6 tests green.
+## Group A — `src/httpServer.ts` + `tests/http.test.ts` (P1.1 fail-closed auth)
+- In `startHttpServer(port, host)`, BEFORE creating/listening, add:
+  ```ts
+  if (!LOOPBACK_HOSTNAMES.has(host) && !process.env.MCP_TOKEN) {
+    throw new Error(
+      `Refusing to bind non-loopback host "${host}" without MCP_TOKEN set — the /mcp endpoint can execute code. Set MCP_TOKEN (and front it with TLS) to expose it.`,
+    );
+  }
+  ```
+  (async fn → throw becomes a rejected promise → http.ts `.catch` fatal path, before the port binds.)
+- Leave the per-request token check UNCHANGED (still reads `process.env.MCP_TOKEN` each request) so the existing token tests, whose shared loopback server reads env per-request, keep passing.
+- Invariant restored: no unauthenticated non-loopback exposure of a code-execution endpoint. NOT a symptom patch — it closes the default-open path at the bind boundary, not per-request.
+- Tests: (a) `startHttpServer(0, "0.0.0.0")` with MCP_TOKEN unset → REJECTS with /MCP_TOKEN/; (b) with MCP_TOKEN set → resolves, then close; (c) loopback default host with no token still starts (unchanged). Existing origin/token/listen tests stay green (loopback).
+- Side effects: the container now REQUIRES MCP_TOKEN to run (it binds 0.0.0.0) — handled in Group C (compose/CI provide a token). Healthz stays unauthenticated (liveness).
 
-## Group B — `src/server.ts` (#8 runAdapter, #12 observability, #13 version) — deps A
-- Extract `async function runAdapter(adapter, exec, {prompt, model, cwd, timeoutMs}, auditLog): Promise<ExecResult>` wrapping buildInvocation→exec with timing; emit ONE structured line to stderr per call: `console.error(JSON.stringify({evt:"agent_run", agent, cwd, ms, exitCode}))` (NO prompt/output). Both the per-agent handler and run_all call it → single source (#8), so run_all inherits model support + all exec-path fixes.
-- Add optional `model` to run_all inputSchema, passed through.
-- Version: `createRequire(import.meta.url)("../package.json").version` → McpServer version (#13). (tsconfig `resolveJsonModule` not needed via createRequire.)
-- Tests: run_all now forwards `model`; version test reads package.json; observability — capture stderr writes, assert one JSON line/call with no prompt text.
+## Group B — `src/exec.ts` + `tests/exec.test.ts` (P2.1 bounded queue)
+- `Semaphore` gains a `maxQueue` (from `MCP_MAX_QUEUE`, non-negative int). `acquire()` rejects with a typed `class ServerBusyError extends Error` (`code = "SERVER_BUSY"`, message "server busy: agent queue full, retry later") when `waiters.length >= maxQueue`. Release/FIFO logic unchanged. Default `maxQueue`: pick a value ≥ the existing semaphore test's queue depth so it stays green (read the test; use e.g. 64). The new busy test sets `MCP_MAX_QUEUE=0` for a deterministic instant-reject once all permits are busy. (Research maps ServerBusyError → HTTP 503+Retry-After conceptually; here it surfaces as an MCP `isError` result — no HTTP status to set in the stateless per-request model, so the actionable text is the contract.)
+- `runCommand`/`withSlot` propagate the rejection; it flows through `runAdapter` → the tool handler's existing `catch` → `isError` result (503-equivalent) with no process spawned.
+- Invariant: overload sheds load instead of growing latency unbounded. NOT a symptom patch — bounds the actual unbounded resource (the wait queue).
+- Tests: set `MCP_MAX_QUEUE` small + cap small, saturate with slow spawns, assert the overflow acquirer rejects with ServerBusyError while in-flight ones still complete. Default (100) keeps the existing semaphore test green.
 
-## Group C — `src/httpServer.ts` (#4 listen-reject, #9 timing-safe) — deps A (independent of B)
-- Before `listen`: `httpServer.once("error", reject)`; on `listening` remove it and resolve.
-- Token check: `const expected = Buffer.from(sha256(\`Bearer ${token}\`)); const got = Buffer.from(sha256(String(req.headers.authorization ?? "")));` compare via `crypto.timingSafeEqual(expected, got)` (equal-length by hashing). Reject non-string auth.
-- Tests (`tests/http.test.ts`): (a) listen on an already-bound port → promise rejects (#4). (b) origin allowlist pass + block + malformed-Origin→403 (#11). Token tests still pass (behavior unchanged, timing-safe).
+## Group C — `Dockerfile` + `docker-compose.yml` + `.github/workflows/ci.yml` (infra: P1.1 image, P3.2 init, P3.4 tag, P3.3 CI lint)
+- Dockerfile: REMOVE `ENV HOST=0.0.0.0` (default becomes http.ts's 127.0.0.1 — safe). Keep EXPOSE/HEALTHCHECK. **P3.2 — bake tini**: `apt-get install -y tini` (Debian base) and `ENTRYPOINT ["/usr/bin/tini","--"]` before the CMD — this reaps zombie agent grandchildren + forwards signals uniformly across compose/CI/bare `docker run` (research: bake-in beats `init:true` for an image that spawns many children). So NO `init: true` needed in compose (would be redundant).
+- docker-compose.yml: set `HOST: "0.0.0.0"` (needed so the published port reaches the server) and require a token: `MCP_TOKEN: ${MCP_TOKEN:?set MCP_TOKEN in .env — the /mcp endpoint executes code}`; change `image: agent-mcp-hub:0.1.0` → `image: agent-mcp-hub:${APP_VERSION:-latest}` (P3.4). Keep loopback publish `127.0.0.1:3919:3919`. (No `init:true` — tini is baked.)
+- ci.yml: (P1.1) the docker smoke step must pass `-e HOST=0.0.0.0 -e MCP_TOKEN=ci-smoke-token` to `docker run` (healthz needs no token; tini is the baked ENTRYPOINT). (P3.3) add a `- run: npm run lint` step in the `test` job before build.
+- Verify: `docker compose config -q` (with MCP_TOKEN set in env for the check). No test file — validated by the CI run itself.
 
-## Group D — `Dockerfile` (#5 pin, #10 healthcheck) — independent
-- Pin: `npm install -g @openai/codex@<v> opencode-ai@<v> @anthropic-ai/claude-code@<v>` (exact latest published versions resolved at implementation via `npm view <pkg> version`), with a comment that Dependabot's docker ecosystem won't track these — bump manually or via a tracked manifest later.
-- HEALTHCHECK → shell-form: `CMD curl -fsS "http://localhost:${PORT:-3919}/healthz" || exit 1`.
+## Group D — `package.json` + `eslint.config.js` (P3.1 engines, P3.3 lint tooling)
+- package.json: `"engines": { "node": ">=22" }` (P3.1); add `"lint": "eslint ."`; add devDeps `eslint` + `typescript-eslint` (versions per research); `npm install`.
+- eslint.config.mjs (new, flat config): ESLint 9 + typescript-eslint 8. Scope `src/**/*.ts` + `tests/**/*.ts`, `globalIgnores(["dist/","coverage/","node_modules/"])`. START with the UNTYPED `js.configs.recommended` + `tseslint.configs.recommended` plus explicit `no-unused-vars` (`argsIgnorePattern:"^_"`) — this bounds risk. THEN try adding type-checked `no-floating-promises` (needs `parserOptions.projectService:true`, `tsconfigRootDir: import.meta.dirname`); if it flags only a few real spots, fix them; if it explodes on the existing `void x.close()` patterns or throws "not in project" on config files, KEEP the untyped lean ruleset so `npm run lint` passes without churning working code. The deliverable is a passing lint GATE, not a rewrite. Report any GENUINE bug ESLint surfaces (e.g. a real floating promise) instead of silencing it.
+- Verify: `npm run lint` exits 0; `npm test`/`typecheck`/`build` still green.
 
-## Group E — `package.json` (#6 prepublishOnly, #14 description) — independent
-- `"prepublishOnly": "npm run build && npm test"`.
-- Description → "...Codex, Cursor, OpenCode, and Claude CLI agents".
+## Execution
+Phase 1 parallel (no npm install, disjoint files): A, B, C. Phase 2: D (owns the only `npm install`; runs after so no node_modules race with A/B's vitest). Orchestrator then integrates: full suite + lint + build, Codex verify, four-eyes, gated push. `git pull --rebase` before push.
 
-## Group F — `.github/workflows/ci.yml` (#7 image smoke) — independent
-- After build: `docker run -d --name hub -p 3919:3919 agent-mcp-hub:ci`; poll `curl -fsS localhost:3919/healthz` with retry (≤10× sleep 2); `docker rm -f hub` in `if: always()`; then the existing prune.
-
-## Regression-test summary
-Every behavioral fix (#1,#2,#3,#4,#8,#9,#11,#12,#13) ships a test that fails pre-fix, passes post-fix. #5,#6,#7,#10,#14 are config/CI/text — verified by inspection + (for #7) the CI run itself.
-
-## Not symptom patches
-#1 fixes the process-group invariant, not "kill harder". #8 removes the duplication that would let #1/#2 half-land. #3/#2 bound the two unbounded resources structurally. #4 restores the listen error contract.
+## Regression tests
+Behavioral: P1.1 (guard reject/allow), P2.1 (busy rejection). Config/CI: P3.1/P3.2/P3.4 by inspection + `docker compose config`; P3.3 by `npm run lint` exit 0 + the CI lint step.
