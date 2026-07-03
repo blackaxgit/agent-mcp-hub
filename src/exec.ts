@@ -21,11 +21,31 @@ function parseConcurrency(raw: string | undefined): number {
   return Number.isInteger(n) && n > 0 ? n : 4;
 }
 
+/** Non-negative finite integer only; NaN/negative/non-integer all fall back to 100. */
+function parseMaxQueue(raw: string | undefined): number {
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 0 ? n : 100;
+}
+
 /**
  * Cap on children spawned concurrently across the process. Parsed once at module
  * load; override via MCP_MAX_CONCURRENT_AGENTS.
  */
 export const MAX_CONCURRENT_AGENTS = parseConcurrency(process.env.MCP_MAX_CONCURRENT_AGENTS);
+
+/**
+ * Thrown when every permit is busy AND the wait queue is already full. Overload
+ * sheds load here instead of growing latency unbounded — the caller retries
+ * later. Surfaces through runCommand → runAdapter → the tool handler's catch as
+ * an `isError` result (the 503-equivalent in the stateless per-request model).
+ */
+export class ServerBusyError extends Error {
+  readonly code = "SERVER_BUSY";
+  constructor() {
+    super("server busy: agent queue full, retry later");
+    this.name = "ServerBusyError";
+  }
+}
 
 /**
  * Kill an entire process group. Children are spawned `detached`, making each the
@@ -57,19 +77,30 @@ function killGroup(
  * FIFO async semaphore. `acquire` resolves to a release token that hands the
  * permit straight to the next waiter (never bumping the count while anyone is
  * queued) and is idempotent so a double release cannot leak an extra permit.
+ *
+ * The wait queue is bounded: when no permit is free and the queue is already at
+ * `maxQueue()`, `acquire` rejects with `ServerBusyError` BEFORE enqueuing rather
+ * than letting the backlog grow without limit. `maxQueue` is a thunk so the
+ * bound is read per-acquire (keeps the class free of env reads and lets it be
+ * overridden without reloading the module).
  */
 class Semaphore {
   private permits: number;
   private readonly waiters: Array<() => void> = [];
+  private readonly maxQueue: () => number;
 
-  constructor(permits: number) {
+  constructor(permits: number, maxQueue: () => number) {
     this.permits = permits;
+    this.maxQueue = maxQueue;
   }
 
   async acquire(): Promise<() => void> {
     if (this.permits > 0) {
       this.permits -= 1;
     } else {
+      if (this.waiters.length >= this.maxQueue()) {
+        throw new ServerBusyError();
+      }
       await new Promise<void>((resolve) => this.waiters.push(resolve));
     }
     let released = false;
@@ -83,7 +114,7 @@ class Semaphore {
   }
 }
 
-const sem = new Semaphore(MAX_CONCURRENT_AGENTS);
+const sem = new Semaphore(MAX_CONCURRENT_AGENTS, () => parseMaxQueue(process.env.MCP_MAX_QUEUE));
 
 /** Run `fn` holding one semaphore slot; the slot is released on every exit path. */
 async function withSlot<T>(fn: () => Promise<T>): Promise<T> {

@@ -1,8 +1,13 @@
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { DEFAULT_TIMEOUT_MS, MAX_CONCURRENT_AGENTS, runCommand } from "../src/exec.js";
+import {
+  DEFAULT_TIMEOUT_MS,
+  MAX_CONCURRENT_AGENTS,
+  ServerBusyError,
+  runCommand,
+} from "../src/exec.js";
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -147,5 +152,33 @@ describe("runCommand concurrency semaphore", () => {
       .map(Number);
     expect(observed.length).toBe(MAX_CONCURRENT_AGENTS * 2);
     expect(Math.max(...observed)).toBeLessThanOrEqual(MAX_CONCURRENT_AGENTS);
+  });
+
+  it("rejects with ServerBusyError when the queue is full", async () => {
+    // MCP_MAX_QUEUE is read per-acquire, so setting it to "0" makes the queue
+    // reject the instant every permit is busy — no waiting, deterministic.
+    const prev = process.env.MCP_MAX_QUEUE;
+    process.env.MCP_MAX_QUEUE = "0";
+    try {
+      // Saturate every permit with slow, still-running children.
+      const inFlight = Array.from({ length: MAX_CONCURRENT_AGENTS }, () =>
+        runCommand("node", ["-e", "setTimeout(() => {}, 1500)"]),
+      );
+      // Give the acquires above a tick to take all permits before we overflow.
+      await delay(50);
+
+      // With permits exhausted and maxQueue 0, the next acquire sheds load.
+      await expect(runCommand("node", ["-e", "0"])).rejects.toBeInstanceOf(ServerBusyError);
+      await expect(runCommand("node", ["-e", "0"])).rejects.toMatchObject({
+        code: "SERVER_BUSY",
+      });
+
+      // The in-flight children were never disturbed and still resolve cleanly.
+      const results = await Promise.all(inFlight);
+      for (const r of results) expect(r.exitCode).toBe(0);
+    } finally {
+      if (prev === undefined) delete process.env.MCP_MAX_QUEUE;
+      else process.env.MCP_MAX_QUEUE = prev;
+    }
   });
 });
