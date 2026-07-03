@@ -1,19 +1,19 @@
-# Approach Research — Feature 2 (verified 2026-07-03)
+# Approach Research — Feature 3: mcp-template selective alignment (2026-07-03)
 
-(v0.1 research preserved in git history at this path.)
+Source: deep extraction of `~/Projects/mcps/mcp-template` (template-analyst report; protocols/*.md are binding, the TS skeleton is reference). User confirmed **Selective spine** scope.
 
-## Claude Code CLI (verified against local CLI v2.1.199 + official docs)
-- **Adapter invocation:** `args: ["-p", "--output-format", "text", ("--model", m)]`, `stdin: prompt`. Empirically confirmed: piped stdin with no positional arg returns clean text, exit 0. `text` is the default print-mode format (kept explicit, matching the cursor adapter).
-- **Injection safety:** stdin-delivered prompts starting with `-` are never parsed as flags — same guarantee as codex/cursor adapters.
-- **Model flag:** `--model` accepts aliases (`sonnet`, `opus`, `fable`) or full model names.
-- **Availability probe:** `claude --version` → exit 0 ("2.1.199 (Claude Code)").
-- **Permissions:** plain text Q&A needs no permission flags; only tool-driving prompts would need `--allowedTools`/`--permission-mode` — out of scope for the wrapper (the wrapped CLI decides).
-- **`--bare` decision — NOT used:** `--bare` gives reproducible container runs but restricts auth strictly to `ANTHROPIC_API_KEY`/apiKeyHelper (OAuth/keychain never read). The hub's convention is reusing host CLI logins (codex/cursor/opencode all do), so non-bare keeps local stdio users on OAuth working. Docs note `ANTHROPIC_API_KEY` for containers. Revisit if `--bare` becomes the `-p` default as announced.
-- **Stdin cap:** 10MB piped-prompt limit (CLI exits non-zero over cap) — surfaced through the existing non-zero-exit error path; no code needed.
+## What the template mandates vs what we adopt
+The template distinguishes its **normative spine** (protocol files) from **substitutable stack choices** (Express/Winston/Jest/dir layout — explicitly substitutable per templates/README.md). We adopt the spine items we're missing; stack stays; every remaining divergence goes in TEMPLATE-DEVIATION.md — the template's own mechanism (`templates/typescript/TEMPLATE-DEVIATION.md.example` format: clause, what-instead file:line, why, risk, mitigations, remediation owner+date).
 
-## Docker install
-- `npm install -g @anthropic-ai/claude-code`; needs **Node 22+** (v2.1.198+) — our image is `node:22-bookworm-slim`, compliant (only EBADENGINE warnings on older, but we're fine). Ships a native binary (linux-x64/arm64 incl. musl); Debian 10+ OK. No `sudo npm`.
-- Container auth: `ANTHROPIC_API_KEY` env (primary) — added to compose passthrough.
+## Adoption designs (mapped to template prescriptions)
+1. **TEMPLATE-DEVIATION.md** (root). Entries: opt-in auth on loopback (vs fail-closed default, security-protocol §1); stdio transport offered (vs Streamable-HTTP-only, AGENTS.md L7 — stdio is the product's primary local mode); no rate/inflight caps (build-protocol §resilience — single-user local); SDK `isError` text instead of closed error taxonomy + envelope v2 (build-protocol §6/§6a); no schema `examples`/`outputSchema` (build-protocol §3); stack substitutions (raw node:http, stderr logging, vitest); base image tag-pinned not digest-pinned (security-protocol §9); client-controlled `cwd` (local-tool acceptance).
+2. **Central config** (`src/config.ts`, per operator-guide §2): parse once at boot, immutable, ALL errors aggregated into one fatal `ConfigError`. Fields: `MCP_PORT`|`PORT` (int 1–65535, default 3919), `MCP_HOST`|`HOST` (default 127.0.0.1; MCP_-prefixed takes precedence), `MCP_TOKEN`, `MCP_ALLOWED_ORIGINS` (comma list), `MCP_SHUTDOWN_TIMEOUT_SECONDS` (default 25, positive int), `MCP_AGENTS` (raw passthrough — name validation stays in `enabledAdapters`, already fail-fast). `startHttpServer` consumes a `Config` instead of reading `process.env` per request.
+3. **Graceful shutdown + /readyz** (template lifespan pattern): drain controller — `draining` flag; `/readyz` → 200/503 (`/healthz` stays pure liveness); on drain: stop accepting (`server.close`), force-close after `shutdownTimeoutMs` (`closeAllConnections`), resolve when drained. Signal handlers (SIGTERM/SIGINT) installed ONLY in the `http.ts` entry, not in `startHttpServer` (keeps tests clean) — mirrors template's composition-root wiring.
+4. **Annotations + orientation** (build-protocol §1/§4): `readOnlyHint: true` on `ping`/`list_agents`; `destructiveHint: true, openWorldHint: true` on agent tools + `run_all`, with a blast-radius sentence in each description ("the agent may read and modify files under cwd"). `initialize.instructions` via `new McpServer({...}, { instructions })` (SDK ServerOptions) describing the tool surface and `MCP_AGENTS`.
+5. **Audit events** (security-protocol §8, scaled to a local single-user tool): one JSON line per `tools/call` to **stderr** (C5-safe): `{ts, event:"tool_call", tool, outcome:"ok"|"error", exitCode, durationMs, outputSizeClass}` — size CLASS never raw payloads (template's cardinal audit rule). Injectable sink for tests; third optional param of `buildServer`.
 
-## MCP_AGENTS toggle
-No external prior art needed — env allowlist matches the project's existing `MCP_TOKEN`/`MCP_ALLOWED_ORIGINS` convention; fail-fast on unknown names per the project's reliability standard (actionable errors at startup, not silent skips).
+## Explicitly deferred (recorded as deviations, not built)
+Fail-closed auth default, Express boundary chain, Winston, Jest, ESLint/Prettier configs, error envelope v2, HMAC cursors/pagination, rate/inflight caps, multi-tenant, credential-context, schema examples/outputSchema.
+
+## SDK facts (already verified in feature 1/2 research, still current)
+`registerTool(name, {description, inputSchema, annotations}, handler)` supports `annotations` (ToolAnnotations); `McpServer` second ctor arg accepts `{instructions}`; `Client.getInstructions()` exposes it after initialize — used in tests.

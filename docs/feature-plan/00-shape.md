@@ -1,26 +1,23 @@
-# Scope Shape — Feature 2: Claude adapter + agent toggles
+# Scope Shape — Feature 3: mcp-template alignment
 
-(v0.1 shape preserved in git history at this path.)
+## Problem
+agent-mcp-hub was hand-built before adopting `~/Projects/mcps/mcp-template` as the house standard. The template's protocols prescribe a security/operability spine (fail-closed auth, audit, shutdown, config discipline, deviation register) that the hub only partially satisfies (gap matrix: 00-codebase-analysis.md).
 
-## Problem & audience
-Two asks: (1) the hub cannot delegate to Claude Code — the most-used agent CLI is missing; (2) all wrapped agents are always exposed — users who only have some CLIs installed (or want to prevent, e.g., recursive claude-in-claude calls) can't turn agents off; disabled-but-exposed tools waste client tool-selection attention.
+## Chosen mode: Selective (pending user confirmation)
+Full alignment would mean swapping to the skeleton stack (Express/Winston/Jest layout) and a fail-closed-by-default auth posture — high-churn, and the template itself marks the stack substitutable and provides TEMPLATE-DEVIATION.md exactly for justified divergence. The hub is a local-first personal tool; wholesale conversion buys little.
 
-## Chosen mode: Reduction
-Smallest valuable slice: one new pure adapter + one env-var allowlist, mirroring existing patterns exactly.
+## Proposed adoption set (the spine, not the skin)
+1. **TEMPLATE-DEVIATION.md** — register every deliberate divergence (open-auth-on-loopback default, stdio transport offered, no rate/inflight caps, SDK isError instead of closed error taxonomy, raw http/vitest/no-Winston substitutions) with risk + mitigation + remediation, per the template's own format.
+2. **Central validated config** (`src/config.ts`): parse/validate ALL env (`MCP_TOKEN`, `MCP_ALLOWED_ORIGINS`, `MCP_AGENTS`, `MCP_PORT`/`PORT`, `MCP_HOST`/`HOST`) once, fail-fast with aggregated errors (template §operator-guide).
+3. **Graceful shutdown + /readyz**: SIGTERM/SIGINT → readiness 503 → stop accepting → drain inflight with timeout → clean exit (HTTP entry).
+4. **Tool annotations + orientation**: `readOnlyHint` (ping/list_agents), `destructiveHint`+`openWorldHint` + blast-radius sentence (agent tools, run_all), `initialize.instructions` server orientation string.
+5. **Minimal structured audit events**: one JSON line to stderr per `tools/call` (timestamp, tool, agent, outcome, exit code, duration, output size-class — never raw payloads), matching the template's audit-event shape at local-tool scale.
 
-## Smallest valuable version
-- `claude` adapter (`claude -p`, prompt via stdin — same injection-safe shape as codex/cursor), registered fourth.
-- `MCP_AGENTS` env var: comma-separated allowlist (e.g. `MCP_AGENTS=codex,claude`); unset/empty → all agents. Unknown name → fail fast at startup with the valid list. Applied identically to stdio and HTTP entries; consistent with the existing `MCP_TOKEN`/`MCP_ALLOWED_ORIGINS` naming.
-- Docker image installs the claude CLI; compose passes `MCP_AGENTS` + `ANTHROPIC_API_KEY` through; README updated.
-
-## Explicitly NOT building
-- Per-agent config beyond on/off (default models, per-agent timeouts) — backlog.
-- Config file support (env only).
-- Runtime toggling via an MCP tool (restart to change).
-- A separate deny-list variable (one mechanism: allowlist).
+## Explicitly NOT adopting (recorded as deviations instead)
+Express/Winston/Jest/ESLint skeleton swap; fail-closed auth default (MCP_TOKEN stays opt-in; loopback bind is the default guard); rate limits/inflight caps; closed error-code envelope; HMAC pagination cursors; multi-tenant isolation; credential-context protocol (all N/A or disproportionate for a local single-user hub).
 
 ## 10/10 vs 5/10
-10/10 = disabled agents vanish from `listTools`/`list_agents`/`run_all`, invalid config fails loudly at startup, claude adapter injection-safe and covered by the same test patterns as the other three. 5/10 = claude bolted on with toggles that only hide tools but still fan out in `run_all`.
+10/10 = spine adopted with tests, every remaining divergence written down in TEMPLATE-DEVIATION.md with rationale — a reviewer can audit the hub against the template in minutes. 5/10 = a deviation doc alone with no behavior adopted.
 
 ## Riskiest assumption
-Exact `claude -p` stdin/flag behavior and the npm package/auth story for the Docker image — being verified by a research subagent before the gate.
+That the user wants selective spine adoption rather than full skeleton conversion — confirmed via explicit question before the gate.

@@ -1,51 +1,66 @@
-# Implementation Plan — Feature 2: Claude adapter + agent toggles
+# Implementation Plan — Feature 3: mcp-template selective alignment
 
-(v0.1 plan preserved in git history at this path.)
+(Prior plans preserved in git history.)
 
-## Tasks (ordered, with dependencies)
+## Tasks
 
-### T1 — Claude adapter (no deps)
-- Create `src/adapters/claude.ts`: `claudeAdapter: AgentAdapter`, `buildInvocation(prompt, {model}) → { args: [<research-confirmed print-mode flags>, ...model], stdin: prompt }`.
-- Create `tests/adapters/claude.test.ts`: 4 tests mirroring cursor's (no-model, model, flag-like prompt via stdin, identity). TDD order.
+### U1 — Config module (no deps)
+- Create `src/config.ts`:
+```ts
+export interface Config {
+  port: number;
+  host: string;
+  token: string | undefined;
+  allowedOrigins: string[];
+  agents: string | undefined;
+  shutdownTimeoutMs: number;
+}
+export class ConfigError extends Error {}
+export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config
+```
+  Parse rules per spec K2. Collect every field error into `errors: string[]`; if non-empty throw `new ConfigError("Invalid configuration:\n- " + errors.join("\n- "))`.
+- Create `tests/config.test.ts` (M1: defaults, MCP_PORT>PORT precedence, aggregated two-field error, origins list, agents passthrough, shutdown=0 invalid). TDD.
 
-### T2 — Registry filtering (deps: T1) — rev per gate reviews
-- `src/registry.ts`:
-  - Import + append `claudeAdapter` to `allAdapters()` (order: codex, cursor, opencode, claude).
-  - Add `export function enabledAdapters(agentsSpec = process.env.MCP_AGENTS): AgentAdapter[]`:
-    1. Parse: split on `,`, trim, drop empties, dedupe.
-    2. **If the parsed list is empty (covers unset, `""`, `","`, `" , "`) → return `allAdapters()`** (never an empty server).
-    3. **Validate BEFORE filtering:** for each requested name not in the known set, throw `new Error(\`Unknown agent "<name>" in MCP_AGENTS. Valid agents: ${allAdapters().map(a => a.name).join(", ")}\`)` — the valid list is GENERATED, not hardcoded; plain filtering would silently drop typos.
-    4. Return `allAdapters().filter(a => set.has(a.name))` (registry order preserved, dedupe free).
-- `tests/registry.test.ts`: update order assertion to 4 names; enabledAdapters tests: unset→4, `","`→4, subset `"codex, claude"` (whitespace) → exact order-preserving pair, duplicates deduped, unknown name throws with the name AND the valid list in the message.
+### U2 — Audit module (no deps)
+- Create `src/audit.ts` per spec K7 (`sizeClass`, `AuditEvent`, `emitAudit(event, sink = line => process.stderr.write(line + "\n"))`; emitAudit wraps sink in try/catch).
+- Create `tests/audit.test.ts` (M6 boundaries + shape via captured sink). TDD.
 
-### T3 — Wiring (deps: T2) — rev per gate reviews
-- `src/index.ts`: `allAdapters()` → `enabledAdapters()` (throw lands inside async `main()` → existing fatal handler — already safe).
-- `src/httpServer.ts`: **declare `startHttpServer` `async`** and call `const adapters = enabledAdapters()` as its first statement — a validation throw becomes a rejected promise → `http.ts`'s `.catch()` fatal path (a sync throw from a non-async function would bypass it). Pass `adapters` into the per-request `buildServer` closure. Fails before binding the port.
-- `tests/server.test.ts` — EVERY changed assertion enumerated:
-  1. Tool list → `["claude","codex","cursor","list_agents","opencode","ping","run_all"]`.
-  2. `list_agents reports availability per adapter` → 4th element `{name:"claude", available:false}` (mock throws for non-codex).
-  3. run_all parallelism test: `started` 3→4; add `expect(exec).toHaveBeenCalledWith("claude", ["-p","--output-format","text"], {cwd:"/tmp", timeoutMs:1234, input:"p"})`.
-  4. run_all mixed-labels test: add `## claude (ok)` and `claude answer` assertions (claude mock hits the default ok branch).
-  5. NEW filtered-build test: `buildServer(enabledAdapters("codex,opencode"), exec)` → listTools exactly `["codex","list_agents","opencode","ping","run_all"]`; `list_agents` returns only those two; `run_all` fans out to exactly two exec calls.
-- Confirmed UNAFFECTED (reviewer-verified): constraints, e2e, http, exec, smoke tests.
+### U3 — Server: annotations, instructions, audit wiring (deps U2)
+- `src/server.ts`:
+  - `buildServer(adapters, exec = runCommand, auditSink?: (line: string) => void)`.
+  - `new McpServer({ name, version }, { instructions: ORIENTATION })` — ORIENTATION mentions agent delegation, `list_agents`, `MCP_AGENTS`.
+  - Annotations per K5; agent-tool + run_all descriptions gain the blast-radius sentence.
+  - Agent tool handler + run_all sub-calls: wrap exec with timing; after settle call `emitAudit({ts: new Date().toISOString(), event:"tool_call", tool: adapter.name, outcome, exitCode, durationMs, outputSizeClass: sizeClass(Buffer.byteLength(stdout ?? ""))}, auditSink)` — errors → outcome "error", exitCode undefined on rejection. run_all emits per sub-agent, none for the aggregate (code comment).
+- `tests/server.test.ts`: add M4 annotations test, M5 instructions test (`client.getInstructions()`), M6 integration audit assertions via injected sink (ok + error + no-prompt-leak negative). Existing tests untouched otherwise.
 
-### T4 — Packaging + docs (deps: T1–T3 for accuracy, file-disjoint)
-- `Dockerfile`: install claude CLI in runtime stage (npm package per research).
-- `docker-compose.yml`: add `MCP_AGENTS: ${MCP_AGENTS:-}` and `ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}`.
-- `README.md`: claude tool row + prerequisites line, `MCP_AGENTS` doc (stdio + compose examples), claude auth note.
+### U4 — HTTP config + drain (deps U1)
+- `src/httpServer.ts`:
+  - Signature → `startHttpServer(config: Config): Promise<{ server: Server; drain: () => Promise<void>; isDraining: () => boolean }>`; token/origins from config; `/readyz` route per K4; inflight tracked via `server.closeAllConnections()` at force-timeout; `drain()` idempotent: sets flag, `server.close()`, races completion vs `shutdownTimeoutMs` timer, force-closes on timeout, resolves.
+  - `isOriginAllowed(origin, extra: string[])` takes the list as a param (no env read).
+- `src/http.ts`: `const config = loadConfig(); const { server, drain } = await startHttpServer(config);` then `for (const sig of ["SIGTERM","SIGINT"]) process.on(sig, () => { drain().then(() => process.exit(0)); });` (stderr log lines on begin/end).
+- `tests/http.test.ts`: build `Config` objects (port 0) — token test passes token via config; add M3 drain test (readyz 200 → drain() → readyz rejected-or-503 → server closed) and drain-idempotent test. NOTE: after `server.close()` new requests are refused — assert `/readyz` 503 by hitting it DURING drain only if a keep-alive connection path exists; otherwise assert `isDraining()===true` + connection refusal (plan-approved fallback assertion).
+- `tests/e2e.test.ts` unaffected (stdio). `src/index.ts` unaffected.
+
+### U5 — TEMPLATE-DEVIATION.md (independent)
+- Create at repo root, template-example format, all 8 K1 entries; remediation owner "blackaxgit", dates 2026-Q4.
+
+### U6 — README touch (after U1–U4)
+- Configuration section: add `MCP_PORT`/`MCP_HOST`/`MCP_SHUTDOWN_TIMEOUT_SECONDS` and `/readyz`; one line pointing to TEMPLATE-DEVIATION.md.
 
 ## Execution model
-Two parallel subagents with disjoint files — Agent A: T1+T2+T3 (code+tests, sequential internally); Agent B: T4 (packaging/docs). Orchestrator verifies, commits per unit, gates, pushes. `git pull --rebase` before push (Dependabot merges may interleave).
+Agent A: U1+U2 (new modules + tests, disjoint). Agent B: U5 (doc, disjoint). Then Agent C: U3+U4+U6 (touches server/http/tests — sequential after A lands). Orchestrator verifies, commits per unit, gates, pushes (pull --rebase first — Dependabot merges land concurrently).
 
 ## Test strategy
-Unit (adapter argv/stdin, registry filter/fail-fast), integration (server tool list + filtered build + run_all forwarding via InMemoryTransport), e2e (existing stdio initialize test unaffected; CI docker job proves image builds with claude CLI).
+Unit: config parsing/aggregation, audit sizeClass/shape/sink-safety. Integration: annotations/instructions/audit through InMemory MCP client; drain via real HTTP server on port 0. E2E: existing stdio + CI docker build unchanged.
 
 ## Rollback
-Single revert of the feature commits restores v0.1 behavior; `MCP_AGENTS` unset default guarantees no behavior change for existing deployments even without revert.
+Revert the feature commits; no persisted state. `startHttpServer` signature change is internal (bin entries + tests only).
 
 ## Progress log
-- [ ] T1 adapter
-- [ ] T2 registry
-- [ ] T3 wiring
-- [ ] T4 packaging/docs
+- [ ] U1 config
+- [ ] U2 audit
+- [ ] U3 server wiring
+- [ ] U4 http drain
+- [ ] U5 deviations doc
+- [ ] U6 README
 - [ ] Verification + gated push
