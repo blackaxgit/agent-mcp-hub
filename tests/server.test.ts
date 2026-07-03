@@ -140,6 +140,18 @@ describe("run_all", () => {
       timeoutMs: 1234,
       input: "p",
     });
+    expect(exec).toHaveBeenCalledWith("cursor-agent", ["-p", "--output-format", "text"], {
+      cwd: "/tmp",
+      timeoutMs: 1234,
+      input: "p",
+    });
+    expect(exec).toHaveBeenCalledWith("opencode", ["run", "p"], {
+      cwd: "/tmp",
+      timeoutMs: 1234,
+      input: undefined,
+    });
     expect(textOf(res)).toContain("## codex (ok)");
+    expect(textOf(res)).toContain("## cursor (ok)");
+    expect(textOf(res)).toContain("## opencode (ok)");
   });
 });
