@@ -6,12 +6,14 @@
   "type": "module",
   "bin": { "agent-mcp-hub": "dist/index.js", "agent-mcp-hub-http": "dist/http.js" },
   "files": ["dist"],
-  "engines": { "node": ">=20" },
+  "engines": { "node": ">=22" },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/index.ts",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.test.json",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
     "prepublishOnly": "npm run build && npm run typecheck && npm test"
   },
   "dependencies": {
@@ -19,9 +21,12 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@eslint/js": "^9.0.0",
     "@types/node": "^26.1.0",
+    "eslint": "^9.0.0",
     "tsx": "^4.19.0",
     "typescript": "^6.0.3",
+    "typescript-eslint": "^8.0.0",
     "vitest": "^4.1.9"
   }
 }
