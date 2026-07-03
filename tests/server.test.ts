@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { Exec } from "../src/exec.js";
-import { allAdapters } from "../src/registry.js";
+import { allAdapters, enabledAdapters } from "../src/registry.js";
 import { buildServer } from "../src/server.js";
 
 async function connectedClient(exec: Exec) {
@@ -30,7 +30,7 @@ describe("buildServer", () => {
     const client = await connectedClient(okExec);
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
-    expect(names).toEqual(["codex", "cursor", "list_agents", "opencode", "ping", "run_all"]);
+    expect(names).toEqual(["claude", "codex", "cursor", "list_agents", "opencode", "ping", "run_all"]);
   });
 
   it("runs an agent tool through exec with the adapter invocation", async () => {
@@ -96,7 +96,39 @@ describe("buildServer", () => {
       { name: "codex", available: true },
       { name: "cursor", available: false },
       { name: "opencode", available: false },
+      { name: "claude", available: false },
     ]);
+  });
+
+  it("exposes only the enabled agents when built from a filtered registry", async () => {
+    const exec: Exec = vi.fn(async (binary: string) => ({
+      stdout: `${binary} answer\n`,
+      stderr: "",
+      exitCode: 0,
+    }));
+    const server = buildServer(enabledAdapters("codex,opencode"), exec);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "test-client", version: "0.0.0" });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+    const { tools } = await client.listTools();
+    expect(tools.map((t) => t.name).sort()).toEqual([
+      "codex",
+      "list_agents",
+      "opencode",
+      "ping",
+      "run_all",
+    ]);
+
+    const agents = await client.callTool({ name: "list_agents", arguments: {} });
+    const parsed = JSON.parse(textOf(agents)) as Array<{ name: string; available: boolean }>;
+    expect(parsed.map((a) => a.name)).toEqual(["codex", "opencode"]);
+
+    (exec as ReturnType<typeof vi.fn>).mockClear();
+    await client.callTool({ name: "run_all", arguments: { prompt: "compare" } });
+    expect(exec).toHaveBeenCalledTimes(2);
+    expect(exec).toHaveBeenCalledWith("codex", expect.anything(), expect.anything());
+    expect(exec).toHaveBeenCalledWith("opencode", expect.anything(), expect.anything());
   });
 });
 
@@ -114,6 +146,8 @@ describe("run_all", () => {
     expect(text).toContain("## cursor (failed)");
     expect(text).toContain("not logged in");
     expect(text).toContain("## opencode (ok)");
+    expect(text).toContain("## claude (ok)");
+    expect(text).toContain("claude answer");
     expect(res.isError).toBeFalsy();
   });
 
@@ -132,7 +166,7 @@ describe("run_all", () => {
       name: "run_all",
       arguments: { prompt: "p", cwd: "/tmp", timeoutMs: 1234 },
     });
-    await vi.waitFor(() => expect(started).toBe(3));
+    await vi.waitFor(() => expect(started).toBe(4));
     for (const resolve of resolvers) resolve({ stdout: "ok\n", stderr: "", exitCode: 0 });
     const res = await pending;
     expect(exec).toHaveBeenCalledWith("codex", ["exec", "--skip-git-repo-check", "-"], {
@@ -150,8 +184,14 @@ describe("run_all", () => {
       timeoutMs: 1234,
       input: undefined,
     });
+    expect(exec).toHaveBeenCalledWith("claude", ["-p", "--output-format", "text"], {
+      cwd: "/tmp",
+      timeoutMs: 1234,
+      input: "p",
+    });
     expect(textOf(res)).toContain("## codex (ok)");
     expect(textOf(res)).toContain("## cursor (ok)");
     expect(textOf(res)).toContain("## opencode (ok)");
+    expect(textOf(res)).toContain("## claude (ok)");
   });
 });
