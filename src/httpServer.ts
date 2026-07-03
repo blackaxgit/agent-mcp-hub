@@ -1,4 +1,5 @@
 import { createServer, type Server } from "node:http";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { enabledAdapters } from "./registry.js";
 import { buildServer } from "./server.js";
@@ -10,6 +11,21 @@ const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
  * client. Rejecting non-loopback origins blocks DNS-rebinding attacks against
  * an endpoint that can spawn coding agents.
  */
+function sha256(value: string): Buffer {
+  return createHash("sha256").update(value).digest();
+}
+
+/**
+ * Constant-time bearer-token check. Both sides are hashed to fixed-length
+ * (32-byte) digests so `timingSafeEqual` never sees mismatched lengths and the
+ * comparison time does not leak how many leading characters matched. A missing
+ * or non-string Authorization header collapses to the empty string → mismatch.
+ */
+function isTokenValid(authorization: string | string[] | undefined, token: string): boolean {
+  const provided = typeof authorization === "string" ? authorization : "";
+  return timingSafeEqual(sha256(provided), sha256(`Bearer ${token}`));
+}
+
 function isOriginAllowed(origin: string | undefined): boolean {
   if (origin === undefined) return true;
   const extra = (process.env.MCP_ALLOWED_ORIGINS ?? "")
@@ -56,7 +72,7 @@ export async function startHttpServer(port: number, host = "127.0.0.1"): Promise
       return;
     }
     const token = process.env.MCP_TOKEN;
-    if (token && req.headers.authorization !== `Bearer ${token}`) {
+    if (token && !isTokenValid(req.headers.authorization, token)) {
       res
         .writeHead(401, { "content-type": "text/plain", "www-authenticate": "Bearer" })
         .end("unauthorized");
@@ -79,7 +95,17 @@ export async function startHttpServer(port: number, host = "127.0.0.1"): Promise
       }
     }
   });
-  return await new Promise((resolve) => {
-    httpServer.listen(port, host, () => resolve(httpServer));
+  return await new Promise((resolve, reject) => {
+    const onError = (err: Error) => {
+      httpServer.removeListener("listening", onListening);
+      reject(err);
+    };
+    const onListening = () => {
+      httpServer.removeListener("error", onError);
+      resolve(httpServer);
+    };
+    httpServer.once("error", onError);
+    httpServer.once("listening", onListening);
+    httpServer.listen(port, host);
   });
 }

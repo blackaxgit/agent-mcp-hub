@@ -62,7 +62,7 @@ describe("security hardening", () => {
     expect(res.status).toBe(405);
   });
 
-  it("requires the bearer token when MCP_TOKEN is set", async () => {
+  it("requires the bearer token when MCP_TOKEN is set (timing-safe compare)", async () => {
     process.env.MCP_TOKEN = "s3cret";
     try {
       const missing = await fetch(`${baseUrl}/mcp`, { method: "POST" });
@@ -73,6 +73,14 @@ describe("security hardening", () => {
         headers: { authorization: "Bearer nope" },
       });
       expect(wrong.status).toBe(401);
+
+      // Same length as the expected header but different value: the constant-time
+      // compare must still reject rather than short-circuit on length.
+      const wrongSameLength = await fetch(`${baseUrl}/mcp`, {
+        method: "POST",
+        headers: { authorization: "Bearer XXXXXX" },
+      });
+      expect(wrongSameLength.status).toBe(401);
 
       const client = new Client({ name: "http-test-auth", version: "0.0.0" });
       await client.connect(
@@ -85,6 +93,44 @@ describe("security hardening", () => {
       await client.close();
     } finally {
       delete process.env.MCP_TOKEN;
+    }
+  });
+
+  it("rejects a request whose port is already bound (listen error propagates)", async () => {
+    const other = await startHttpServer(0);
+    try {
+      const { port } = other.address() as AddressInfo;
+      await expect(startHttpServer(port)).rejects.toMatchObject({ code: "EADDRINUSE" });
+    } finally {
+      await new Promise((resolve) => other.close(resolve));
+    }
+  });
+
+  it("honours MCP_ALLOWED_ORIGINS for non-loopback origins", async () => {
+    process.env.MCP_ALLOWED_ORIGINS = "http://allowed.example.com";
+    try {
+      // Allowed non-loopback Origin passes the gate and reaches the method check.
+      const allowed = await fetch(`${baseUrl}/mcp`, {
+        method: "GET",
+        headers: { origin: "http://allowed.example.com" },
+      });
+      expect(allowed.status).toBe(405);
+
+      // A different non-loopback Origin is still blocked.
+      const blocked = await fetch(`${baseUrl}/mcp`, {
+        method: "GET",
+        headers: { origin: "http://other.example.com" },
+      });
+      expect(blocked.status).toBe(403);
+
+      // A malformed Origin header exercises the URL-parse catch and is blocked.
+      const malformed = await fetch(`${baseUrl}/mcp`, {
+        method: "GET",
+        headers: { origin: "not-a-url" },
+      });
+      expect(malformed.status).toBe(403);
+    } finally {
+      delete process.env.MCP_ALLOWED_ORIGINS;
     }
   });
 });
