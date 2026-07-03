@@ -15,7 +15,9 @@ RUN apt-get update \
 
 # Agent CLIs available on PATH for the server to spawn
 # @anthropic-ai/claude-code ships a native binary and needs Node 22+ (satisfied here).
-RUN npm install -g @openai/codex opencode-ai @anthropic-ai/claude-code
+# Pinned for reproducible builds. Dependabot's docker ecosystem does not track npm -g
+# installs — bump these manually (or move to a tracked manifest) when updating agents.
+RUN npm install -g @openai/codex@0.142.5 opencode-ai@1.17.13 @anthropic-ai/claude-code@2.1.199
 
 RUN useradd -m -u 1001 mcp
 USER mcp
@@ -38,5 +40,5 @@ ENV PORT=3919
 ENV HOST=0.0.0.0
 EXPOSE 3919
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
-  CMD curl -fsS http://localhost:3919/healthz || exit 1
+  CMD curl -fsS "http://localhost:${PORT:-3919}/healthz" || exit 1
 CMD ["node", "dist/http.js"]
