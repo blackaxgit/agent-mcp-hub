@@ -14,7 +14,8 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # Agent CLIs available on PATH for the server to spawn
-RUN npm install -g @openai/codex opencode-ai
+# @anthropic-ai/claude-code ships a native binary and needs Node 22+ (satisfied here).
+RUN npm install -g @openai/codex opencode-ai @anthropic-ai/claude-code
 
 RUN useradd -m -u 1001 mcp
 USER mcp

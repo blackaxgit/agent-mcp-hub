@@ -1,7 +1,7 @@
 # agent-mcp-hub
 
-One MCP server that bridges multiple CLI coding agents — **Codex**, **Cursor**, and
-**OpenCode** — into any MCP client.
+One MCP server that bridges multiple CLI coding agents — **Codex**, **Cursor**,
+**OpenCode**, and **Claude** — into any MCP client.
 
 ## Tools
 
@@ -10,6 +10,7 @@ One MCP server that bridges multiple CLI coding agents — **Codex**, **Cursor**
 | `codex` | Delegate a prompt to `codex exec` (prompt piped via stdin) |
 | `cursor` | Delegate a prompt to `cursor-agent -p` (prompt piped via stdin) |
 | `opencode` | Delegate a prompt to `opencode run` |
+| `claude` | Delegate a prompt to the Claude Code CLI (prompt piped via stdin) |
 | `run_all` | Same prompt to all agents in parallel, results side by side |
 | `list_agents` | Which agent CLIs are installed and on PATH |
 | `ping` | Health check |
@@ -26,6 +27,7 @@ Install and authenticate the CLIs you want to use (any subset works):
 - Codex: `npm i -g @openai/codex && codex login`
 - Cursor: `curl https://cursor.com/install -fsS | bash && cursor-agent login`
 - OpenCode: `npm i -g opencode-ai && opencode auth login`
+- Claude Code: `npm i -g @anthropic-ai/claude-code && claude` (first run logs in; containers use `ANTHROPIC_API_KEY`)
 
 ## Install
 
@@ -46,6 +48,34 @@ claude mcp add agent-hub -- npx -y agent-mcp-hub
     }
   }
 }
+```
+
+## Configuration
+
+**`MCP_AGENTS`** — comma-separated allowlist of the agents to expose
+(`codex,cursor,opencode,claude`). Unset or empty exposes all agents. Disabled
+agents get no tool and are absent from `list_agents`/`run_all`. An unknown name
+fails at startup with an error listing the valid names, so typos never silently
+disable an agent.
+
+For stdio, set it in the client's `mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "agent-hub": {
+      "command": "npx",
+      "args": ["-y", "agent-mcp-hub"],
+      "env": { "MCP_AGENTS": "codex,claude" }
+    }
+  }
+}
+```
+
+For Docker Compose, put it in the `.env` file next to `docker-compose.yml`:
+
+```bash
+MCP_AGENTS=codex,claude
 ```
 
 ## Run with Docker
@@ -78,9 +108,10 @@ claude mcp add --transport http agent-hub http://localhost:3919/mcp
 ```
 
 **Auth:** the wrapped CLIs need credentials. Either pass API keys as env vars
-(`OPENAI_API_KEY`, `CURSOR_API_KEY`) — a `.env` file next to `docker-compose.yml`
-is picked up automatically — or reuse your host CLI logins by uncommenting the
-read-only login-dir mounts in `docker-compose.yml`.
+(`OPENAI_API_KEY`, `CURSOR_API_KEY`, and `ANTHROPIC_API_KEY` for the `claude`
+CLI) — a `.env` file next to `docker-compose.yml` is picked up automatically —
+or reuse your host CLI logins by uncommenting the read-only login-dir mounts in
+`docker-compose.yml`.
 
 **Workspace:** mount the project you want the agents to work on into `/workspace`
 (the `./workspace` bind mount is preconfigured) and pass `cwd: "/workspace"` in
