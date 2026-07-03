@@ -1,6 +1,6 @@
 import { createServer, type Server } from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { allAdapters } from "./registry.js";
+import { enabledAdapters } from "./registry.js";
 import { buildServer } from "./server.js";
 
 const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
@@ -24,7 +24,11 @@ function isOriginAllowed(origin: string | undefined): boolean {
   }
 }
 
-export function startHttpServer(port: number, host = "127.0.0.1"): Promise<Server> {
+export async function startHttpServer(port: number, host = "127.0.0.1"): Promise<Server> {
+  // Resolve enabled agents up front so an invalid MCP_AGENTS rejects the
+  // returned promise (http.ts's .catch fatal path) before the port binds,
+  // rather than surfacing per-request.
+  const adapters = enabledAdapters();
   const httpServer = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost");
     if (req.method === "GET" && url.pathname === "/healthz") {
@@ -60,7 +64,7 @@ export function startHttpServer(port: number, host = "127.0.0.1"): Promise<Serve
     }
     try {
       // Stateless: a fresh server + transport per request, torn down with the response.
-      const server = buildServer(allAdapters());
+      const server = buildServer(adapters);
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
       res.on("close", () => {
         void transport.close();
@@ -75,7 +79,7 @@ export function startHttpServer(port: number, host = "127.0.0.1"): Promise<Serve
       }
     }
   });
-  return new Promise((resolve) => {
+  return await new Promise((resolve) => {
     httpServer.listen(port, host, () => resolve(httpServer));
   });
 }

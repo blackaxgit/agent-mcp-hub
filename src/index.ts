@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { allAdapters } from "./registry.js";
+import { enabledAdapters } from "./registry.js";
 import { buildServer } from "./server.js";
 
 async function main(): Promise<void> {
-  const server = buildServer(allAdapters());
+  const server = buildServer(enabledAdapters());
   await server.connect(new StdioServerTransport());
   // stdio server stays alive until the client closes the pipe
 }
