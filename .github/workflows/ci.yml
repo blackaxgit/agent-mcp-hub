@@ -26,6 +26,16 @@ jobs:
       - run: npm test
       - run: npm run typecheck
       - run: npm run build
-      # No docker-build job on purpose: the runner user (ghrunner) is
-      # unprivileged and outside the docker group — docker-group membership is
-      # root-equivalent on the host, which the runner security rules forbid.
+
+  docker:
+    needs: test
+    runs-on: [self-hosted, linux, x64, ubuntu-2404, "repo:agent-mcp-hub"]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # Builds against the runner's ROOTLESS Docker daemon (DOCKER_HOST is set
+      # in the runner's .env), keeping ghrunner unprivileged per the runner
+      # security rules. INSTALL_CURSOR=false keeps CI independent of the
+      # vendor's curl|bash installer.
+      - run: docker build --build-arg INSTALL_CURSOR=false -t agent-mcp-hub:ci .
+      - run: docker image ls agent-mcp-hub:ci
