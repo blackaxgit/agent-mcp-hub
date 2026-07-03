@@ -1,51 +1,53 @@
-# VERIFICATION — agent-mcp-hub v0.1 (2026-07-02)
+# VERIFICATION — Feature 2: claude adapter + MCP_AGENTS toggle (2026-07-03)
 
-Suite state at verification: **36/36 tests, 9 files; typecheck (src+tests) clean; build clean; gitleaks clean.**
+(v0.1 verification preserved in git history at this path.)
+
+Suite state: **53/53 tests (11 files), typecheck (src+tests) clean, build clean.**
 
 ## Acceptance criteria
 
 ```
-A1 (test suite coverage)        → DONE
-Evidence: npm test = 36 passed (exec 6, adapters 12, registry 4, server 10 incl.
-  dash-guard/timeout-message/parallelism+forwarding, constraints 2, smoke 1, e2e 1)
-Codex: agrees after fixes (its A1 "FAIL" was an EPERM sandbox artifact; suite passes
-  in the real environment)
+B1 (claude adapter tests)          → DONE
+Evidence: tests/adapters/claude.test.ts — 4 tests green; argv ["-p","--output-format",
+  "text",(--model m)] + stdin, matching verified research. Codex: PASS.
 
-A2 (typecheck + build clean)    → DONE
-Evidence: tsc -p tsconfig.test.json clean (src+tests); tsc -p tsconfig.json clean,
-  dist/ emitted. Codex: typecheck agreed; build "FAIL" was sandbox EPERM.
+B2 (registry order + enabledAdapters semantics) → DONE
+Evidence: tests/registry.test.ts — order codex,cursor,opencode,claude; unset→4, ","→4,
+  whitespace subset, dedupe, unknown "clade" throws with generated valid list.
+  Codex: PASS (validate-before-filter confirmed at source).
 
-A3 (stdio initialize handshake) → DONE
-Evidence: manual pipe returned {"serverInfo":{"name":"agent-mcp-hub","version":"0.1.0"}};
-  now ALSO automated as tests/e2e.test.ts (added from Codex finding #2). Codex: gap fixed.
+B3 (server exposes/filters consistently) → DONE
+Evidence: tool list = 7 sorted names; filtered-build test (codex,opencode) proves
+  tools + list_agents + run_all all reflect the same subset. Codex: PASS.
+  PLUS live e2e: MCP_AGENTS=codex,claude over real stdio → tools exactly
+  [claude,codex,list_agents,ping,run_all]; MCP_AGENTS=clade → process exit 1.
 
-A4 (README docs)                → DONE
-Evidence: README.md — tools table, prerequisites, Claude Code + mcp.json install,
-  known opencode dash limitation. Codex: agrees (PASS).
+B4 (run_all forwards to claude)    → DONE
+Evidence: parallelism test started=4 + claude exec assertion; mixed-labels test
+  includes "## claude (ok)". Codex: PASS.
 
-A5 (conventional commits + gated push) → DONE
-Evidence: 13 commits `<type>(<scope>): <subject>`, no AI trailers (verified via
-  git log); gitleaks detect over all commits = "no leaks found"; pushed to
-  origin/main (see below). Codex: could not verify (ran pre-push by design).
+B5 (suite/typecheck/build green locally AND in CI) → DONE locally / CI PENDING PUSH
+Evidence: local 53/53 + typecheck + build clean (orchestrator-run). Codex: PARTIAL
+  (its sandbox EPERM; attributed to sandbox, not repo). CI verdict follows the push.
+
+B6 (Docker packaging)              → DONE
+Evidence: Dockerfile installs @anthropic-ai/claude-code (Node 22 base OK); compose
+  passes MCP_AGENTS + ANTHROPIC_API_KEY; docker compose config -q clean. Codex: PASS.
+  Full image build exercised by the CI docker job after push.
+
+B7 (README)                        → DONE
+Evidence: claude tool row, prerequisites, Configuration section (stdio + compose
+  examples), Docker auth note. Codex: PASS.
 ```
 
-## Requirements / constraints
-- F1–F11: implemented and test-covered (see A1 evidence); F11 dash-guard verified at adapter and server level.
-- C1–C5: enforced by tests/constraints.test.ts (C1, C5) and design (C2 argv/stdin, C3 no network, C4 two runtime deps). Codex found no violations.
+## Constraints
+H1–H4: no G/H violations found by Codex; C1/C5 guard tests green; no new runtime deps; default (unset env) behavior additive-only.
 
-## Codex cross-check
-Codex: **agrees with reservations resolved** — initial verdict DISAGREES (86) driven by
-sandbox EPERM artifacts (A1/A2), pre-push timing (A5), and two genuine gaps (A3 smoke
-test, weak run_all assert) which were fixed and re-verified. Details: 05b-codex-verification.md.
+## Codex
+**AGREES, confidence 90** (05b-codex-verification.md).
 
 ## Notes
-- Accepted-minor (documented, not fixed): exec timeout test asserts the observable
-  contract only; tool input schemas exercised via SDK validation rather than asserted
-  as JSON shapes.
-- npm audit reports 5 vulnerabilities in transitive DEV dependencies (vitest/tsx
-  toolchain) — no runtime exposure (runtime deps: @modelcontextprotocol/sdk, zod only).
-- Real-CLI integration (codex/cursor-agent/opencode actually installed) is exercised
-  at runtime via list_agents and graceful isError paths; out of automated scope.
+- CI (self-hosted) result for this feature lands with the push — recorded in the final summary, not re-edited here.
+- Recursion note: hub-inside-Claude-Code can now be prevented by operators via MCP_AGENTS excluding claude (documented).
 
-Final confidence: 97% delivered-to-spec (residual 3%: real-CLI behavioral drift,
-by design out of the mocked test scope).
+Final confidence: 97% (residual: claude CLI runtime behavior inside the Docker image, exercised only at image build/runtime).

@@ -1,24 +1,21 @@
-# Codex Implementation Verification (outside engine)
+# Codex Implementation Verification — Feature 2 (outside engine)
 
-Run: codex-rescue runtime, read-only, 2026-07-02. Status: ran successfully. Codex verdict: **DISAGREES, confidence 86** — triaged below; two findings were genuine and fixed, the rest were sandbox artifacts or accepted-minor.
+(v0.1 verification preserved in git history at this path.)
 
-## Codex per-criterion verdicts and triage
+Run: codex-rescue runtime, read-only, 2026-07-03. Status: ran successfully. Verdict: **AGREES, confidence 90.**
 
-| Codex verdict | Triage by orchestrator |
-|---|---|
-| A1 FAIL — `npm test` EPERM (vitest temp/cache writes blocked) | **Sandbox artifact.** Codex ran inside a read-only sandbox; the same command in the real environment passes 36/36 (re-verified after fixes). |
-| A2 PARTIAL — typecheck passed, `npm run build` EPERM on `dist/` | **Sandbox artifact.** Real environment: build clean. |
-| A3 PARTIAL — no automated initialize smoke test (only manual) | **GENUINE — FIXED.** Added `tests/e2e.test.ts`: pipes the initialize JSON-RPC request into the real entry (`node --import tsx src/index.ts`) via `runCommand` and asserts `"agent-mcp-hub"` + `"0.1.0"` in the response. |
-| A4 PASS | Agreed. |
-| A5 not verifiable (no push/gate artifacts yet) | **Expected sequencing** — Codex ran before the gated push. Gitleaks gate ran clean over all commits; push follows verification. |
+## Per-criterion verdicts (Codex)
+- B1 PASS — claude adapter tests + implementation match.
+- B2 PASS — registry order, trim/dedupe, empty/`,`→all, validate-before-filter confirmed at source level.
+- B3 PASS — seven sorted tools; filtered list drives tools, `list_agents`, `run_all`.
+- B4 PASS — claude forwarding assertion complete (binary/argv/stdin/options).
+- B5 PARTIAL (sandbox) — typecheck passed in Codex's sandbox; `npm test`/`npm run build` hit its read-only EPERM, which Codex itself attributed to the sandbox. Orchestrator ran both in the real environment: **53/53 tests, build clean** — treated as PASS with local evidence.
+- B6 PASS — Dockerfile installs `@anthropic-ai/claude-code`; compose passes `MCP_AGENTS`/`ANTHROPIC_API_KEY`; `docker compose config -q` clean.
+- B7 PASS — README complete.
 
-## Codex numbered findings
+## G/H violations
+None found. Codex specifically confirmed: fail-fast in BOTH entries before wiring/bind; filtered list flows to `list_agents` AND `run_all`; claude argv exactly matches research; C1/C5 hold; no new runtime deps.
 
-1. Medium — A1/A2 EPERM: sandbox artifact (above).
-2. Medium — A3 smoke placeholder: **fixed** (`tests/e2e.test.ts`, commit `test(e2e): ...`).
-3. High — A5 unverifiable: sequencing (gate + push completed after this review; see VERIFICATION.md).
-4. Low — exec timeout test asserts message only, not kill semantics: accepted — Codex itself confirmed the implementation waits for `close` after SIGKILL (src/exec.ts); the observable contract (rejection + message) is what callers depend on.
-5. Low — `run_all` test asserted only codex forwarding: **fixed** — now asserts forwarding for all three adapters and ok-labels for all three.
-6. Low — tool-listing test doesn't assert input schemas: accepted — schemas are enforced at runtime by the SDK's zod validation on every `callTool` in the suite; asserting serialized JSON schema shapes would test the SDK, not our code.
-
-Codex found **no F1–F11 or C1–C5 source-level violations** (spot-checked: no `shell: true`, no network calls, minimal deps, stderr-only diagnostics).
+## Process notes from the verification run
+- Codex's sandbox EPERM on test/build is a recurring artifact of read-only verification runs (same as v0.1), not a repo defect.
+- The forwarding subagent flagged a suspected prompt injection in tool output (a date-change reminder); orchestrator assessment: that reminder matches the legitimate harness date rollover — a false positive, no action needed.
