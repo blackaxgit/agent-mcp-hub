@@ -30,15 +30,33 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config
   - `buildServer(adapters, exec = runCommand, auditSink?: (line: string) => void)`.
   - `new McpServer({ name, version }, { instructions: ORIENTATION })` — ORIENTATION mentions agent delegation, `list_agents`, `MCP_AGENTS`.
   - Annotations per K5; agent-tool + run_all descriptions gain the blast-radius sentence.
-  - Agent tool handler + run_all sub-calls: wrap exec with timing; after settle call `emitAudit({ts: new Date().toISOString(), event:"tool_call", tool: adapter.name, outcome, exitCode, durationMs, outputSizeClass: sizeClass(Buffer.byteLength(stdout ?? ""))}, auditSink)` — errors → outcome "error", exitCode undefined on rejection. run_all emits per sub-agent, none for the aggregate (code comment).
-- `tests/server.test.ts`: add M4 annotations test, M5 instructions test (`client.getInstructions()`), M6 integration audit assertions via injected sink (ok + error + no-prompt-leak negative). Existing tests untouched otherwise.
+  - Extract one audited runner used by BOTH the per-tool handler and run_all sub-calls, wrapping the ENTIRE invocation so pre-exec throws (opencode dash-guard in `buildInvocation`) still emit:
+```ts
+async function runAudited(adapter: AgentAdapter, prompt: string, opts: {model?: string; cwd?: string; timeoutMs?: number}, exec: Exec, sink?: AuditSink): Promise<ExecResult> {
+  const started = Date.now();
+  try {
+    const invocation = adapter.buildInvocation(prompt, { model: opts.model });
+    const result = await exec(adapter.binary, invocation.args, { cwd: opts.cwd, timeoutMs: opts.timeoutMs, input: invocation.stdin });
+    emitAudit({ ts: new Date().toISOString(), event: "tool_call", tool: adapter.name, outcome: result.exitCode === 0 ? "ok" : "error", exitCode: result.exitCode, durationMs: Date.now() - started, outputSizeClass: sizeClass(Buffer.byteLength(result.stdout, "utf8")) }, sink);
+    return result;
+  } catch (err) {
+    emitAudit({ ts: new Date().toISOString(), event: "tool_call", tool: adapter.name, outcome: "error", exitCode: undefined, durationMs: Date.now() - started, outputSizeClass: "empty" }, sink);
+    throw err;
+  }
+}
+```
+    (`outputSizeClass` = stdout bytes only, per spec decision.) Per-tool handler and run_all's allSettled map both call `runAudited`; run_all emits nothing for the aggregate (code comment).
+- `tests/server.test.ts`: add M4 annotations test, M5 instructions test (`client.getInstructions()`), M6 integration audit assertions via injected sink: ok (durationMs number), non-zero exit (exitCode preserved), rejection (exitCode undefined), exitCode null preserved, dash-guard pre-exec throw emits, run_all → one event per sub-agent, no-prompt-leak negative. Existing tests untouched otherwise.
 
-### U4 — HTTP config + drain (deps U1)
+### U4 — HTTP config + TWO-PHASE drain (deps U1) — rev per gate review
 - `src/httpServer.ts`:
-  - Signature → `startHttpServer(config: Config): Promise<{ server: Server; drain: () => Promise<void>; isDraining: () => boolean }>`; token/origins from config; `/readyz` route per K4; inflight tracked via `server.closeAllConnections()` at force-timeout; `drain()` idempotent: sets flag, `server.close()`, races completion vs `shutdownTimeoutMs` timer, force-closes on timeout, resolves.
-  - `isOriginAllowed(origin, extra: string[])` takes the list as a param (no env read).
-- `src/http.ts`: `const config = loadConfig(); const { server, drain } = await startHttpServer(config);` then `for (const sig of ["SIGTERM","SIGINT"]) process.on(sig, () => { drain().then(() => process.exit(0)); });` (stderr log lines on begin/end).
-- `tests/http.test.ts`: build `Config` objects (port 0) — token test passes token via config; add M3 drain test (readyz 200 → drain() → readyz rejected-or-503 → server closed) and drain-idempotent test. NOTE: after `server.close()` new requests are refused — assert `/readyz` 503 by hitting it DURING drain only if a keep-alive connection path exists; otherwise assert `isDraining()===true` + connection refusal (plan-approved fallback assertion).
+  - Signature → `startHttpServer(config: Config): Promise<HttpHandle>` where `HttpHandle = { server: Server; beginDrain: () => void; shutdown: () => Promise<void>; isDraining: () => boolean }`.
+  - Token/origins read from `config` (no per-request env); `isOriginAllowed(origin, extra: string[])` parameterized.
+  - `/readyz` route: `draining ? 503 "draining" : 200 "ok"` (registered BEFORE the /mcp branch; `/healthz` untouched).
+  - `beginDrain()`: sets `draining = true` only — server KEEPS accepting (this is what makes 503 observable; single-phase close would yield ECONNREFUSED/ECONNRESET, verified empirically on Node 26).
+  - `shutdown()`: idempotent (memoized promise); `beginDrain(); server.closeIdleConnections(); server.close(cb)`; race close-complete vs `config.shutdownTimeoutMs` timer → on timeout `server.closeAllConnections()`; resolve when closed.
+- `src/http.ts`: `const config = loadConfig(); const { beginDrain, shutdown } = await startHttpServer(config);` SIGTERM/SIGINT handler: `beginDrain(); void shutdown().then(() => process.exit(0));` with stderr log lines on begin/end.
+- `tests/http.test.ts` — ALL breakpoints enumerated: `let httpServer: Server` + `beforeAll` destructure `{ server }`, `address()` via `server`, `afterAll` uses `shutdown()`; token test creates its OWN server from a token-bearing Config (shared server has none; env mutation no longer effective by design — remove the delete/restore dance); M3 deterministic drain test (readyz 200 → `beginDrain()` → readyz 503 → `await shutdown()` → connection refused → second `shutdown()` resolves).
 - `tests/e2e.test.ts` unaffected (stdio). `src/index.ts` unaffected.
 
 ### U5 — TEMPLATE-DEVIATION.md (independent)

