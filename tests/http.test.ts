@@ -96,6 +96,45 @@ describe("security hardening", () => {
     }
   });
 
+  it("refuses to bind a non-loopback host without MCP_TOKEN", async () => {
+    const saved = process.env.MCP_TOKEN;
+    delete process.env.MCP_TOKEN;
+    try {
+      await expect(startHttpServer(0, "0.0.0.0")).rejects.toThrow(/MCP_TOKEN/);
+    } finally {
+      if (saved === undefined) delete process.env.MCP_TOKEN;
+      else process.env.MCP_TOKEN = saved;
+    }
+  });
+
+  it("binds a non-loopback host when MCP_TOKEN is set", async () => {
+    const saved = process.env.MCP_TOKEN;
+    process.env.MCP_TOKEN = "bind-token";
+    let server: Server | undefined;
+    try {
+      server = await startHttpServer(0, "0.0.0.0");
+      expect(server.address()).toBeTruthy();
+    } finally {
+      if (server) await new Promise((resolve) => server!.close(resolve));
+      if (saved === undefined) delete process.env.MCP_TOKEN;
+      else process.env.MCP_TOKEN = saved;
+    }
+  });
+
+  it("still binds loopback without a token", async () => {
+    const saved = process.env.MCP_TOKEN;
+    delete process.env.MCP_TOKEN;
+    let server: Server | undefined;
+    try {
+      server = await startHttpServer(0, "127.0.0.1");
+      expect(server.address()).toBeTruthy();
+    } finally {
+      if (server) await new Promise((resolve) => server!.close(resolve));
+      if (saved === undefined) delete process.env.MCP_TOKEN;
+      else process.env.MCP_TOKEN = saved;
+    }
+  });
+
   it("rejects a request whose port is already bound (listen error propagates)", async () => {
     const other = await startHttpServer(0);
     try {

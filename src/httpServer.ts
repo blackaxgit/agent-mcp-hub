@@ -4,7 +4,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { enabledAdapters } from "./registry.js";
 import { buildServer } from "./server.js";
 
-const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
+const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
 
 /**
  * Browser requests carry an Origin header; absent Origin means a non-browser
@@ -41,6 +41,14 @@ function isOriginAllowed(origin: string | undefined): boolean {
 }
 
 export async function startHttpServer(port: number, host = "127.0.0.1"): Promise<Server> {
+  // The /mcp endpoint can execute code (spawns agent CLIs). The MCP spec says
+  // loopback bind + auth are SHOULD; we upgrade to a hard refuse because
+  // exposure here is RCE at the operator's privilege.
+  if (!LOOPBACK_HOSTNAMES.has(host) && !process.env.MCP_TOKEN) {
+    throw new Error(
+      `Refusing to bind non-loopback host "${host}" without MCP_TOKEN set — the /mcp endpoint can execute code. Set MCP_TOKEN (and front it with TLS) to expose it.`,
+    );
+  }
   // Resolve enabled agents up front so an invalid MCP_AGENTS rejects the
   // returned promise (http.ts's .catch fatal path) before the port binds,
   // rather than surfacing per-request.
