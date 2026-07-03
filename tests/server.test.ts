@@ -1,9 +1,12 @@
+import { createRequire } from "node:module";
 import { describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { Exec } from "../src/exec.js";
 import { allAdapters, enabledAdapters } from "../src/registry.js";
 import { buildServer } from "../src/server.js";
+
+const pkg = createRequire(import.meta.url)("../package.json") as { version: string };
 
 async function connectedClient(exec: Exec) {
   const server = buildServer(allAdapters(), exec);
@@ -100,6 +103,42 @@ describe("buildServer", () => {
     ]);
   });
 
+  it("advertises the package.json version to clients", async () => {
+    const client = await connectedClient(okExec);
+    const info = client.getServerVersion();
+    expect(info?.version).toBe(pkg.version);
+  });
+
+  it("emits exactly one structured agent_run line to stderr with no prompt text", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const client = await connectedClient(okExec);
+      await client.callTool({
+        name: "codex",
+        arguments: { prompt: "super-secret-prompt", cwd: "/work" },
+      });
+      const lines = errSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((line) => line.includes('"agent_run"'));
+      expect(lines).toHaveLength(1);
+      const record = JSON.parse(lines[0]) as {
+        evt: string;
+        agent: string;
+        cwd: string | null;
+        ms: number;
+        exitCode?: number | null;
+      };
+      expect(record.evt).toBe("agent_run");
+      expect(record.agent).toBe("codex");
+      expect(record.cwd).toBe("/work");
+      expect(typeof record.ms).toBe("number");
+      expect(record.exitCode).toBe(0);
+      expect(lines[0]).not.toContain("super-secret-prompt");
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
   it("exposes only the enabled agents when built from a filtered registry", async () => {
     const exec: Exec = vi.fn(async (binary: string) => ({
       stdout: `${binary} answer\n`,
@@ -193,5 +232,28 @@ describe("run_all", () => {
     expect(textOf(res)).toContain("## cursor (ok)");
     expect(textOf(res)).toContain("## opencode (ok)");
     expect(textOf(res)).toContain("## claude (ok)");
+  });
+
+  it("forwards model to every adapter invocation", async () => {
+    const exec: Exec = vi.fn(async (binary: string) => ({
+      stdout: `${binary} answer\n`,
+      stderr: "",
+      exitCode: 0,
+    }));
+    const client = await connectedClient(exec);
+    await client.callTool({
+      name: "run_all",
+      arguments: { prompt: "compare", model: "o3" },
+    });
+    expect(exec).toHaveBeenCalledWith(
+      "codex",
+      ["exec", "--skip-git-repo-check", "--model", "o3", "-"],
+      { cwd: undefined, timeoutMs: undefined, input: "compare" },
+    );
+    expect(exec).toHaveBeenCalledWith(
+      "cursor-agent",
+      ["-p", "--output-format", "text", "--model", "o3"],
+      { cwd: undefined, timeoutMs: undefined, input: "compare" },
+    );
   });
 });
