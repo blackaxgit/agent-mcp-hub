@@ -31,10 +31,10 @@ The plan doc (rev 2) already encodes the per-adapter test files with correct `..
 Each phase is one conventional commit on `main`; revert = `git revert <sha>` (or reset before push). Nothing external is mutated until the final gated push; npm publish is out of scope.
 
 ## Progress log
-- [ ] Phase 1 scaffold
-- [ ] Phase 2 exec
-- [ ] Phase 3 adapters
-- [ ] Phase 4 registry
-- [ ] Phase 5 server
-- [ ] Phase 6 entry/README
-- [ ] Verification + gated push
+- [x] Phase 1 scaffold (commit 0c5f994)
+- [x] Phase 2 exec (commit 1d1e118)
+- [x] Phase 3 adapters (commits d5c66a1, a979fb9, cc7cd4b)
+- [x] Phase 4 registry (commit b81aa0e)
+- [x] Phase 5 server (commit deb0320)
+- [x] Phase 6 entry/README (commit e290c5b)
+- [x] Verification: 35/35 tests, typecheck + build clean, stdio smoke OK; gitleaks gate clean (11 commits) — Codex cross-check + push pending
