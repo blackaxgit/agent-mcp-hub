@@ -13,6 +13,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  secrets:
+    runs-on: [self-hosted, linux, x64, ubuntu-2404, "repo:agent-mcp-hub"]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      # Secret scanning is paid-only on private personal repos, so CI runs the
+      # same gitleaks scan as the local pre-push gate (rootless Docker).
+      - run: docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.24.3 detect --source /repo --no-banner
+
   test:
     runs-on: [self-hosted, linux, x64, ubuntu-2404, "repo:agent-mcp-hub"]
     timeout-minutes: 15
