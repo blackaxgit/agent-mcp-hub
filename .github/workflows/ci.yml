@@ -39,18 +39,23 @@ jobs:
       - run: npm run build
 
   docker:
+    # Main-push only: the 20G host cannot absorb an uncached multi-GB build
+    # per PR (divergent lockfiles defeat layer caching and the disk filled
+    # twice, killing jobs mid-build). PRs are covered by secrets+test.
+    if: github.event_name == 'push'
     needs: test
     runs-on: [self-hosted, linux, x64, ubuntu-2404, "repo:agent-mcp-hub"]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # Reclaim ALL docker disk before building — cache hit rate across
+      # main pushes is low and headroom matters more than cache on this host.
+      - run: docker system prune -af
       # Builds against the runner's ROOTLESS Docker daemon (DOCKER_HOST is set
       # in the runner's .env), keeping ghrunner unprivileged per the runner
       # security rules. INSTALL_CURSOR=false keeps CI independent of the
       # vendor's curl|bash installer.
       - run: docker build --build-arg INSTALL_CURSOR=false -t agent-mcp-hub:ci .
       - run: docker image ls agent-mcp-hub:ci
-      # The host has a 20G disk; unbounded build cache filled it and killed
-      # jobs mid-step. Keep layers bounded after every build.
-      - run: docker image prune -f && docker builder prune -f --keep-storage 2GB
+      - run: docker system prune -af
         if: always()
