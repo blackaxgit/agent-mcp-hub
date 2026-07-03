@@ -18,10 +18,12 @@ RUN npm install -g @openai/codex opencode-ai
 
 RUN useradd -m -u 1001 mcp
 USER mcp
-# Best-effort: cursor-agent installs to ~/.local/bin; if the installer is
-# unavailable at build time the cursor tool simply reports unavailable.
-RUN curl -fsS https://cursor.com/install | bash \
- || echo "WARN: cursor-agent install failed; the cursor tool will be unavailable"
+# cursor-agent ships only via the vendor's install script (no checksums
+# published, so it cannot be integrity-pinned). Opt out of the curl|bash
+# supply-chain risk with: docker build --build-arg INSTALL_CURSOR=false .
+# When enabled, an installer failure fails the build (no silent masking).
+ARG INSTALL_CURSOR=true
+RUN if [ "$INSTALL_CURSOR" = "true" ]; then curl -fsS https://cursor.com/install | bash; fi
 ENV PATH="/home/mcp/.local/bin:${PATH}"
 
 WORKDIR /app
@@ -30,6 +32,9 @@ COPY --from=build --chown=mcp:mcp /app/dist ./dist
 COPY --chown=mcp:mcp package.json ./
 
 ENV PORT=3919
+# Inside the container the server must bind all interfaces so the published
+# port works; host exposure is restricted in docker-compose.yml (127.0.0.1).
+ENV HOST=0.0.0.0
 EXPOSE 3919
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
   CMD curl -fsS http://localhost:3919/healthz || exit 1
