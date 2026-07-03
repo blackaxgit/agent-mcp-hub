@@ -1,8 +1,7 @@
 # agent-mcp-hub
 
 One MCP server that bridges multiple CLI coding agents — **Codex**, **Cursor**, and
-**OpenCode** — into any MCP client (Claude Code, Cursor, VS Code, Windsurf, …).
-Like [codex-mcp-server](https://github.com/tuannvm/codex-mcp-server), but multi-agent.
+**OpenCode** — into any MCP client.
 
 ## Tools
 
