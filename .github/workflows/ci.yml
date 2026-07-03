@@ -50,3 +50,7 @@ jobs:
       # vendor's curl|bash installer.
       - run: docker build --build-arg INSTALL_CURSOR=false -t agent-mcp-hub:ci .
       - run: docker image ls agent-mcp-hub:ci
+      # The host has a 20G disk; unbounded build cache filled it and killed
+      # jobs mid-step. Keep layers bounded after every build.
+      - run: docker image prune -f && docker builder prune -f --keep-storage 2GB
+        if: always()
