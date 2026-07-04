@@ -246,6 +246,22 @@ describe("run_all", () => {
     expect(res.isError).toBeFalsy();
   });
 
+  it("labels an agent whose exec REJECTS as (failed) with the classified message", async () => {
+    const exec: Exec = vi.fn(async (binary: string) => {
+      if (binary === "codex") throw new Error("boom-reject");
+      return { stdout: `${binary} answer\n`, stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({ name: "run_all", arguments: { prompt: "compare" } });
+    const text = textOf(res);
+    expect(text).toContain("## codex (failed)");
+    expect(text).toContain("boom-reject");
+    expect(text).toContain("## cursor (ok)");
+    expect(text).toContain("## opencode (ok)");
+    expect(text).toContain("## claude (ok)");
+    expect(res.isError).toBeFalsy();
+  });
+
   it("starts all agents before any finishes and forwards options", async () => {
     let started = 0;
     const resolvers: Array<

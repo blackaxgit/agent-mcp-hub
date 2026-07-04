@@ -1,7 +1,8 @@
+import { ChildProcess } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_TIMEOUT_MS,
   MAX_CONCURRENT_AGENTS,
@@ -58,6 +59,42 @@ describe("runCommand", () => {
   });
 });
 
+describe("MAX_CONCURRENT_AGENTS env parsing", () => {
+  // parseConcurrency runs once at module load off MCP_MAX_CONCURRENT_AGENTS, so
+  // to exercise both ternary arms we re-import the module with the env var set.
+  // The static import at the top already covered the unset → NaN → fallback arm.
+  const reimport = async (value: string | undefined) => {
+    const prev = process.env.MCP_MAX_CONCURRENT_AGENTS;
+    if (value === undefined) delete process.env.MCP_MAX_CONCURRENT_AGENTS;
+    else process.env.MCP_MAX_CONCURRENT_AGENTS = value;
+    vi.resetModules();
+    try {
+      const mod = await import("../src/exec.js");
+      return mod.MAX_CONCURRENT_AGENTS;
+    } finally {
+      if (prev === undefined) delete process.env.MCP_MAX_CONCURRENT_AGENTS;
+      else process.env.MCP_MAX_CONCURRENT_AGENTS = prev;
+      vi.resetModules();
+    }
+  };
+
+  it("uses a valid positive-integer override", async () => {
+    // Positive-integer arm of `Number.isInteger(n) && n > 0 ? n : 4`.
+    expect(await reimport("7")).toBe(7);
+  });
+
+  it.each([
+    ["0", "not positive"],
+    ["-1", "negative"],
+    ["abc", "NaN"],
+    ["2.5", "non-integer"],
+    ["", "empty → Number('') is 0"],
+  ])("falls back to 4 for %j (%s)", async (value) => {
+    // Fallback arm: every non-positive-integer input collapses to the default 4.
+    expect(await reimport(value)).toBe(4);
+  });
+});
+
 describe("runCommand process-group tree kill", () => {
   let workDir: string;
 
@@ -94,6 +131,86 @@ describe("runCommand process-group tree kill", () => {
   });
 });
 
+describe("runCommand killGroup failure handling", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  // A short-lived child that outlives its own timeout: when the group-kill is
+  // sabotaged the child self-exits, so `close` still fires and the reject path
+  // runs deterministically instead of hanging.
+  const selfExiting = ["-e", "setTimeout(() => {}, 500)"];
+
+  // Force only the process-GROUP kill (negative pid) to throw `code`; positive-pid
+  // signals (Node internals, unrelated children) pass straight through. Returns a
+  // counter of how many group-kill attempts were sabotaged.
+  const sabotageGroupKill = (code: string) => {
+    const realKill = process.kill.bind(process);
+    const counter = { negativePidKills: 0 };
+    vi.spyOn(process, "kill").mockImplementation((pid: number, signal?: string | number) => {
+      if (pid < 0) {
+        counter.negativePidKills += 1;
+        throw Object.assign(new Error(code), { code });
+      }
+      return realKill(pid, signal as NodeJS.Signals);
+    });
+    return counter;
+  };
+
+  it("returns early on ESRCH group-kill without ever invoking the fallback", async () => {
+    // Group already gone → process.kill(-pid) throws ESRCH. killGroup must treat
+    // it as benign, take the early return, and NEVER touch the fallback path.
+    const counter = sabotageGroupKill("ESRCH");
+    const childKill = vi.spyOn(ChildProcess.prototype, "kill");
+
+    const err = await runCommand("node", selfExiting, { timeoutMs: 100 }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(TimeoutError);
+    expect((err as TimeoutError).message).toMatch(/timed out after 100ms/);
+    expect(counter.negativePidKills).toBeGreaterThan(0);
+    // ESRCH short-circuits before the single-PID fallback.
+    expect(childKill).not.toHaveBeenCalled();
+  });
+
+  it("falls back to a single-PID kill on a non-ESRCH group-kill failure", async () => {
+    // EPERM (or anything non-ESRCH) → killGroup must run the fallback, which is
+    // child.kill on just the child PID. Let that real kill go through.
+    const realChildKill = ChildProcess.prototype.kill;
+    const counter = sabotageGroupKill("EPERM");
+    const childKill = vi.spyOn(ChildProcess.prototype, "kill").mockImplementation(function (
+      this: ChildProcess,
+      signal?: number | NodeJS.Signals,
+    ) {
+      return realChildKill.call(this, signal);
+    });
+
+    const err = await runCommand("node", selfExiting, { timeoutMs: 100 }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(TimeoutError);
+    expect((err as TimeoutError).message).toMatch(/timed out after 100ms/);
+    expect(counter.negativePidKills).toBeGreaterThan(0);
+    // The fallback fired: child.kill("SIGKILL") reaped the child by its own PID.
+    expect(childKill).toHaveBeenCalledWith("SIGKILL");
+  });
+
+  it("swallows a throwing fallback and still surfaces the TimeoutError", async () => {
+    // Worst case: group-kill fails non-ESRCH AND the single-PID fallback itself
+    // throws. killGroup must swallow both so the caller sees the original
+    // TimeoutError, never a kill error. The child self-exits since no kill lands.
+    const counter = sabotageGroupKill("EPERM");
+    const childKill = vi.spyOn(ChildProcess.prototype, "kill").mockImplementation(() => {
+      throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+    });
+
+    const err = await runCommand("node", selfExiting, { timeoutMs: 100 }).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(TimeoutError);
+    expect((err as TimeoutError).message).toMatch(/timed out after 100ms/);
+    expect(counter.negativePidKills).toBeGreaterThan(0);
+    expect(childKill).toHaveBeenCalledWith("SIGKILL");
+  });
+});
+
 describe("runCommand output cap", () => {
   it("kills the child and rejects when output exceeds maxOutputBytes", async () => {
     const flood =
@@ -103,6 +220,29 @@ describe("runCommand output cap", () => {
     await expect(runCommand("node", ["-e", flood], { maxOutputBytes: 1024 })).rejects.toThrow(
       /exceeded output limit of 1024 bytes/,
     );
+  });
+
+  it("issues the output-limit kill once despite many post-breach chunks", async () => {
+    // A single large synchronous write leaves the pipe full, so the parent drains
+    // it as many `data` events AFTER the breach flips `killedForOutput`. Those
+    // later events must hit the early return (`if (killedForOutput) return;`) and
+    // NOT re-run the kill: the group-kill fires exactly once, not once per chunk.
+    const realKill = process.kill.bind(process);
+    let groupKills = 0;
+    vi.spyOn(process, "kill").mockImplementation((pid: number, signal?: string | number) => {
+      if (pid < 0) groupKills += 1;
+      return realKill(pid, signal as NodeJS.Signals);
+    });
+
+    const flood = "process.stdout.write(Buffer.alloc(1<<20, 120));setTimeout(()=>{},2000);";
+    await expect(runCommand("node", ["-e", flood], { maxOutputBytes: 1024 })).rejects.toThrow(
+      /exceeded output limit of 1024 bytes/,
+    );
+
+    // One breach → one group kill. Removing the `killedForOutput` guard would
+    // re-enter the limit branch on every drained chunk and kill repeatedly.
+    expect(groupKills).toBe(1);
+    vi.restoreAllMocks();
   });
 
   it("does not echo captured bytes in the limit error", async () => {
