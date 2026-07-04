@@ -330,6 +330,54 @@ describe("run_all", () => {
       { cwd: undefined, timeoutMs: undefined, input: "compare" },
     );
   });
+
+  it("run_all model forwarding for opencode and claude", async () => {
+    const exec: Exec = vi.fn(async (binary: string) => ({
+      stdout: `${binary} answer\n`,
+      stderr: "",
+      exitCode: 0,
+    }));
+    const client = await connectedClient(exec);
+    await client.callTool({
+      name: "run_all",
+      arguments: { prompt: "compare", model: "o3" },
+    });
+    expect(exec).toHaveBeenCalledWith("opencode", ["run", "--model", "o3", "compare"], {
+      cwd: undefined,
+      timeoutMs: undefined,
+      input: undefined,
+    });
+    expect(exec).toHaveBeenCalledWith(
+      "claude",
+      ["-p", "--output-format", "text", "--model", "o3"],
+      { cwd: undefined, timeoutMs: undefined, input: "compare" },
+    );
+  });
+
+  it("run_all with dash-leading prompt rejects opencode before exec", async () => {
+    const exec: Exec = vi.fn(async (binary: string) => ({
+      stdout: `${binary} answer\n`,
+      stderr: "",
+      exitCode: 0,
+    }));
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "run_all",
+      arguments: { prompt: "--help me" },
+    });
+    const text = textOf(res);
+    // opencode should show error and not be called
+    expect(text).toContain("## opencode (failed)");
+    expect(text).toContain("prompts that start with '-'");
+    expect(exec).not.toHaveBeenCalledWith("opencode", expect.anything(), expect.anything());
+    // Other agents should run successfully
+    expect(text).toContain("## codex (ok)");
+    expect(text).toContain("## cursor (ok)");
+    expect(text).toContain("## claude (ok)");
+    expect(exec).toHaveBeenCalledWith("codex", expect.anything(), expect.anything());
+    expect(exec).toHaveBeenCalledWith("cursor-agent", expect.anything(), expect.anything());
+    expect(exec).toHaveBeenCalledWith("claude", expect.anything(), expect.anything());
+  });
 });
 
 // A2 / A4 — confirm-before-run gate (MCP elicitation). Env is restored with an
@@ -458,6 +506,45 @@ describe("confirm-before-run gate", () => {
       const handler: ElicitHandler = async () => {
         throw new Error("client dropped mid-confirm");
       };
+      const client = await connectedClientWithElicit(exec, handler);
+      const res = await client.callTool({ name: "codex", arguments: { prompt: "hello" } });
+      expect(exec).not.toHaveBeenCalled();
+      expect(res.isError).toBe(true);
+      expect(textOf(res)).toContain("cancelled by user");
+    });
+  });
+
+  it("A2(h) malformed elicit payload (empty object) → treated as cancel", async () => {
+    await withConfirmEnv("1", async () => {
+      const exec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
+      const handler: ElicitHandler = async () => ({ action: "accept", content: {} });
+      const client = await connectedClientWithElicit(exec, handler);
+      const res = await client.callTool({ name: "codex", arguments: { prompt: "hello" } });
+      expect(exec).not.toHaveBeenCalled();
+      expect(res.isError).toBe(true);
+      expect(textOf(res)).toContain("cancelled by user");
+    });
+  });
+
+  it("A2(i) malformed elicit payload (confirm as string) → treated as cancel", async () => {
+    await withConfirmEnv("1", async () => {
+      const exec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
+      const handler: ElicitHandler = async () => ({
+        action: "accept",
+        content: { confirm: "true" },
+      });
+      const client = await connectedClientWithElicit(exec, handler);
+      const res = await client.callTool({ name: "codex", arguments: { prompt: "hello" } });
+      expect(exec).not.toHaveBeenCalled();
+      expect(res.isError).toBe(true);
+      expect(textOf(res)).toContain("cancelled by user");
+    });
+  });
+
+  it("A2(j) malformed elicit payload (no content) → treated as cancel", async () => {
+    await withConfirmEnv("1", async () => {
+      const exec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
+      const handler: ElicitHandler = async () => ({ action: "accept" });
       const client = await connectedClientWithElicit(exec, handler);
       const res = await client.callTool({ name: "codex", arguments: { prompt: "hello" } });
       expect(exec).not.toHaveBeenCalled();
