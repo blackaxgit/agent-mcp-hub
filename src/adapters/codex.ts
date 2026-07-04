@@ -2,6 +2,8 @@ import type { AgentAdapter, AgentInvocation, AgentRunOptions } from "../types.js
 
 export const codexAdapter: AgentAdapter = {
   name: "codex",
+  summary:
+    "OpenAI Codex — a terminal coding agent (GPT/o-series) that autonomously reads and edits files to implement, refactor, and fix code.",
   binary: "codex",
   loginCommand: "codex login",
   apiKeyEnv: "OPENAI_API_KEY",

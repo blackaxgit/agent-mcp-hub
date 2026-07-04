@@ -12,6 +12,9 @@ export interface AgentInvocation {
 export interface AgentAdapter {
   /** Tool name exposed over MCP, e.g. "codex". */
   readonly name: string;
+  /** One line identifying the agent and when to reach for it; front of the MCP
+   *  tool description so a client can pick between the agents. */
+  readonly summary: string;
   /** Executable looked up on PATH, e.g. "cursor-agent". */
   readonly binary: string;
   /** Command the user runs to authenticate this CLI, e.g. "codex login". */
