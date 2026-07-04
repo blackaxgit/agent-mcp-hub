@@ -25,7 +25,14 @@ const { version } = createRequire(import.meta.url)("../package.json") as { versi
 async function runAdapter(
   adapter: AgentAdapter,
   exec: Exec,
-  params: { prompt: string; model?: string; cwd?: string; timeoutMs?: number },
+  params: {
+    prompt: string;
+    model?: string;
+    cwd?: string;
+    timeoutMs?: number;
+    idleTimeoutMs?: number;
+  },
+  onActivity?: () => void,
 ): Promise<ExecResult> {
   const invocation = adapter.buildInvocation(params.prompt, { model: params.model });
   const start = Date.now();
@@ -43,7 +50,9 @@ async function runAdapter(
     const result = await exec(adapter.binary, invocation.args, {
       cwd: params.cwd,
       timeoutMs: params.timeoutMs,
+      idleTimeoutMs: params.idleTimeoutMs,
       input: invocation.stdin,
+      onActivity,
     });
     audit(result.exitCode);
     return result;
@@ -51,6 +60,55 @@ async function runAdapter(
     audit(undefined);
     throw err;
   }
+}
+
+/**
+ * The slice of the tool handler's `extra` arg we touch for progress: the request
+ * `_meta.progressToken` (present only when the client asked for out-of-band
+ * progress) and `sendNotification`. Kept structural so the SDK's richer extra
+ * object assigns straight in without importing its generic handler type.
+ */
+interface ProgressExtra {
+  _meta?: { progressToken?: string | number };
+  sendNotification: (notification: {
+    method: "notifications/progress";
+    params: { progressToken: string | number; progress: number; message?: string };
+  }) => Promise<void>;
+}
+
+/**
+ * Build the SYNC activity callback that emits MCP progress for one request, or
+ * `undefined` when the client did not attach a progressToken (behave as today).
+ * The returned closure is fire-and-forget: it NEVER awaits `sendNotification` (a
+ * child 'data' handler must not await) and swallows any send rejection.
+ *
+ * Throttle: a leading-edge send fires on the first activity (lastSentSec starts
+ * at -Infinity), then at most one send per ~10s window. `progress` is forced
+ * strictly increasing (Math.max(lastProgress + 1, elapsedSec)) so a shared
+ * emitter — including run_all's concurrent adapters — never repeats a value.
+ */
+function makeProgressEmitter(
+  extra: ProgressExtra | undefined,
+  label: string,
+): (() => void) | undefined {
+  const progressToken = extra?._meta?.progressToken;
+  if (progressToken === undefined) return undefined;
+  const start = Date.now();
+  let lastSentSec = -Infinity;
+  let lastProgress = 0;
+  return () => {
+    const elapsedSec = Math.floor((Date.now() - start) / 1000);
+    if (elapsedSec - lastSentSec < 10) return;
+    lastSentSec = elapsedSec;
+    const progress = Math.max(lastProgress + 1, elapsedSec);
+    lastProgress = progress;
+    void extra!
+      .sendNotification({
+        method: "notifications/progress",
+        params: { progressToken, progress, message: `${label} running… ${elapsedSec}s` },
+      })
+      .catch(() => {});
+  };
 }
 
 const agentInputSchema = {
@@ -62,7 +120,15 @@ const agentInputSchema = {
     .int()
     .positive()
     .optional()
-    .describe("Kill the agent after this many ms (default 300000)"),
+    .describe("Total runtime cap: kill the agent after this many ms overall (default 1800000)"),
+  idleTimeoutMs: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe(
+      "Idle/inactivity timeout in ms: the run is killed only if the agent produces NO output for this long (default 300000)",
+    ),
 };
 
 export function buildServer(adapters: AgentAdapter[], exec: Exec = runCommand): McpServer {
@@ -116,7 +182,7 @@ export function buildServer(adapters: AgentAdapter[], exec: Exec = runCommand): 
         description: `Delegate a prompt to the ${adapter.name} CLI agent (non-interactive) and return its output`,
         inputSchema: agentInputSchema,
       },
-      async ({ prompt, model, cwd, timeoutMs }) => {
+      async ({ prompt, model, cwd, timeoutMs, idleTimeoutMs }, extra) => {
         if (!(await confirmOrCancel(buildConfirmMessage(adapter.name, { prompt, model, cwd })))) {
           return {
             isError: true,
@@ -124,7 +190,13 @@ export function buildServer(adapters: AgentAdapter[], exec: Exec = runCommand): 
           };
         }
         try {
-          const result = await runAdapter(adapter, exec, { prompt, model, cwd, timeoutMs });
+          const onActivity = makeProgressEmitter(extra, adapter.name);
+          const result = await runAdapter(
+            adapter,
+            exec,
+            { prompt, model, cwd, timeoutMs, idleTimeoutMs },
+            onActivity,
+          );
           if (result.exitCode !== 0) {
             const { message } = classifyFailure(adapter, { result });
             return { isError: true, content: [{ type: "text", text: message }] };
@@ -147,9 +219,17 @@ export function buildServer(adapters: AgentAdapter[], exec: Exec = runCommand): 
         model: z.string().optional().describe("Model override passed to every agent CLI"),
         cwd: z.string().optional().describe("Working directory for the agent processes"),
         timeoutMs: z.number().int().positive().optional().describe("Per-agent timeout in ms"),
+        idleTimeoutMs: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe(
+            "Idle/inactivity timeout in ms: the run is killed only if the agent produces NO output for this long (default 300000)",
+          ),
       },
     },
-    async ({ prompt, model, cwd, timeoutMs }) => {
+    async ({ prompt, model, cwd, timeoutMs, idleTimeoutMs }, extra) => {
       if (
         !(await confirmOrCancel(
           buildRunAllMessage(
@@ -160,8 +240,14 @@ export function buildServer(adapters: AgentAdapter[], exec: Exec = runCommand): 
       ) {
         return { isError: true, content: [{ type: "text", text: `run_all: ${CANCEL_TAIL}` }] };
       }
+      // One shared emitter for the whole batch: a single progressToken and a
+      // single monotonic counter, so 4 concurrent adapters cannot emit colliding
+      // progress values.
+      const onActivity = makeProgressEmitter(extra, "run_all");
       const settled = await Promise.allSettled(
-        adapters.map((adapter) => runAdapter(adapter, exec, { prompt, model, cwd, timeoutMs })),
+        adapters.map((adapter) =>
+          runAdapter(adapter, exec, { prompt, model, cwd, timeoutMs, idleTimeoutMs }, onActivity),
+        ),
       );
       const content = settled.map((outcome, i) => {
         const adapter = adapters[i];

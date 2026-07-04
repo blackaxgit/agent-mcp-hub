@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -74,10 +74,25 @@ describe("buildServer", () => {
     expect(exec).toHaveBeenCalledWith(
       "codex",
       ["exec", "--skip-git-repo-check", "--model", "o3", "-"],
-      { cwd: undefined, timeoutMs: undefined, input: "hello" },
+      expect.objectContaining({ cwd: undefined, timeoutMs: undefined, input: "hello" }),
     );
     expect(res.isError).toBeFalsy();
     expect(textOf(res)).toBe("done");
+  });
+
+  it("forwards idleTimeoutMs from the tool input into the exec opts", async () => {
+    const exec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "codex",
+      arguments: { prompt: "x", idleTimeoutMs: 1234 },
+    });
+    expect(exec).toHaveBeenCalledWith(
+      "codex",
+      expect.anything(),
+      expect.objectContaining({ idleTimeoutMs: 1234, input: "x" }),
+    );
+    expect(res.isError).toBeFalsy();
   });
 
   it("returns a text-only tool_failure with (exit N) and the output tail on non-zero exit", async () => {
@@ -282,26 +297,26 @@ describe("run_all", () => {
     await vi.waitFor(() => expect(started).toBe(4));
     for (const resolve of resolvers) resolve({ stdout: "ok\n", stderr: "", exitCode: 0 });
     const res = await pending;
-    expect(exec).toHaveBeenCalledWith("codex", ["exec", "--skip-git-repo-check", "-"], {
-      cwd: "/tmp",
-      timeoutMs: 1234,
-      input: "p",
-    });
-    expect(exec).toHaveBeenCalledWith("cursor-agent", ["-p", "--output-format", "text"], {
-      cwd: "/tmp",
-      timeoutMs: 1234,
-      input: "p",
-    });
-    expect(exec).toHaveBeenCalledWith("opencode", ["run", "p"], {
-      cwd: "/tmp",
-      timeoutMs: 1234,
-      input: undefined,
-    });
-    expect(exec).toHaveBeenCalledWith("claude", ["-p", "--output-format", "text"], {
-      cwd: "/tmp",
-      timeoutMs: 1234,
-      input: "p",
-    });
+    expect(exec).toHaveBeenCalledWith(
+      "codex",
+      ["exec", "--skip-git-repo-check", "-"],
+      expect.objectContaining({ cwd: "/tmp", timeoutMs: 1234, input: "p" }),
+    );
+    expect(exec).toHaveBeenCalledWith(
+      "cursor-agent",
+      ["-p", "--output-format", "text"],
+      expect.objectContaining({ cwd: "/tmp", timeoutMs: 1234, input: "p" }),
+    );
+    expect(exec).toHaveBeenCalledWith(
+      "opencode",
+      ["run", "p"],
+      expect.objectContaining({ cwd: "/tmp", timeoutMs: 1234, input: undefined }),
+    );
+    expect(exec).toHaveBeenCalledWith(
+      "claude",
+      ["-p", "--output-format", "text"],
+      expect.objectContaining({ cwd: "/tmp", timeoutMs: 1234, input: "p" }),
+    );
     expect(textOf(res)).toContain("## codex (ok)");
     expect(textOf(res)).toContain("## cursor (ok)");
     expect(textOf(res)).toContain("## opencode (ok)");
@@ -322,12 +337,12 @@ describe("run_all", () => {
     expect(exec).toHaveBeenCalledWith(
       "codex",
       ["exec", "--skip-git-repo-check", "--model", "o3", "-"],
-      { cwd: undefined, timeoutMs: undefined, input: "compare" },
+      expect.objectContaining({ cwd: undefined, timeoutMs: undefined, input: "compare" }),
     );
     expect(exec).toHaveBeenCalledWith(
       "cursor-agent",
       ["-p", "--output-format", "text", "--model", "o3"],
-      { cwd: undefined, timeoutMs: undefined, input: "compare" },
+      expect.objectContaining({ cwd: undefined, timeoutMs: undefined, input: "compare" }),
     );
   });
 
@@ -342,15 +357,38 @@ describe("run_all", () => {
       name: "run_all",
       arguments: { prompt: "compare", model: "o3" },
     });
-    expect(exec).toHaveBeenCalledWith("opencode", ["run", "--model", "o3", "compare"], {
-      cwd: undefined,
-      timeoutMs: undefined,
-      input: undefined,
-    });
+    expect(exec).toHaveBeenCalledWith(
+      "opencode",
+      ["run", "--model", "o3", "compare"],
+      expect.objectContaining({ cwd: undefined, timeoutMs: undefined, input: undefined }),
+    );
     expect(exec).toHaveBeenCalledWith(
       "claude",
       ["-p", "--output-format", "text", "--model", "o3"],
-      { cwd: undefined, timeoutMs: undefined, input: "compare" },
+      expect.objectContaining({ cwd: undefined, timeoutMs: undefined, input: "compare" }),
+    );
+  });
+
+  it("forwards idleTimeoutMs to every adapter invocation", async () => {
+    const exec: Exec = vi.fn(async (binary: string) => ({
+      stdout: `${binary} answer\n`,
+      stderr: "",
+      exitCode: 0,
+    }));
+    const client = await connectedClient(exec);
+    await client.callTool({
+      name: "run_all",
+      arguments: { prompt: "compare", idleTimeoutMs: 1234 },
+    });
+    expect(exec).toHaveBeenCalledWith(
+      "codex",
+      expect.anything(),
+      expect.objectContaining({ idleTimeoutMs: 1234 }),
+    );
+    expect(exec).toHaveBeenCalledWith(
+      "opencode",
+      expect.anything(),
+      expect.objectContaining({ idleTimeoutMs: 1234 }),
     );
   });
 
@@ -597,5 +635,134 @@ describe("confirm gate is client-agnostic (A4/E7)", () => {
     const body = serverSrc.slice(start, serverSrc.indexOf("\n  }", start));
     expect(start).toBeGreaterThan(-1);
     expect(body).not.toMatch(PRODUCT);
+  });
+});
+
+// A7-A10 — MCP progress heartbeat. `client.callTool(params, undefined, { onprogress })`
+// makes the SDK auto-inject a progressToken into the request _meta; the server's
+// handler `extra._meta.progressToken` then drives makeProgressEmitter. Fake timers
+// control the emitter's `Date.now()`-based elapsed-seconds/throttle math.
+describe("progress heartbeat (A7-A10)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("A7 leading-edge + throttled, strictly-increasing progress that names the agent", async () => {
+    // Mock exec pulses onActivity across ≥2 ten-second windows plus a rapid
+    // same-window repeat that must be throttled.
+    const exec: Exec = vi.fn(
+      async (
+        _binary: string,
+        _args: string[],
+        opts?: { onActivity?: () => void },
+      ): Promise<{ stdout: string; stderr: string; exitCode: number | null }> => {
+        opts?.onActivity?.(); // t=0 → leading-edge send (progress 1)
+        opts?.onActivity?.(); // t=0 → same window → throttled (no send)
+        vi.advanceTimersByTime(10_000);
+        opts?.onActivity?.(); // t=10s → send
+        vi.advanceTimersByTime(10_000);
+        opts?.onActivity?.(); // t=20s → send
+        return { stdout: "done\n", stderr: "", exitCode: 0 };
+      },
+    );
+    const client = await connectedClient(exec);
+    vi.useFakeTimers();
+    const seen: Array<{ progress: number; message?: string }> = [];
+    const res = await client.callTool({ name: "codex", arguments: { prompt: "x" } }, undefined, {
+      onprogress: (p) => seen.push({ progress: p.progress, message: p.message }),
+    });
+    expect(res.isError).toBeFalsy();
+    expect(textOf(res)).toBe("done");
+    // Leading edge: exactly one send for the two t=0 activities, then one per window.
+    expect(seen).toHaveLength(3);
+    // Leading-edge notification fired on the first activity (elapsed 0s), not delayed.
+    expect(seen[0].message).toContain("0s");
+    expect(seen[0].message).toContain("codex");
+    // Strictly increasing progress across the request.
+    for (let i = 1; i < seen.length; i += 1) {
+      expect(seen[i].progress).toBeGreaterThan(seen[i - 1].progress);
+    }
+  });
+
+  it("A8 no onprogress → no progress token, normal result (onActivity is a no-op)", async () => {
+    const exec: Exec = vi.fn(
+      async (
+        _binary: string,
+        _args: string[],
+        opts?: { onActivity?: () => void },
+      ): Promise<{ stdout: string; stderr: string; exitCode: number | null }> => {
+        // makeProgressEmitter returned undefined (no token) → this is undefined.
+        expect(opts?.onActivity).toBeUndefined();
+        opts?.onActivity?.();
+        return { stdout: "plain\n", stderr: "", exitCode: 0 };
+      },
+    );
+    const client = await connectedClient(exec);
+    const res = await client.callTool({ name: "codex", arguments: { prompt: "x" } });
+    expect(res.isError).toBeFalsy();
+    expect(textOf(res)).toBe("plain");
+  });
+
+  it("A9 run_all shares ONE monotonic counter across concurrent adapters", async () => {
+    // Each adapter pulses once, a full window apart, so a shared emitter yields
+    // strictly-increasing progress; a per-adapter emitter would collide on 1.
+    const exec: Exec = vi.fn(
+      async (
+        _binary: string,
+        _args: string[],
+        opts?: { onActivity?: () => void },
+      ): Promise<{ stdout: string; stderr: string; exitCode: number | null }> => {
+        opts?.onActivity?.();
+        vi.advanceTimersByTime(10_000);
+        return { stdout: "ok\n", stderr: "", exitCode: 0 };
+      },
+    );
+    const client = await connectedClient(exec);
+    vi.useFakeTimers();
+    const progresses: number[] = [];
+    const res = await client.callTool(
+      { name: "run_all", arguments: { prompt: "compare" } },
+      undefined,
+      {
+        onprogress: (p) => progresses.push(p.progress),
+      },
+    );
+    expect(res.isError).toBeFalsy();
+    expect(progresses.length).toBeGreaterThanOrEqual(2);
+    for (let i = 1; i < progresses.length; i += 1) {
+      expect(progresses[i]).toBeGreaterThan(progresses[i - 1]);
+    }
+    // A shared token+counter yields distinct values (would be all-1 if per-adapter).
+    expect(new Set(progresses).size).toBe(progresses.length);
+  });
+
+  it("A10 a rejecting sendNotification is swallowed — the tool call still returns", async () => {
+    const exec: Exec = vi.fn(
+      async (
+        _binary: string,
+        _args: string[],
+        opts?: { onActivity?: () => void },
+      ): Promise<{ stdout: string; stderr: string; exitCode: number | null }> => {
+        opts?.onActivity?.(); // fires the emitter → sendNotification rejects below
+        return { stdout: "still works\n", stderr: "", exitCode: 0 };
+      },
+    );
+    const server = buildServer(allAdapters(), exec);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    // Make ONLY progress notifications fail; the tool result must still get through.
+    const realSend = serverTransport.send.bind(serverTransport);
+    serverTransport.send = async (message: unknown, options?: unknown) => {
+      if ((message as { method?: string }).method === "notifications/progress") {
+        throw new Error("progress send failed");
+      }
+      return realSend(message as never, options as never);
+    };
+    const client = new Client({ name: "test-client", version: "0.0.0" });
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    const res = await client.callTool({ name: "codex", arguments: { prompt: "x" } }, undefined, {
+      onprogress: () => {},
+    });
+    expect(res.isError).toBeFalsy();
+    expect(textOf(res)).toBe("still works");
   });
 });
