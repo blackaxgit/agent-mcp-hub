@@ -11,6 +11,7 @@ import {
 } from "./confirm.js";
 import { classifyFailure } from "./failure.js";
 import { checkAvailability } from "./registry.js";
+import type { ElicitRequestFormParams } from "@modelcontextprotocol/sdk/types.js";
 import type { AgentAdapter } from "./types.js";
 
 const { version } = createRequire(import.meta.url)("../package.json") as { version: string };
@@ -79,9 +80,11 @@ export function buildServer(adapters: AgentAdapter[], exec: Exec = runCommand): 
     // URL-only / stateless-HTTP / non-elicit clients lack it and must degrade.
     if (caps?.elicitation?.form === undefined) return true;
     try {
-      const params = { message: summary, requestedSchema: CONFIRM_SCHEMA } as unknown as Parameters<
-        typeof server.server.elicitInput
-      >[0];
+      const params: ElicitRequestFormParams = {
+        mode: "form",
+        message: summary,
+        requestedSchema: CONFIRM_SCHEMA,
+      };
       const r = await server.server.elicitInput(params);
       return r.action === "accept" && r.content?.confirm === true;
     } catch {

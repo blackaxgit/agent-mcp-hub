@@ -1,5 +1,6 @@
 // Pure helpers for the confirm-before-run gate (MCP elicitation).
 // No I/O, no subprocesses — safe to import anywhere and trivially testable.
+import type { ElicitRequestFormParams } from "@modelcontextprotocol/sdk/types.js";
 
 const ENABLING = new Set(["1", "true", "on", "all"]);
 
@@ -46,8 +47,10 @@ export function buildRunAllMessage(
   return lines.join("\n");
 }
 
-/** requestedSchema for elicitInput: a single required boolean the client renders. */
-export const CONFIRM_SCHEMA = {
+/** requestedSchema for elicitInput: a single required boolean the client renders.
+ *  Typed against the SDK so a malformed edit fails typecheck (drift-safe). The
+ *  import is type-only — erased at runtime, so this module stays pure. */
+export const CONFIRM_SCHEMA: ElicitRequestFormParams["requestedSchema"] = {
   type: "object",
   properties: {
     confirm: {
@@ -57,7 +60,7 @@ export const CONFIRM_SCHEMA = {
     },
   },
   required: ["confirm"],
-} as const;
+};
 
 /** Canonical terminal cancel wording shared by both call sites (asserted in tests). */
 export const CANCEL_TAIL =

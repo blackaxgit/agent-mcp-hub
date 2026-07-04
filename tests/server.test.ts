@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -479,5 +480,19 @@ describe("confirm gate is client-agnostic (A4/E7)", () => {
       expect(resA.isError).toBe(true);
       expect(resB.isError).toBe(true);
     });
+  });
+
+  it("A4 secondary: no product/IDE literal gates the confirm (source smoke)", () => {
+    const PRODUCT = /\b(claude|cursor|codex|vscode|windsurf|zed|continue)\b/i;
+    // confirm.ts is the pure gate helper — must be product-agnostic end to end.
+    const confirmSrc = readFileSync(new URL("../src/confirm.ts", import.meta.url), "utf8");
+    expect(confirmSrc).not.toMatch(PRODUCT);
+    // ...and the confirmOrCancel function body in server.ts (adapter names elsewhere
+    // in server.ts are legitimate tool registration, so scan only this function).
+    const serverSrc = readFileSync(new URL("../src/server.ts", import.meta.url), "utf8");
+    const start = serverSrc.indexOf("async function confirmOrCancel");
+    const body = serverSrc.slice(start, serverSrc.indexOf("\n  }", start));
+    expect(start).toBeGreaterThan(-1);
+    expect(body).not.toMatch(PRODUCT);
   });
 });
