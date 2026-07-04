@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { SpawnError, TimeoutError, type Exec } from "../src/exec.js";
+import { SpawnError, TimeoutError, OutputLimitError, type Exec } from "../src/exec.js";
 import { allAdapters, enabledAdapters } from "../src/registry.js";
 import { buildServer } from "../src/server.js";
 
@@ -60,6 +60,7 @@ describe("buildServer", () => {
       "list_agents",
       "opencode",
       "ping",
+      "review_change",
       "run_all",
     ]);
   });
@@ -212,6 +213,7 @@ describe("buildServer", () => {
       "list_agents",
       "opencode",
       "ping",
+      "review_change",
       "run_all",
     ]);
 
@@ -597,5 +599,884 @@ describe("confirm gate is client-agnostic (A4/E7)", () => {
     const body = serverSrc.slice(start, serverSrc.indexOf("\n  }", start));
     expect(start).toBeGreaterThan(-1);
     expect(body).not.toMatch(PRODUCT);
+  });
+});
+
+// review_change tool tests
+describe("review_change", () => {
+  function gitCleanExec(extra: Record<string, Exec> = {}) {
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff" && args[1] === "--stat")
+          return {
+            stdout: " M foo.ts\n 1 file changed, 1 insertion(+)\n",
+            stderr: "",
+            exitCode: 0,
+          };
+        if (args[0] === "diff")
+          return {
+            stdout:
+              "diff --git a/foo.ts b/foo.ts\n--- a/foo.ts\n+++ b/foo.ts\n@@ -1 +1 @@\n-old\n+new\n",
+            stderr: "",
+            exitCode: 0,
+          };
+        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      return extra[binary]
+        ? extra[binary](binary, args)
+        : { stdout: `${binary} default\n`, stderr: "", exitCode: 0 };
+    });
+    return exec;
+  }
+
+  it("A1 happy path: runner edits, reviewer replies PASS, all three binaries called", async () => {
+    const runnerExec: Exec = vi.fn(async () => ({
+      stdout: "done editing\n",
+      stderr: "",
+      exitCode: 0,
+    }));
+    const reviewerExec: Exec = vi.fn(async () => ({
+      stdout: "PASS\nlooks good\n",
+      stderr: "",
+      exitCode: 0,
+    }));
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff" && args[1] === "--stat")
+          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (args[0] === "diff")
+          return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
+        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return runnerExec(binary, args);
+      if (binary === "claude") return reviewerExec(binary, args);
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBeFalsy();
+    const text = textOf(res);
+    expect(text).toContain("done editing");
+    expect(text).toContain("foo.ts");
+    expect(text).toContain("Review by claude");
+    expect(text).toContain("PASS");
+    expect(exec).toHaveBeenCalledWith("codex", expect.anything(), expect.anything());
+    expect(exec).toHaveBeenCalledWith(
+      "git",
+      expect.arrayContaining(["rev-parse"]),
+      expect.anything(),
+    );
+    expect(exec).toHaveBeenCalledWith("claude", expect.anything(), expect.anything());
+  });
+
+  it("A2 verdict FAIL: text contains FAIL, isError falsy", async () => {
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff" && args[1] === "--stat")
+          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (args[0] === "diff")
+          return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
+        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return { stdout: "done\n", stderr: "", exitCode: 0 };
+      if (binary === "claude")
+        return { stdout: "FAIL: broken\nsomething wrong\n", stderr: "", exitCode: 0 };
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBeFalsy();
+    expect(textOf(res)).toContain("FAIL");
+  });
+
+  it("A2 verdict default: no PASS/WARN/FAIL first line → WARN", async () => {
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff" && args[1] === "--stat")
+          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (args[0] === "diff")
+          return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
+        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return { stdout: "done\n", stderr: "", exitCode: 0 };
+      if (binary === "claude") return { stdout: "looks okay to me\n", stderr: "", exitCode: 0 };
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBeFalsy();
+    expect(textOf(res)).toContain("WARN");
+  });
+
+  it("A3 not a repo: git rev-parse fails → isError, runner NOT called", async () => {
+    const runnerExec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "", stderr: "", exitCode: 128 };
+        return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return runnerExec(binary, args);
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain("not a git repository");
+    expect(runnerExec).not.toHaveBeenCalled();
+  });
+
+  it("git rev-parse throws → isError 'git failed'; runner NOT called", async () => {
+    const runnerExec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") throw new Error("git rev-parse boom");
+        return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return runnerExec(binary, args);
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain("git failed");
+    expect(runnerExec).not.toHaveBeenCalled();
+  });
+
+  it("runner throws → isError with classified error; git diff and reviewer NOT called", async () => {
+    const reviewerExec: Exec = vi.fn(async () => ({ stdout: "PASS\n", stderr: "", exitCode: 0 }));
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") throw new Error("runner boom");
+      if (binary === "claude") return reviewerExec(binary, args);
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain("runner boom");
+    expect(reviewerExec).not.toHaveBeenCalled();
+    const gitCalls = (exec as ReturnType<typeof vi.fn>).mock.calls.filter((c) => c[0] === "git");
+    const diffCalls = gitCalls.filter((c) => c[1][0] === "diff");
+    expect(diffCalls).toHaveLength(0);
+  });
+
+  it("no changes + dirty worktree → dirty note in text", async () => {
+    const reviewerExec: Exec = vi.fn(async () => ({ stdout: "PASS\n", stderr: "", exitCode: 0 }));
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain")
+          return { stdout: " M x\n", stderr: "", exitCode: 0 };
+        if (args[0] === "diff" && args[1] === "--stat")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff") return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return { stdout: "no-op\n", stderr: "", exitCode: 0 };
+      if (binary === "claude") return reviewerExec(binary, args);
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBeFalsy();
+    expect(textOf(res)).toContain("worktree was already dirty");
+    expect(textOf(res)).toContain("No file changes detected");
+    expect(reviewerExec).not.toHaveBeenCalled();
+  });
+
+  it('A4 unknown agent: runner "nope" → isError listing valid names; NOTHING spawned', async () => {
+    const exec: Exec = vi.fn(async () => ({ stdout: "", stderr: "", exitCode: 0 }));
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "nope", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain("unknown agent");
+    expect(text).toContain("codex");
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("A5 runner fail: runner exitCode 1 → isError classified; git diff and reviewer NOT called", async () => {
+    const reviewerExec: Exec = vi.fn(async () => ({ stdout: "PASS\n", stderr: "", exitCode: 0 }));
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return { stdout: "error output\n", stderr: "boom", exitCode: 1 };
+      if (binary === "claude") return reviewerExec(binary, args);
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain("codex failed");
+    expect(reviewerExec).not.toHaveBeenCalled();
+    // diff --stat and diff HEAD should not have been called (runner failed before capture)
+    const gitCalls = (exec as ReturnType<typeof vi.fn>).mock.calls.filter((c) => c[0] === "git");
+    const diffCalls = gitCalls.filter((c) => c[1][0] === "diff");
+    expect(diffCalls).toHaveLength(0);
+  });
+
+  it("A6 no changes: empty diff/stat + ls-files empty → isError FALSE, 'No file changes detected'; reviewer NOT called", async () => {
+    const reviewerExec: Exec = vi.fn(async () => ({ stdout: "PASS\n", stderr: "", exitCode: 0 }));
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff" && args[1] === "--stat")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff") return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return { stdout: "no-op\n", stderr: "", exitCode: 0 };
+      if (binary === "claude") return reviewerExec(binary, args);
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBeFalsy();
+    expect(textOf(res)).toContain("No file changes detected");
+    expect(reviewerExec).not.toHaveBeenCalled();
+  });
+
+  it("A7 dirty: status --porcelain shows changes → dirty note in text; status called BEFORE runner binary", async () => {
+    const runnerExec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
+    const reviewerExec: Exec = vi.fn(async () => ({ stdout: "PASS\n", stderr: "", exitCode: 0 }));
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain")
+          return { stdout: " M x\n", stderr: "", exitCode: 0 };
+        if (args[0] === "diff" && args[1] === "--stat")
+          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (args[0] === "diff")
+          return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
+        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return runnerExec(binary, args);
+      if (binary === "claude") return reviewerExec(binary, args);
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBeFalsy();
+    expect(textOf(res)).toContain("worktree was already dirty");
+    const calls = (exec as ReturnType<typeof vi.fn>).mock.calls;
+    const statusIdx = calls.findIndex((c) => c[0] === "git" && c[1][0] === "status");
+    const runnerIdx = calls.findIndex((c) => c[0] === "codex");
+    expect(statusIdx).toBeGreaterThan(-1);
+    expect(runnerIdx).toBeGreaterThan(-1);
+    expect(statusIdx).toBeLessThan(runnerIdx);
+  });
+
+  it("A8 confirm decline: elicitation declines → isError cancelled; git rev-parse, runner, reviewer NONE called", async () => {
+    const prev = process.env.MCP_CONFIRM;
+    process.env.MCP_CONFIRM = "1";
+    try {
+      const exec: Exec = vi.fn(async () => ({ stdout: "", stderr: "", exitCode: 0 }));
+      const client = await connectedClientWithElicit(exec, declineHandler);
+      const res = await client.callTool({
+        name: "review_change",
+        arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+      });
+      expect(res.isError).toBe(true);
+      expect(textOf(res)).toContain("cancelled by user");
+      const calls = (exec as ReturnType<typeof vi.fn>).mock.calls;
+      expect(calls.filter((c) => c[0] === "git")).toHaveLength(0);
+      expect(calls.filter((c) => c[0] === "codex")).toHaveLength(0);
+      expect(calls.filter((c) => c[0] === "claude")).toHaveLength(0);
+    } finally {
+      if (prev === undefined) delete process.env.MCP_CONFIRM;
+      else process.env.MCP_CONFIRM = prev;
+    }
+  });
+
+  it("A10 untracked-only: diff/stat empty but ls-files shows new.ts → reviewer IS called, prompt + result contain 'new.ts'", async () => {
+    const reviewerExec: Exec = vi.fn(async () => ({
+      stdout: "PASS\nlooks good\n",
+      stderr: "",
+      exitCode: 0,
+    }));
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff" && args[1] === "--stat")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff") return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "ls-files") return { stdout: "new.ts\n", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return { stdout: "created new.ts\n", stderr: "", exitCode: 0 };
+      if (binary === "claude") return reviewerExec(binary, args);
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "add new feature", cwd: "/tmp" },
+    });
+    expect(res.isError).toBeFalsy();
+    const text = textOf(res);
+    expect(text).toContain("new.ts");
+    expect(text).toContain("PASS");
+    expect(text).toContain("New files: new.ts");
+  });
+
+  it("A11 git-capture fail: runner ok, diff HEAD throws OutputLimitError → isError 'too large'; reviewer NOT called", async () => {
+    const reviewerExec: Exec = vi.fn(async () => ({ stdout: "PASS\n", stderr: "", exitCode: 0 }));
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff" && args[1] === "--stat")
+          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (args[0] === "diff") throw new OutputLimitError("too big", 1000);
+        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return { stdout: "done\n", stderr: "", exitCode: 0 };
+      if (binary === "claude") return reviewerExec(binary, args);
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain("too large");
+    expect(reviewerExec).not.toHaveBeenCalled();
+  });
+
+  it("A12 reviewer fail: reviewer exitCode 1 → isError true, text includes runner output + review-could-not-run note", async () => {
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff" && args[1] === "--stat")
+          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (args[0] === "diff")
+          return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
+        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return { stdout: "done editing\n", stderr: "", exitCode: 0 };
+      if (binary === "claude") return { stdout: "", stderr: "reviewer boom", exitCode: 1 };
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain("done editing");
+    expect(text).toContain("Review could not run");
+  });
+
+  it("A13 metadata: listTools shows review_change with required cwd and expected annotations", async () => {
+    const client = await connectedClient(gitCleanExec());
+    const { tools } = await client.listTools();
+    const review = tools.find((t) => t.name === "review_change");
+    expect(review).toBeDefined();
+    const schema = review!.inputSchema as {
+      properties: Record<string, { type: string; description: string }>;
+      required: string[];
+    };
+    expect(schema.required).toContain("cwd");
+    expect(schema.properties.cwd).toBeDefined();
+    expect(schema.properties.runner).toBeDefined();
+    expect(schema.properties.reviewer).toBeDefined();
+    expect(schema.properties.prompt).toBeDefined();
+    expect(review!.annotations).toEqual({
+      readOnlyHint: false,
+      destructiveHint: true,
+      openWorldHint: true,
+    });
+  });
+
+  it("unknown REVIEWER reports the reviewer name (not runner) and lists valid names; nothing spawned", async () => {
+    const exec: Exec = vi.fn(async () => ({ stdout: "", stderr: "", exitCode: 0 }));
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "nope", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain("unknown agent");
+    expect(text).toContain("nope");
+    expect(text).toMatch(/unknown agent "nope"/);
+    expect(text).toContain("valid:");
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("verdict lower/mixed case: 'pass\\nlgtm' → PASS; '  fail: broken' → FAIL", async () => {
+    const exec1: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff" && args[1] === "--stat")
+          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (args[0] === "diff")
+          return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
+        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return { stdout: "done\n", stderr: "", exitCode: 0 };
+      if (binary === "claude") return { stdout: "pass\nlgtm\n", stderr: "", exitCode: 0 };
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client1 = await connectedClient(exec1);
+    const res1 = await client1.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res1.isError).toBeFalsy();
+    expect(textOf(res1)).toContain("PASS");
+    expect(textOf(res1)).not.toContain("WARN");
+
+    const exec2: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff" && args[1] === "--stat")
+          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (args[0] === "diff")
+          return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
+        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return { stdout: "done\n", stderr: "", exitCode: 0 };
+      if (binary === "claude") return { stdout: "  fail: broken\n", stderr: "", exitCode: 0 };
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client2 = await connectedClient(exec2);
+    const res2 = await client2.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res2.isError).toBeFalsy();
+    expect(textOf(res2)).toContain("FAIL");
+  });
+
+  it("reviewer THROW path: SpawnError → isError, runner output + 'Review could not run' + classified error; no '## Review by' section", async () => {
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff" && args[1] === "--stat")
+          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (args[0] === "diff")
+          return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
+        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return { stdout: "done editing\n", stderr: "", exitCode: 0 };
+      if (binary === "claude") throw new SpawnError("boom");
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain("done editing");
+    expect(text).toContain("Review could not run");
+    expect(text).toContain("not installed");
+    expect(text).toContain("spawn failed");
+    expect(text).not.toContain("## Review by claude");
+  });
+
+  it("reviewer THROW with empty stat + untracked → covers true branches of both ternaries in catch block", async () => {
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff" && args[1] === "--stat")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff") return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "ls-files") return { stdout: "new.ts\n", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return { stdout: "created new.ts\n", stderr: "", exitCode: 0 };
+      if (binary === "claude") throw new SpawnError("boom");
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain("Review could not run");
+    expect(text).toContain("New files: new.ts");
+    expect(text).not.toContain("## Change (git diff --stat)");
+  });
+
+  it("generic capture throw: runner ok, git diff HEAD throws plain Error → 'git failed capturing the diff', runner output present, 'too large' absent, reviewer NOT called", async () => {
+    const reviewerExec: Exec = vi.fn(async () => ({ stdout: "PASS\n", stderr: "", exitCode: 0 }));
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff" && args[1] === "--stat")
+          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (args[0] === "diff") throw new Error("git boom");
+        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return { stdout: "done\n", stderr: "", exitCode: 0 };
+      if (binary === "claude") return reviewerExec(binary, args);
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain("git failed capturing the diff");
+    expect(text).toContain("git boom");
+    expect(text).toContain("done");
+    expect(text).not.toContain("too large");
+    expect(reviewerExec).not.toHaveBeenCalled();
+  });
+
+  it("reviewer-error text with empty stat + untracked: no '## Change (git diff --stat)' section but 'New files: new.ts' present", async () => {
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff" && args[1] === "--stat")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff") return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "ls-files") return { stdout: "new.ts\n", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return { stdout: "created new.ts\n", stderr: "", exitCode: 0 };
+      if (binary === "claude") return { stdout: "", stderr: "reviewer boom", exitCode: 1 };
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain("Review could not run");
+    expect(text).toContain("New files: new.ts");
+    expect(text).not.toContain("## Change (git diff --stat)");
+  });
+
+  it("worktreeDirty throw: git status --porcelain throws → isError 'git failed'; runner NOT called", async () => {
+    const runnerExec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain") throw new Error("status boom");
+        return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return runnerExec(binary, args);
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain("git failed");
+    expect(runnerExec).not.toHaveBeenCalled();
+  });
+
+  it("strengthen untracked-only: reviewer exec called with prompt containing 'New untracked files: new.ts' and '(no tracked diff)'", async () => {
+    const reviewerExec: Exec = vi.fn(async () => ({
+      stdout: "PASS\nlooks good\n",
+      stderr: "",
+      exitCode: 0,
+    }));
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff" && args[1] === "--stat")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff") return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "ls-files") return { stdout: "new.ts\n", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return { stdout: "created new.ts\n", stderr: "", exitCode: 0 };
+      if (binary === "claude") return reviewerExec(binary, args);
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "add new feature", cwd: "/tmp" },
+    });
+    expect(res.isError).toBeFalsy();
+    const claudeCalls = (exec as ReturnType<typeof vi.fn>).mock.calls.filter(
+      (c) => c[0] === "claude",
+    );
+    expect(claudeCalls.length).toBeGreaterThan(0);
+    const lastClaudeCall = claudeCalls[claudeCalls.length - 1];
+    const opts = lastClaudeCall[2] as { input?: string };
+    expect(opts.input).toContain("New untracked files: new.ts");
+    expect(opts.input).toContain("(no tracked diff)");
+  });
+
+  it("untracked-only SUCCESS: empty stat + empty diff + untracked present → PASS verdict, 'New files:' present", async () => {
+    const reviewerExec: Exec = vi.fn(async () => ({
+      stdout: "PASS\nlooks good\n",
+      stderr: "",
+      exitCode: 0,
+    }));
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff" && args[1] === "--stat")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff") return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "ls-files") return { stdout: "new.ts\n", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return { stdout: "created new.ts\n", stderr: "", exitCode: 0 };
+      if (binary === "claude") return reviewerExec(binary, args);
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "add new feature", cwd: "/tmp" },
+    });
+    expect(res.isError).toBeFalsy();
+    const text = textOf(res);
+    expect(text).toContain("PASS");
+    expect(text).toContain("New files: new.ts");
+    expect(text).toContain("## Change (git diff --stat)");
+  });
+
+  it("success WITH tracked diff AND untracked together: both sections present in output", async () => {
+    const reviewerExec: Exec = vi.fn(async () => ({
+      stdout: "PASS\nlooks good\n",
+      stderr: "",
+      exitCode: 0,
+    }));
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff" && args[1] === "--stat")
+          return {
+            stdout: " M foo.ts\n 1 file changed, 1 insertion(+)\n",
+            stderr: "",
+            exitCode: 0,
+          };
+        if (args[0] === "diff")
+          return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
+        if (args[0] === "ls-files") return { stdout: "extra.ts\n", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return { stdout: "done editing\n", stderr: "", exitCode: 0 };
+      if (binary === "claude") return reviewerExec(binary, args);
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBeFalsy();
+    const text = textOf(res);
+    expect(text).toContain("## Change (git diff --stat)");
+    expect(text).toContain("New files: extra.ts");
+    expect(text).toContain("PASS");
+  });
+
+  it("empty reviewer output → default WARN verdict", async () => {
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff" && args[1] === "--stat")
+          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (args[0] === "diff")
+          return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
+        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return { stdout: "done\n", stderr: "", exitCode: 0 };
+      if (binary === "claude") return { stdout: "", stderr: "", exitCode: 0 };
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBeFalsy();
+    const text = textOf(res);
+    expect(text).toContain("WARN");
+    expect(text).toContain("## Review by claude");
+  });
+
+  it("non-Error throw in git capture (diff HEAD rejects with string) → isError, 'git failed capturing the diff: raw string failure'", async () => {
+    const reviewerExec: Exec = vi.fn(async () => ({ stdout: "PASS\n", stderr: "", exitCode: 0 }));
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff" && args[1] === "--stat")
+          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (args[0] === "diff") return Promise.reject("raw string failure");
+        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return { stdout: "done\n", stderr: "", exitCode: 0 };
+      if (binary === "claude") return reviewerExec(binary, args);
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain("git failed capturing the diff: raw string failure");
+    expect(reviewerExec).not.toHaveBeenCalled();
+  });
+
+  it("non-Error throw in isGitRepo (rev-parse rejects with string) → isError 'git failed: raw'", async () => {
+    const runnerExec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return Promise.reject("raw");
+        return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return runnerExec(binary, args);
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain("git failed: raw");
+    expect(runnerExec).not.toHaveBeenCalled();
+  });
+
+  it("worktreeDirty throw with non-Error → isError uses String(err)", async () => {
+    const runnerExec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain") return Promise.reject("status raw");
+        return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return runnerExec(binary, args);
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain("git failed: status raw");
+    expect(runnerExec).not.toHaveBeenCalled();
+  });
+
+  it("reviewer catch with non-empty stat + no untracked → stat section present, no 'New files:'", async () => {
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (args[0] === "status" && args[1] === "--porcelain")
+          return { stdout: "", stderr: "", exitCode: 0 };
+        if (args[0] === "diff" && args[1] === "--stat")
+          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (args[0] === "diff")
+          return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
+        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return { stdout: "done editing\n", stderr: "", exitCode: 0 };
+      if (binary === "claude") return { stdout: "", stderr: "reviewer boom", exitCode: 1 };
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain("## Change (git diff --stat)");
+    expect(text).toContain("M foo.ts");
+    expect(text).not.toContain("New files:");
+    expect(text).toContain("Review could not run");
   });
 });
