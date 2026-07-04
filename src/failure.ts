@@ -153,12 +153,26 @@ function classifyError(adapter: AdapterMeta, error: unknown): FailureClassificat
     };
   }
   if (error instanceof TimeoutError) {
+    // Split by WHICH cap fired: an idle timeout means the agent went silent
+    // (likely hung or its backend is unreachable) — raising the cap won't help,
+    // so we point at the CLI/model/connection instead. A total timeout means a
+    // genuinely long run outgrew the runtime cap, so raising it is the fix.
+    if (error.kind === "idle") {
+      return {
+        code: "timed_out",
+        message:
+          `${adapter.name} failed: no output (idle timeout).\n` +
+          `The agent produced no output for ${error.timeoutMs}ms — it may be hung, ` +
+          `or its model/backend is unreachable.\n` +
+          `Fix: check the ${adapter.name} CLI, its model, and the network connection.`,
+      };
+    }
     return {
       code: "timed_out",
       message:
         `${adapter.name} failed: timed out after ${error.timeoutMs}ms.\n` +
-        `The agent did not finish in time.\n` +
-        `Fix: raise timeoutMs, or check the agent/model is responsive.`,
+        `The total runtime cap was exceeded before the agent finished.\n` +
+        `Fix: raise timeoutMs (or MCP_AGENT_TIMEOUT_MS), or check the agent/model is responsive.`,
     };
   }
   if (error instanceof OutputLimitError) {
