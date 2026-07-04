@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  DEFAULT_IDLE_TIMEOUT_MS,
   DEFAULT_TIMEOUT_MS,
   MAX_CONCURRENT_AGENTS,
+  OutputLimitError,
   ServerBusyError,
   TimeoutError,
   runCommand,
@@ -40,22 +42,159 @@ describe("runCommand", () => {
     );
   });
 
-  it("kills the process and rejects when the timeout is exceeded", async () => {
-    await expect(
-      runCommand("node", ["-e", "setTimeout(() => {}, 10000)"], { timeoutMs: 200 }),
-    ).rejects.toThrow(/timed out after 200ms/);
-  });
-
-  it("rejects timeout with a typed TimeoutError carrying timeoutMs", async () => {
+  it("kills the process and rejects when the total timeout is exceeded", async () => {
+    // idleTimeoutMs > timeoutMs so the TOTAL cap (not idle) is the one that fires.
     const err = await runCommand("node", ["-e", "setTimeout(() => {}, 10000)"], {
       timeoutMs: 200,
+      idleTimeoutMs: 5000,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(TimeoutError);
+    expect((err as TimeoutError).message).toMatch(/timed out after 200ms/);
+    expect((err as TimeoutError).kind).toBe("total");
+  });
+
+  it("rejects total timeout with a typed TimeoutError carrying timeoutMs", async () => {
+    const err = await runCommand("node", ["-e", "setTimeout(() => {}, 10000)"], {
+      timeoutMs: 200,
+      idleTimeoutMs: 5000,
     }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(TimeoutError);
     expect((err as TimeoutError).timeoutMs).toBe(200);
+    expect((err as TimeoutError).kind).toBe("total");
   });
 
-  it("defaults the timeout to 300000ms", () => {
-    expect(DEFAULT_TIMEOUT_MS).toBe(300_000);
+  it("defaults the total timeout to 1800000ms", () => {
+    expect(DEFAULT_TIMEOUT_MS).toBe(1_800_000);
+  });
+
+  it("defaults the idle timeout to 300000ms", () => {
+    expect(DEFAULT_IDLE_TIMEOUT_MS).toBe(300_000);
+  });
+});
+
+describe("runCommand idle timeout", () => {
+  it("A1: kills a silent child at the idle window with kind 'idle'", async () => {
+    // Small idle window, LARGE total cap: the kill must come from the IDLE timer,
+    // not the total. Elapsed well under the 10s total (but above the 150ms idle)
+    // proves idle fired — a total-driven kill could not land this fast.
+    const start = Date.now();
+    const err = await runCommand("node", ["-e", "setTimeout(()=>{},10000)"], {
+      idleTimeoutMs: 150,
+      timeoutMs: 10_000,
+    }).catch((e: unknown) => e);
+    const elapsed = Date.now() - start;
+    expect(err).toBeInstanceOf(TimeoutError);
+    expect((err as TimeoutError).kind).toBe("idle");
+    expect((err as TimeoutError).timeoutMs).toBe(150);
+    expect((err as TimeoutError).message).toMatch(/no output/);
+    // Comfortably under the 10s total cap — proves idle, not total, did the kill.
+    expect(elapsed).toBeLessThan(2000);
+  });
+
+  it("A2: a periodically-printing child resets the idle timer and survives", async () => {
+    // Prints every ~40ms for ~400ms; idle window (150ms) is ≥3× the interval, so
+    // each line re-arms idle and the child is NOT killed — it exits 0 on its own.
+    const script =
+      "let n=0;const t=setInterval(()=>{console.log(n++);if(n>9){clearInterval(t)}},40);";
+    const r = await runCommand("node", ["-e", script], {
+      idleTimeoutMs: 150,
+      timeoutMs: 30_000,
+    });
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("A3: total cap fires before idle for a continuously-printing child", async () => {
+    // Small total cap, LARGE idle window (10s) that the child never approaches —
+    // it prints every 10ms so the idle timer is perpetually re-armed and can never
+    // fire. The kill at well under 2s therefore can only be the TOTAL cap.
+    const start = Date.now();
+    const err = await runCommand(
+      "node",
+      ["-e", "setInterval(()=>console.log('x'),10);setTimeout(()=>{},30000);"],
+      { timeoutMs: 300, idleTimeoutMs: 10_000 },
+    ).catch((e: unknown) => e);
+    const elapsed = Date.now() - start;
+    expect(err).toBeInstanceOf(TimeoutError);
+    expect((err as TimeoutError).kind).toBe("total");
+    expect((err as TimeoutError).timeoutMs).toBe(300);
+    expect((err as TimeoutError).message).toMatch(/timed out/);
+    // Idle is 10s and never idle anyway — sub-2s can only be the total cap.
+    expect(elapsed).toBeLessThan(2000);
+  });
+
+  it("A4: with idle === total both timers race but reject exactly once", async () => {
+    // Silent child, idleTimeoutMs === timeoutMs (both small + equal): the total
+    // and idle timers are scheduled for the same tick, so both callbacks are due
+    // together. markTimeout()'s guard must let only the FIRST win — a single
+    // TimeoutError, one kill, no double-reject and no unhandled rejection. The
+    // test simply completing (Promise settles once, process does not crash) is the
+    // proof; kind may be "idle" or "total" depending on timer ordering.
+    let rejections = 0;
+    const err = await runCommand("node", ["-e", "setTimeout(()=>{},10000)"], {
+      idleTimeoutMs: 120,
+      timeoutMs: 120,
+    }).then(
+      () => {
+        throw new Error("expected the racing timers to reject");
+      },
+      (e: unknown) => {
+        rejections += 1;
+        return e;
+      },
+    );
+    expect(rejections).toBe(1);
+    expect(err).toBeInstanceOf(TimeoutError);
+    expect(["idle", "total"]).toContain((err as TimeoutError).kind);
+    // Give any losing timer its chance to (wrongly) fire a second time; a stray
+    // reject/kill would surface as an unhandled rejection and fail the run.
+    await delay(300);
+  });
+});
+
+describe("runCommand onActivity", () => {
+  it("A5: fires ≥1 for a printing child and is absent-safe", async () => {
+    let calls = 0;
+    const r = await runCommand("node", ["-e", "console.log('a');console.log('b')"], {
+      onActivity: () => {
+        calls += 1;
+      },
+    });
+    expect(r.exitCode).toBe(0);
+    expect(calls).toBeGreaterThanOrEqual(1);
+  });
+
+  it("A5: does not fire for a silent child killed by idle", async () => {
+    let calls = 0;
+    await runCommand("node", ["-e", "setTimeout(()=>{},5000)"], {
+      idleTimeoutMs: 100,
+      timeoutMs: 30_000,
+      onActivity: () => {
+        calls += 1;
+      },
+    }).catch(() => {});
+    expect(calls).toBe(0);
+  });
+
+  it("A5: an absent onActivity callback is a no-op", async () => {
+    // No onActivity passed — a printing child must not crash the tracker.
+    const r = await runCommand("node", ["-e", "console.log('hi')"]);
+    expect(r.stdout.trim()).toBe("hi");
+    expect(r.exitCode).toBe(0);
+  });
+});
+
+describe("TimeoutError back-compat", () => {
+  it("A11: keeps code/name/timeoutMs/instanceof and defaults kind to 'total'", () => {
+    const err = new TimeoutError("x", 50);
+    expect(err).toBeInstanceOf(TimeoutError);
+    expect(err.code).toBe("timeout");
+    expect(err.name).toBe("TimeoutError");
+    expect(err.timeoutMs).toBe(50);
+    expect(err.kind).toBe("total");
+  });
+
+  it("A11: accepts an explicit idle kind", () => {
+    expect(new TimeoutError("x", 50, "idle").kind).toBe("idle");
   });
 });
 
@@ -95,6 +234,49 @@ describe("MAX_CONCURRENT_AGENTS env parsing", () => {
   });
 });
 
+describe("timeout default env parsing", () => {
+  // DEFAULT_TIMEOUT_MS / DEFAULT_IDLE_TIMEOUT_MS are parsed once at module load
+  // via the shared positive-int helper, so re-import the module with the env set
+  // to exercise both the override and the invalid-→-default arms.
+  const reimport = async (env: {
+    total?: string | undefined;
+    idle?: string | undefined;
+  }): Promise<{ total: number; idle: number }> => {
+    const prevTotal = process.env.MCP_AGENT_TIMEOUT_MS;
+    const prevIdle = process.env.MCP_AGENT_IDLE_TIMEOUT_MS;
+    const set = (key: string, value: string | undefined) => {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    };
+    set("MCP_AGENT_TIMEOUT_MS", env.total);
+    set("MCP_AGENT_IDLE_TIMEOUT_MS", env.idle);
+    vi.resetModules();
+    try {
+      const mod = await import("../src/exec.js");
+      return { total: mod.DEFAULT_TIMEOUT_MS, idle: mod.DEFAULT_IDLE_TIMEOUT_MS };
+    } finally {
+      set("MCP_AGENT_TIMEOUT_MS", prevTotal);
+      set("MCP_AGENT_IDLE_TIMEOUT_MS", prevIdle);
+      vi.resetModules();
+    }
+  };
+
+  it("uses valid positive-integer overrides", async () => {
+    expect(await reimport({ total: "600000", idle: "45000" })).toEqual({
+      total: 600_000,
+      idle: 45_000,
+    });
+  });
+
+  it("falls back to the raised total default and 300000 idle for invalid env", async () => {
+    // Invalid values (non-integer / negative) collapse to the built-in defaults.
+    expect(await reimport({ total: "abc", idle: "-5" })).toEqual({
+      total: 1_800_000,
+      idle: 300_000,
+    });
+  });
+});
+
 describe("runCommand process-group tree kill", () => {
   let workDir: string;
 
@@ -118,9 +300,13 @@ describe("runCommand process-group tree kill", () => {
       "process.argv[1]],{stdio:'ignore'});" +
       "setTimeout(()=>{},10000);";
 
-    await expect(
-      runCommand("node", ["-e", childScript, marker], { timeoutMs: 300 }),
-    ).rejects.toThrow(/timed out after 300ms/);
+    const err = await runCommand("node", ["-e", childScript, marker], {
+      timeoutMs: 300,
+      idleTimeoutMs: 5000,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(TimeoutError);
+    expect((err as TimeoutError).message).toMatch(/timed out after 300ms/);
+    expect((err as TimeoutError).kind).toBe("total");
 
     // Let any in-flight write settle, then confirm the grandchild stopped growing it.
     await delay(300);
@@ -163,10 +349,14 @@ describe("runCommand killGroup failure handling", () => {
     const counter = sabotageGroupKill("ESRCH");
     const childKill = vi.spyOn(ChildProcess.prototype, "kill");
 
-    const err = await runCommand("node", selfExiting, { timeoutMs: 100 }).catch((e: unknown) => e);
+    const err = await runCommand("node", selfExiting, {
+      timeoutMs: 100,
+      idleTimeoutMs: 5000,
+    }).catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(TimeoutError);
     expect((err as TimeoutError).message).toMatch(/timed out after 100ms/);
+    expect((err as TimeoutError).kind).toBe("total");
     expect(counter.negativePidKills).toBeGreaterThan(0);
     // ESRCH short-circuits before the single-PID fallback.
     expect(childKill).not.toHaveBeenCalled();
@@ -184,10 +374,14 @@ describe("runCommand killGroup failure handling", () => {
       return realChildKill.call(this, signal);
     });
 
-    const err = await runCommand("node", selfExiting, { timeoutMs: 100 }).catch((e: unknown) => e);
+    const err = await runCommand("node", selfExiting, {
+      timeoutMs: 100,
+      idleTimeoutMs: 5000,
+    }).catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(TimeoutError);
     expect((err as TimeoutError).message).toMatch(/timed out after 100ms/);
+    expect((err as TimeoutError).kind).toBe("total");
     expect(counter.negativePidKills).toBeGreaterThan(0);
     // The fallback fired: child.kill("SIGKILL") reaped the child by its own PID.
     expect(childKill).toHaveBeenCalledWith("SIGKILL");
@@ -202,10 +396,14 @@ describe("runCommand killGroup failure handling", () => {
       throw Object.assign(new Error("EPERM"), { code: "EPERM" });
     });
 
-    const err = await runCommand("node", selfExiting, { timeoutMs: 100 }).catch((e: unknown) => e);
+    const err = await runCommand("node", selfExiting, {
+      timeoutMs: 100,
+      idleTimeoutMs: 5000,
+    }).catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(TimeoutError);
     expect((err as TimeoutError).message).toMatch(/timed out after 100ms/);
+    expect((err as TimeoutError).kind).toBe("total");
     expect(counter.negativePidKills).toBeGreaterThan(0);
     expect(childKill).toHaveBeenCalledWith("SIGKILL");
   });
@@ -243,6 +441,38 @@ describe("runCommand output cap", () => {
     // re-enter the limit branch on every drained chunk and kill repeatedly.
     expect(groupKills).toBe(1);
     vi.restoreAllMocks();
+  });
+
+  it("clears the timers on the output-cap path so neither timer double-fires", async () => {
+    // The child floods stdout past a tiny cap while BOTH timeout windows are small
+    // enough that they WOULD otherwise fire. The output-cap breach must call
+    // clearTimers() and win: the call rejects with OutputLimitError (never a
+    // TimeoutError), exactly once, and no stray timer fires afterward (a leaked
+    // idle/total timer would markTimeout → double-kill → unhandled rejection).
+    let rejections = 0;
+    const flood =
+      "const b=Buffer.alloc(4096,120);" +
+      "function w(){if(process.stdout.write(b))setImmediate(w);else process.stdout.once('drain',w);}" +
+      "w();";
+    const err = await runCommand("node", ["-e", flood], {
+      maxOutputBytes: 10,
+      idleTimeoutMs: 100,
+      timeoutMs: 100,
+    }).then(
+      () => {
+        throw new Error("expected the output cap to reject");
+      },
+      (e: unknown) => {
+        rejections += 1;
+        return e;
+      },
+    );
+    expect(rejections).toBe(1);
+    expect(err).toBeInstanceOf(OutputLimitError);
+    expect(err).not.toBeInstanceOf(TimeoutError);
+    expect((err as OutputLimitError).maxOutputBytes).toBe(10);
+    // Past both timeout windows: a leaked timer would have double-fired by now.
+    await delay(300);
   });
 
   it("does not echo captured bytes in the limit error", async () => {

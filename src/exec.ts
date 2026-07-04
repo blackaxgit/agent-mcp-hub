@@ -9,16 +9,45 @@ export interface ExecResult {
 export type Exec = (
   binary: string,
   args: string[],
-  opts?: { cwd?: string; timeoutMs?: number; input?: string; maxOutputBytes?: number },
+  opts?: {
+    cwd?: string;
+    timeoutMs?: number;
+    idleTimeoutMs?: number;
+    input?: string;
+    maxOutputBytes?: number;
+    /** Fired synchronously once per ACCEPTED output chunk. Never awaited. */
+    onActivity?: () => void;
+  },
 ) => Promise<ExecResult>;
 
-export const DEFAULT_TIMEOUT_MS = 300_000;
+/** Positive finite integer only; NaN/0/negative/non-integer all fall back to `fallback`. */
+function parsePositiveInt(raw: string | undefined, fallback: number): number {
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+
+/**
+ * TOTAL runtime cap (never reset). Parsed once at module load; override via
+ * MCP_AGENT_TIMEOUT_MS. Raised to 30 min so long PRODUCTIVE runs survive — the
+ * idle timeout, not this, is the fast hung-agent detector.
+ */
+export const DEFAULT_TIMEOUT_MS = parsePositiveInt(process.env.MCP_AGENT_TIMEOUT_MS, 1_800_000);
+
+/**
+ * IDLE (inactivity) cap: reset on every accepted output chunk. Parsed once at
+ * module load; override via MCP_AGENT_IDLE_TIMEOUT_MS. Generous default so a
+ * slow-but-streaming CLI is not killed mid-work.
+ */
+export const DEFAULT_IDLE_TIMEOUT_MS = parsePositiveInt(
+  process.env.MCP_AGENT_IDLE_TIMEOUT_MS,
+  300_000,
+);
+
 export const DEFAULT_MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
 
 /** Positive finite integer only; NaN/0/negative/non-integer all fall back to 4. */
 function parseConcurrency(raw: string | undefined): number {
-  const n = Number(raw);
-  return Number.isInteger(n) && n > 0 ? n : 4;
+  return parsePositiveInt(raw, 4);
 }
 
 /** Non-negative finite integer only; NaN/negative/non-integer all fall back to 100. */
@@ -59,12 +88,18 @@ export class SpawnError extends Error {
   }
 }
 
-/** Thrown when the child is killed for exceeding `timeoutMs`. Carries the bound. */
+/**
+ * Thrown when the child is killed for exceeding a timeout. Carries the bound and
+ * WHICH cap fired: `"idle"` (no output for idleTimeoutMs — likely hung/unreachable)
+ * or `"total"` (exceeded the total runtime cap). `kind` is additive and defaults
+ * to `"total"`, so `new TimeoutError(msg, ms)` call sites are unchanged.
+ */
 export class TimeoutError extends Error {
   readonly code = "timeout";
   constructor(
     message: string,
     readonly timeoutMs: number,
+    readonly kind: "idle" | "total" = "total",
   ) {
     super(message);
     this.name = "TimeoutError";
@@ -160,6 +195,7 @@ async function withSlot<T>(fn: () => Promise<T>): Promise<T> {
 
 const runCommandInner: Exec = (binary, args, opts = {}) => {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const idleTimeoutMs = opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
   const maxOutputBytes = opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
   return new Promise<ExecResult>((resolve, reject) => {
     const child = spawn(binary, args, {
@@ -172,16 +208,35 @@ const runCommandInner: Exec = (binary, args, opts = {}) => {
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
     let outputBytes = 0;
-    let timedOut = false;
+    // Which cap fired, if any. Recorded exactly once by markTimeout so a losing
+    // timer can never overwrite the kind or double-kill.
+    let timeoutCause: { kind: "idle" | "total"; windowMs: number } | undefined;
     let killedForOutput = false;
     let settled = false;
 
-    // Timer starts here — after the semaphore slot is acquired — so timeoutMs
-    // bounds the child's runtime, not the time spent queued behind the cap.
-    const timer = setTimeout(() => {
-      timedOut = true;
+    // The TOTAL timer bounds runtime and is NEVER reset. The IDLE timer is reset
+    // on every accepted chunk. Both start after the semaphore slot is acquired,
+    // so the caps bound the child's runtime, not time spent queued behind the cap.
+    let idleTimer: NodeJS.Timeout;
+    const totalTimer = setTimeout(() => markTimeout("total", timeoutMs), timeoutMs);
+
+    const clearTimers = () => {
+      clearTimeout(totalTimer);
+      clearTimeout(idleTimer);
+    };
+
+    // Single guarded terminal path: first timer to fire wins, records the cause,
+    // stops BOTH timers, then kills the tree. Idempotent — a second call (losing
+    // timer, or a race with settle) is a no-op, so no double-kill / overwrite.
+    function markTimeout(kind: "idle" | "total", windowMs: number): void {
+      /* v8 ignore next -- unreachable: clearTimers() cancels the losing timer before it can fire, so markTimeout runs at most once (settled/timeoutCause never true on entry) */
+      if (settled || timeoutCause) return;
+      timeoutCause = { kind, windowMs };
+      clearTimers();
       killTree();
-    }, timeoutMs);
+    }
+
+    idleTimer = setTimeout(() => markTimeout("idle", idleTimeoutMs), idleTimeoutMs);
 
     if (opts.input !== undefined) {
       // Swallow EPIPE if the child exits before reading its stdin.
@@ -195,22 +250,29 @@ const runCommandInner: Exec = (binary, args, opts = {}) => {
       outputBytes += chunk.length;
       if (outputBytes > maxOutputBytes) {
         // Stop accumulating and drop what we captured: memory must not keep
-        // growing between the breach and the child actually dying.
+        // growing between the breach and the child actually dying. The fatal
+        // breach chunk is NOT activity — it neither re-arms idle nor fires a
+        // heartbeat right before the kill.
         killedForOutput = true;
         stdoutChunks.length = 0;
         stderrChunks.length = 0;
-        clearTimeout(timer);
+        clearTimers();
         killTree();
         return;
       }
       sink.push(chunk);
+      // ACCEPTED chunk: this counts as progress. Fire the (synchronous) activity
+      // hook and reset the idle window from now.
+      opts.onActivity?.();
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => markTimeout("idle", idleTimeoutMs), idleTimeoutMs);
     };
 
     child.stdout?.on("data", (chunk: Buffer) => track(chunk, stdoutChunks));
     child.stderr?.on("data", (chunk: Buffer) => track(chunk, stderrChunks));
 
     child.on("error", (err) => {
-      clearTimeout(timer);
+      clearTimers();
       if (settled) return;
       settled = true;
       reject(
@@ -222,7 +284,7 @@ const runCommandInner: Exec = (binary, args, opts = {}) => {
     });
 
     child.on("close", (code) => {
-      clearTimeout(timer);
+      clearTimers();
       if (settled) return;
       settled = true;
       if (killedForOutput) {
@@ -235,8 +297,24 @@ const runCommandInner: Exec = (binary, args, opts = {}) => {
         );
         return;
       }
-      if (timedOut) {
-        reject(new TimeoutError(`"${binary}" timed out after ${timeoutMs}ms`, timeoutMs));
+      if (timeoutCause) {
+        if (timeoutCause.kind === "idle") {
+          reject(
+            new TimeoutError(
+              `"${binary}" produced no output for ${idleTimeoutMs}ms (idle) — it may be hung or its model/backend is unreachable`,
+              idleTimeoutMs,
+              "idle",
+            ),
+          );
+        } else {
+          reject(
+            new TimeoutError(
+              `"${binary}" timed out after ${timeoutMs}ms (total runtime cap)`,
+              timeoutMs,
+              "total",
+            ),
+          );
+        }
         return;
       }
       resolve({

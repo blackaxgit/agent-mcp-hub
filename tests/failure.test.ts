@@ -78,6 +78,45 @@ describe("classifyFailure — error branch (by type)", () => {
     expect(c.message).toContain("50");
   });
 
+  it("TimeoutError kind:'idle' -> hung/unreachable message that does NOT suggest raising the cap", () => {
+    const c = classifyFailure(codex, {
+      error: new TimeoutError("no output for 300000ms (idle)", 300_000, "idle"),
+    });
+    expect(c.code).toBe("timed_out");
+    expect(c.message).toContain("codex");
+    expect(c.message).toContain("no output");
+    expect(c.message).toContain("300000");
+    // Points at the hung/unreachable cause, not the cap.
+    expect(c.message).toMatch(/hung|unreachable/);
+    // Must NOT tell the user to raise the timeout — the cap is not the problem.
+    expect(c.message).not.toMatch(/raise/i);
+    expect(c.message).not.toContain("timeoutMs");
+    expect(c.message).not.toContain("MCP_AGENT_TIMEOUT_MS");
+  });
+
+  it("TimeoutError kind:'total' -> total-cap message that still contains 'timed out' and says to raise the cap", () => {
+    const c = classifyFailure(codex, {
+      error: new TimeoutError("timed out after 1800000ms (total)", 1_800_000, "total"),
+    });
+    expect(c.code).toBe("timed_out");
+    expect(c.message).toContain("codex");
+    expect(c.message).toContain("timed out");
+    expect(c.message).toContain("1800000");
+    expect(c.message).toContain("total runtime cap");
+    expect(c.message).toContain("timeoutMs");
+    expect(c.message).toContain("MCP_AGENT_TIMEOUT_MS");
+  });
+
+  it("TimeoutError DEFAULT kind (no kind arg) behaves as 'total' — keeps 'timed out' + raise-the-cap wording", () => {
+    const c = classifyFailure(codex, {
+      error: new TimeoutError("timed out after 1800000ms", 1_800_000),
+    });
+    expect(c.code).toBe("timed_out");
+    expect(c.message).toContain("timed out");
+    expect(c.message).toContain("total runtime cap");
+    expect(c.message).toContain("timeoutMs");
+  });
+
   it("OutputLimitError -> output_limit and states the byte cap", () => {
     const c = classifyFailure(codex, {
       error: new OutputLimitError('"codex" exceeded output limit of 4096 bytes', 4096),
