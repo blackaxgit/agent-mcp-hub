@@ -26,4 +26,9 @@ describe("cursorAdapter", () => {
     expect(cursorAdapter.name).toBe("cursor");
     expect(cursorAdapter.binary).toBe("cursor-agent");
   });
+
+  it("exposes remediation metadata", () => {
+    expect(cursorAdapter.loginCommand).toBe("cursor-agent login");
+    expect(cursorAdapter.apiKeyEnv).toBe("CURSOR_API_KEY");
+  });
 });

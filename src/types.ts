@@ -14,6 +14,10 @@ export interface AgentAdapter {
   readonly name: string;
   /** Executable looked up on PATH, e.g. "cursor-agent". */
   readonly binary: string;
+  /** Command the user runs to authenticate this CLI, e.g. "codex login". */
+  readonly loginCommand: string;
+  /** Env var carrying an API key fallback, when the CLI supports one. */
+  readonly apiKeyEnv?: string;
   /** Pure function: prompt + options -> invocation. No I/O allowed here. */
   buildInvocation(prompt: string, options?: AgentRunOptions): AgentInvocation;
 }
