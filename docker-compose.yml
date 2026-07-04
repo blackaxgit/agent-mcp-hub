@@ -32,25 +32,29 @@ services:
       MCP_AGENTS: ${MCP_AGENTS:-}
       # Extra allowed browser Origins (comma-separated); loopback is always allowed.
       MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-}
-      # API-key fallback — needed only where a login mount doesn't carry the
-      # credential (see the volume notes below). Claude Code on macOS keeps its
-      # OAuth token in the Keychain (NOT ~/.claude), so the claude tool needs
-      # ANTHROPIC_API_KEY here; uncomment it. codex/opencode/cursor logins are
-      # file-based and work via the mounts.
+      # Auth per CLI (verified by live container test):
+      #  - codex, opencode: authenticated via the login mounts below — no key.
+      #  - claude: macOS keeps its OAuth token in the Keychain (NOT ~/.claude), so
+      #    set ANTHROPIC_API_KEY. (On Linux, ~/.claude/.credentials.json + the mount work.)
+      #  - cursor: its binary+login live together in ~/.local/share/cursor-agent, and
+      #    mounting that would clobber the image's cursor-agent — so use CURSOR_API_KEY
+      #    (or run `cursor-agent login` inside the container once).
       # OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      # CURSOR_API_KEY: ${CURSOR_API_KEY:-}
+      CURSOR_API_KEY: ${CURSOR_API_KEY:-}
     volumes:
       # Directory the agents operate on (pass cwd: "/workspace" in tool calls).
       - ./workspace:/workspace
-      # Reuse your HOST CLI logins (read-only) so API keys aren't needed for the
-      # file-based CLIs. Container runs as user "mcp" (HOME=/home/mcp).
-      # CAVEATS:
+      # Reuse your HOST CLI logins (read-only) so codex/opencode need no API key.
+      # Container runs as user "mcp" (HOME=/home/mcp). CAVEATS:
       #  - Comment out any CLI you don't use: a MISSING source dir is silently
       #    auto-created EMPTY (short bind-mount syntax), so that CLI acts logged-out.
       #  - claude/macOS: token is Keychain-backed, so this ~/.claude mount carries
       #    config but NOT the login — use ANTHROPIC_API_KEY above. (On Linux, claude
       #    stores ~/.claude/.credentials.json and the mount works.)
+      #  - cursor is intentionally NOT mounted: ~/.local/share/cursor-agent holds the
+      #    versioned binary and would shadow the image's cursor-agent (dangling
+      #    symlink → "not found"). Use CURSOR_API_KEY / in-container `cursor-agent login`.
       #  - Native Linux: host cred files owned by your uid may be unreadable to the
       #    container's uid 1001 (ownership/mode) — then use the API-key fallbacks.
       #    macOS Docker Desktop mediates uids, so mounts read fine there.
@@ -58,6 +62,5 @@ services:
       - ${HOME}/.claude:/home/mcp/.claude:ro
       - ${HOME}/.config/opencode:/home/mcp/.config/opencode:ro
       - ${HOME}/.local/share/opencode:/home/mcp/.local/share/opencode:ro
-      - ${HOME}/.local/share/cursor-agent:/home/mcp/.local/share/cursor-agent:ro
     restart: unless-stopped
     # tini init + healthcheck are baked into the image.
