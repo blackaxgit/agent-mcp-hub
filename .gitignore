@@ -2,3 +2,6 @@ node_modules/
 dist/
 *.log
 .env
+
+# Internal process docs (plans, fixes, reviews) — kept local, not pushed
+docs/
