@@ -1,33 +1,63 @@
+# agent-mcp-hub — local container deployment.
+#
+# AUTH — two separate concerns, don't conflate them:
+#  1. The wrapped CLIs (codex/claude/opencode/cursor) authenticate THEMSELVES from
+#     their own stored logins — no API key needed (same model as codex-mcp-server).
+#     A fresh container is logged out, so the volumes below MOUNT your host login
+#     dirs read-only to reuse `codex login` / `claude` / etc. API keys are only a
+#     fallback (commented out under environment).
+#  2. MCP_TOKEN is NOT a CLI credential — it guards the HTTP /mcp endpoint, which
+#     can execute code. The container binds 0.0.0.0 (to be reachable via the
+#     published port), so the fail-closed server requires it.
+#
+# Prefer no token/container at all? Run stdio: `npx agent-mcp-hub` (the
+# codex-mcp-server model — no HTTP endpoint, no token, CLIs use host logins).
 services:
   agent-mcp-hub:
     build: .
     image: agent-mcp-hub:${APP_VERSION:-latest}
     ports:
       # Loopback-only publish: the /mcp endpoint can spawn coding agents, so
-      # never expose it beyond this host without setting MCP_TOKEN and a TLS
-      # reverse proxy in front.
+      # never expose it beyond this host without MCP_TOKEN and a TLS proxy.
       - "127.0.0.1:3919:3919"
     environment:
       PORT: 3919
       # Bind all interfaces inside the container so the published port reaches
-      # the server; host exposure is restricted below (127.0.0.1 publish).
+      # the server; host exposure is restricted above (127.0.0.1 publish).
       HOST: "0.0.0.0"
-      # Required shared-secret auth: POST /mcp requires
-      # "Authorization: Bearer <token>". Binding non-loopback without it is
-      # refused at startup because the /mcp endpoint can execute code.
+      # Guards the HTTP /mcp endpoint (NOT a CLI key). Binding non-loopback
+      # without it is refused at startup because /mcp can execute code.
       MCP_TOKEN: ${MCP_TOKEN:?set MCP_TOKEN in .env — the /mcp endpoint can execute code}
-      # Extra allowed browser Origins (comma-separated); loopback is always allowed.
-      MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-}
       # Comma-separated allowlist of agents to expose (codex,cursor,opencode,claude); empty = all.
       MCP_AGENTS: ${MCP_AGENTS:-}
-      # Credential passthrough for the wrapped CLIs (set the ones you use):
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      CURSOR_API_KEY: ${CURSOR_API_KEY:-}
+      # Extra allowed browser Origins (comma-separated); loopback is always allowed.
+      MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-}
+      # API-key fallback — needed only where a login mount doesn't carry the
+      # credential (see the volume notes below). Claude Code on macOS keeps its
+      # OAuth token in the Keychain (NOT ~/.claude), so the claude tool needs
+      # ANTHROPIC_API_KEY here; uncomment it. codex/opencode/cursor logins are
+      # file-based and work via the mounts.
+      # OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # CURSOR_API_KEY: ${CURSOR_API_KEY:-}
     volumes:
-      # Directory the agents operate on (pass cwd: "/workspace" in tool calls)
+      # Directory the agents operate on (pass cwd: "/workspace" in tool calls).
       - ./workspace:/workspace
-      # Alternative to API keys: reuse host CLI logins (read-only)
-      # - ~/.codex:/home/mcp/.codex:ro
-      # - ~/.local/share/opencode:/home/mcp/.local/share/opencode:ro
+      # Reuse your HOST CLI logins (read-only) so API keys aren't needed for the
+      # file-based CLIs. Container runs as user "mcp" (HOME=/home/mcp).
+      # CAVEATS:
+      #  - Comment out any CLI you don't use: a MISSING source dir is silently
+      #    auto-created EMPTY (short bind-mount syntax), so that CLI acts logged-out.
+      #  - claude/macOS: token is Keychain-backed, so this ~/.claude mount carries
+      #    config but NOT the login — use ANTHROPIC_API_KEY above. (On Linux, claude
+      #    stores ~/.claude/.credentials.json and the mount works.)
+      #  - Native Linux: host cred files owned by your uid may be unreadable to the
+      #    container's uid 1001 (ownership/mode) — then use the API-key fallbacks.
+      #    macOS Docker Desktop mediates uids, so mounts read fine there.
+      - ${HOME}/.codex:/home/mcp/.codex:ro
+      - ${HOME}/.claude:/home/mcp/.claude:ro
+      - ${HOME}/.config/opencode:/home/mcp/.config/opencode:ro
+      - ${HOME}/.local/share/opencode:/home/mcp/.local/share/opencode:ro
+      - ${HOME}/.local/share/cursor-agent:/home/mcp/.local/share/cursor-agent:ro
     restart: unless-stopped
+    # tini init + healthcheck are baked into the image.

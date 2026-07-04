@@ -1,41 +1,29 @@
-# Fix Plan — re-review round 2
+# Fix Plan — compose CLI-auth model (round 4)
 
-Constraints: no new RUNTIME deps (ESLint is devDeps only); TDD for behavioral fixes; disjoint file ownership. Grouped by file.
+Scope: `docker-compose.yml` + `README.md` (repo). No src/test changes → the 66 tests stay green; the gate is `docker compose config` valid + build/test/lint/format green + Codex/four-eyes.
 
-## Group A — `src/httpServer.ts` + `tests/http.test.ts` (P1.1 fail-closed auth)
-- In `startHttpServer(port, host)`, BEFORE creating/listening, add:
-  ```ts
-  if (!LOOPBACK_HOSTNAMES.has(host) && !process.env.MCP_TOKEN) {
-    throw new Error(
-      `Refusing to bind non-loopback host "${host}" without MCP_TOKEN set — the /mcp endpoint can execute code. Set MCP_TOKEN (and front it with TLS) to expose it.`,
-    );
-  }
-  ```
-  (async fn → throw becomes a rejected promise → http.ts `.catch` fatal path, before the port binds.)
-- Leave the per-request token check UNCHANGED (still reads `process.env.MCP_TOKEN` each request) so the existing token tests, whose shared loopback server reads env per-request, keep passing.
-- Invariant restored: no unauthenticated non-loopback exposure of a code-execution endpoint. NOT a symptom patch — it closes the default-open path at the bind boundary, not per-request.
-- Tests: (a) `startHttpServer(0, "0.0.0.0")` with MCP_TOKEN unset → REJECTS with /MCP_TOKEN/; (b) with MCP_TOKEN set → resolves, then close; (c) loopback default host with no token still starts (unchanged). Existing origin/token/listen tests stay green (loopback).
-- Side effects: the container now REQUIRES MCP_TOKEN to run (it binds 0.0.0.0) — handled in Group C (compose/CI provide a token). Healthz stays unauthenticated (liveness).
+## docker-compose.yml
+- Reframe auth: make the **host-login mounts the primary path** (uncommented, complete for all four CLIs) and demote API keys to an explicit optional fallback.
+- Volumes — add read-only mounts into the container's `/home/mcp` (user `mcp`, uid 1001), using `${HOME}` (portable, no `~` in the value):
+  - `${HOME}/.codex:/home/mcp/.codex:ro`
+  - `${HOME}/.claude:/home/mcp/.claude:ro`
+  - `${HOME}/.config/opencode:/home/mcp/.config/opencode:ro`
+  - `${HOME}/.local/share/opencode:/home/mcp/.local/share/opencode:ro`
+  - `${HOME}/.local/share/cursor-agent:/home/mcp/.local/share/cursor-agent:ro`
+- Keep the API-key env vars but comment them out with a note "usually NOT needed — the mounts above reuse your host logins; set one only if that CLI's login isn't mounted." (Commenting them out is safe: unset env in compose = the image simply doesn't receive them.)
+- Add a top comment distinguishing the two auth concepts (CLI self-auth via mounts vs MCP_TOKEN = HTTP endpoint guard) and pointing to stdio as the token-free path.
+- Keep `build: .`, loopback publish, MCP_TOKEN requirement, MCP_AGENTS, workspace mount, restart unchanged.
+- Edge case (corrected per Codex): a host lacking one of these login dirs does NOT fail `up` — short-syntax bind mounts silently AUTO-CREATE the missing source as an empty dir, so that CLI sees an empty read-only login dir and acts logged-out. Mitigation: document "comment out the mount for any CLI you don't use." (Compose has no conditional volumes; comment-out is the accepted approach.)
+- Claude/macOS (per Codex + host check): claude's OAuth token is Keychain-backed on macOS (no `~/.claude/.credentials.json` present), so the `~/.claude` mount carries config but NOT the login → claude needs `ANTHROPIC_API_KEY` in the container (enabled in compose). On Linux, claude uses `~/.claude/.credentials.json` and the mount works.
+- Linux uid caveat (per Codex): host cred files owned by the host uid with restrictive modes may be unreadable to the container's uid 1001 on native Linux → use the API-key fallbacks. macOS Docker Desktop mediates uid mapping, so mounts read fine there.
+- Invariant restored: the default, visible path is "reuse your existing CLI logins," matching the codex-mcp-server model. NOT a symptom patch — it removes the false key requirement at its source (the container's logged-out state) by mounting the real credentials.
 
-## Group B — `src/exec.ts` + `tests/exec.test.ts` (P2.1 bounded queue)
-- `Semaphore` gains a `maxQueue` (from `MCP_MAX_QUEUE`, non-negative int). `acquire()` rejects with a typed `class ServerBusyError extends Error` (`code = "SERVER_BUSY"`, message "server busy: agent queue full, retry later") when `waiters.length >= maxQueue`. Release/FIFO logic unchanged. Default `maxQueue`: pick a value ≥ the existing semaphore test's queue depth so it stays green (read the test; use e.g. 64). The new busy test sets `MCP_MAX_QUEUE=0` for a deterministic instant-reject once all permits are busy. (Research maps ServerBusyError → HTTP 503+Retry-After conceptually; here it surfaces as an MCP `isError` result — no HTTP status to set in the stateless per-request model, so the actionable text is the contract.)
-- `runCommand`/`withSlot` propagate the rejection; it flows through `runAdapter` → the tool handler's existing `catch` → `isError` result (503-equivalent) with no process spawned.
-- Invariant: overload sheds load instead of growing latency unbounded. NOT a symptom patch — bounds the actual unbounded resource (the wait queue).
-- Tests: set `MCP_MAX_QUEUE` small + cap small, saturate with slow spawns, assert the overflow acquirer rejects with ServerBusyError while in-flight ones still complete. Default (100) keeps the existing semaphore test green.
+## README.md
+- In "Run with Docker": add an **Auth model** subsection stating (a) the CLIs self-authenticate from their own logins (mounted read-only → no API keys), (b) `MCP_TOKEN` guards the HTTP endpoint only (not a CLI key), (c) the **stdio/npx path** is the zero-config, token-free option (the codex-mcp-server model) — recommend it for simple local use.
+- Note the read-only refresh caveat (drop `:ro` or set that key if a CLI must refresh its token) and the missing-login-dir caveat (comment out that mount).
 
-## Group C — `Dockerfile` + `docker-compose.yml` + `.github/workflows/ci.yml` (infra: P1.1 image, P3.2 init, P3.4 tag, P3.3 CI lint)
-- Dockerfile: REMOVE `ENV HOST=0.0.0.0` (default becomes http.ts's 127.0.0.1 — safe). Keep EXPOSE/HEALTHCHECK. **P3.2 — bake tini**: `apt-get install -y tini` (Debian base) and `ENTRYPOINT ["/usr/bin/tini","--"]` before the CMD — this reaps zombie agent grandchildren + forwards signals uniformly across compose/CI/bare `docker run` (research: bake-in beats `init:true` for an image that spawns many children). So NO `init: true` needed in compose (would be redundant).
-- docker-compose.yml: set `HOST: "0.0.0.0"` (needed so the published port reaches the server) and require a token: `MCP_TOKEN: ${MCP_TOKEN:?set MCP_TOKEN in .env — the /mcp endpoint executes code}`; change `image: agent-mcp-hub:0.1.0` → `image: agent-mcp-hub:${APP_VERSION:-latest}` (P3.4). Keep loopback publish `127.0.0.1:3919:3919`. (No `init:true` — tini is baked.)
-- ci.yml: (P1.1) the docker smoke step must pass `-e HOST=0.0.0.0 -e MCP_TOKEN=ci-smoke-token` to `docker run` (healthz needs no token; tini is the baked ENTRYPOINT). (P3.3) add a `- run: npm run lint` step in the `test` job before build.
-- Verify: `docker compose config -q` (with MCP_TOKEN set in env for the check). No test file — validated by the CI run itself.
+## Test strategy
+- No unit test (config/docs). Regression proof = `docker compose config -q` validates AND the full suite/lint/format/build stay green (unaffected). The compose-config validation is part of the verification evidence.
 
-## Group D — `package.json` + `eslint.config.js` (P3.1 engines, P3.3 lint tooling)
-- package.json: `"engines": { "node": ">=22" }` (P3.1); add `"lint": "eslint ."`; add devDeps `eslint` + `typescript-eslint` (versions per research); `npm install`.
-- eslint.config.mjs (new, flat config): ESLint 9 + typescript-eslint 8. Scope `src/**/*.ts` + `tests/**/*.ts`, `globalIgnores(["dist/","coverage/","node_modules/"])`. START with the UNTYPED `js.configs.recommended` + `tseslint.configs.recommended` plus explicit `no-unused-vars` (`argsIgnorePattern:"^_"`) — this bounds risk. THEN try adding type-checked `no-floating-promises` (needs `parserOptions.projectService:true`, `tsconfigRootDir: import.meta.dirname`); if it flags only a few real spots, fix them; if it explodes on the existing `void x.close()` patterns or throws "not in project" on config files, KEEP the untyped lean ruleset so `npm run lint` passes without churning working code. The deliverable is a passing lint GATE, not a rewrite. Report any GENUINE bug ESLint surfaces (e.g. a real floating promise) instead of silencing it.
-- Verify: `npm run lint` exits 0; `npm test`/`typecheck`/`build` still green.
-
-## Execution
-Phase 1 parallel (no npm install, disjoint files): A, B, C. Phase 2: D (owns the only `npm install`; runs after so no node_modules race with A/B's vitest). Orchestrator then integrates: full suite + lint + build, Codex verify, four-eyes, gated push. `git pull --rebase` before push.
-
-## Regression tests
-Behavioral: P1.1 (guard reject/allow), P2.1 (busy rejection). Config/CI: P3.1/P3.2/P3.4 by inspection + `docker compose config`; P3.3 by `npm run lint` exit 0 + the CI lint step.
+## Rollback
+Single-file revert of the two files; no code or state touched.
