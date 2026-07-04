@@ -1,23 +1,34 @@
-# Scope Shape — Feature 3: mcp-template alignment
+# Scope Shape — Dependabot PR triage (round 3)
 
-## Problem
-agent-mcp-hub was hand-built before adopting `~/Projects/mcps/mcp-template` as the house standard. The template's protocols prescribe a security/operability spine (fail-closed auth, audit, shutdown, config discipline, deviation register) that the hub only partially satisfies (gap matrix: 00-codebase-analysis.md).
+## Request
+"Merge the open PRs and ensure it will not break the project." Four open Dependabot PRs:
+- #8 docker: node 22 → 25-bookworm-slim (MAJOR base image)
+- #9 dev: tsx 4.22.5 → 4.23.0 (minor group)
+- #10 dev: @eslint/js 9.39.4 → 10.0.1 (MAJOR)
+- #11 dev: eslint 9.39.4 → 10.6.0 (MAJOR)
 
-## Chosen mode: Selective (pending user confirmation)
-Full alignment would mean swapping to the skeleton stack (Express/Winston/Jest layout) and a fail-closed-by-default auth posture — high-churn, and the template itself marks the stack substitutable and provides TEMPLATE-DEVIATION.md exactly for justified divergence. The hub is a local-first personal tool; wholesale conversion buys little.
+## Chosen mode: Reduction
+This is dependency triage, not a feature. Merge only the bumps that PROVABLY don't break the project (empirical gate); close/hold those that break or violate policy. Skip the heavy spec ceremony — the certainty source for dep bumps is the full gate (test + lint + format + typecheck + build + stdio smoke), not plan review.
 
-## Proposed adoption set (the spine, not the skin)
-1. **TEMPLATE-DEVIATION.md** — register every deliberate divergence (open-auth-on-loopback default, stdio transport offered, no rate/inflight caps, SDK isError instead of closed error taxonomy, raw http/vitest/no-Winston substitutions) with risk + mitigation + remediation, per the template's own format.
-2. **Central validated config** (`src/config.ts`): parse/validate ALL env (`MCP_TOKEN`, `MCP_ALLOWED_ORIGINS`, `MCP_AGENTS`, `MCP_PORT`/`PORT`, `MCP_HOST`/`HOST`) once, fail-fast with aggregated errors (template §operator-guide).
-3. **Graceful shutdown + /readyz**: SIGTERM/SIGINT → readiness 503 → stop accepting → drain inflight with timeout → clean exit (HTTP entry).
-4. **Tool annotations + orientation**: `readOnlyHint` (ping/list_agents), `destructiveHint`+`openWorldHint` + blast-radius sentence (agent tools, run_all), `initialize.instructions` server orientation string.
-5. **Minimal structured audit events**: one JSON line to stderr per `tools/call` (timestamp, tool, agent, outcome, exit code, duration, output size-class — never raw payloads), matching the template's audit-event shape at local-tool scale.
+## Merge gate (empirical, per PR + combined)
+A PR merges only if, in an isolated worktree merged against CURRENT main: `npm ci && npm test && npm run lint && npm run format:check && npm run typecheck && npm run build` all pass, plus the stdio initialize smoke.
 
-## Explicitly NOT adopting (recorded as deviations instead)
-Express/Winston/Jest/ESLint skeleton swap; fail-closed auth default (MCP_TOKEN stays opt-in; loopback bind is the default guard); rate limits/inflight caps; closed error-code envelope; HMAC pagination cursors; multi-tenant isolation; credential-context protocol (all N/A or disproportionate for a local single-user hub).
+## Per-PR disposition (to be confirmed by verification)
+- **#9 tsx** — minor dev-tool bump; expected SAFE → merge.
+- **#11 eslint 10 + #10 @eslint/js 10** — INTERDEPENDENT majors (eslint and @eslint/js must share a major); verify TOGETHER in one worktree. RISK: typescript-eslint 8.x peer-supports eslint ^8.57 || ^9 — ESLint 10 may be outside its range, breaking `npm run lint`. If lint breaks, HOLD both until typescript-eslint ships eslint-10 support (don't merge one without the other). Merge both only if the full gate (esp. lint) passes.
+- **#8 node 25** — MAJOR base image to a NON-LTS release. Policy: this repo already closed #1 (node 26) for LTS-only. Node 25 is a current/odd (non-LTS) line; engines>=22 allows it but LTS discipline says no. Disposition: CLOSE with a Dependabot major-version ignore, same as #1. (Node 24 is the LTS; a targeted 22→24 bump can be proposed separately if desired.)
 
-## 10/10 vs 5/10
-10/10 = spine adopted with tests, every remaining divergence written down in TEMPLATE-DEVIATION.md with rationale — a reviewer can audit the hub against the template in minutes. 5/10 = a deviation doc alone with no behavior adopted.
+## Explicitly NOT doing
+- Not merging a bump that fails any gate "to fix later".
+- Not merging #8 (non-LTS) — closed by policy.
+- Not merging #11/#10 individually (would desync eslint/@eslint/js majors).
 
 ## Riskiest assumption
-That the user wants selective spine adoption rather than full skeleton conversion — confirmed via explicit question before the gate.
+That typescript-eslint 8 works with ESLint 10 — resolved empirically by the worktree verification before any merge.
+
+## Outcome (2026-07-03)
+- Isolated-worktree verification, full gate (test+lint+format+typecheck+build+stdio smoke) each PASS.
+- **Decisive finding:** typescript-eslint 8.62.1 peer range is `eslint ^8.57 || ^9 || ^10` — ESLint 10 explicitly supported; `npm run lint` clean under ESLint 10 (no flat-config/rule-schema breakage), 0 peer/engine warnings.
+- **Merged:** #9 tsx 4.23.0; #11 eslint 10.6.0 + #10 @eslint/js 10.0.1 (the interdependent pair — #11 merged, #10 Dependabot-rebased to regenerate its lock against eslint-10 main, then merged green).
+- **Closed:** #8 node 25 — non-LTS base image, per the LTS-only policy (precedent #1/node 26), with a Dependabot major-ignore.
+- **Merged main re-verified locally:** eslint 10.6.0 + @eslint/js 10.0.1 + tsx 4.23.0; 66/66 tests, lint, format:check, typecheck, build, stdio smoke all green. 0 open PRs.
