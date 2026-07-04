@@ -27,7 +27,7 @@ Install and authenticate the CLIs you want to use (any subset works):
 - Codex: `npm i -g @openai/codex && codex login`
 - Cursor: `curl https://cursor.com/install -fsS | bash && cursor-agent login`
 - OpenCode: `npm i -g opencode-ai && opencode auth login`
-- Claude Code: `npm i -g @anthropic-ai/claude-code && claude` (first run logs in; containers use `ANTHROPIC_API_KEY`)
+- Claude Code: `npm i -g @anthropic-ai/claude-code && claude` (first run logs in; containers on macOS use `ANTHROPIC_API_KEY`)
 
 ## Install
 
@@ -123,11 +123,35 @@ Or with Claude Code:
 claude mcp add --transport http agent-hub http://localhost:3919/mcp
 ```
 
-**Auth:** the wrapped CLIs need credentials. Either pass API keys as env vars
-(`OPENAI_API_KEY`, `CURSOR_API_KEY`, and `ANTHROPIC_API_KEY` for the `claude`
-CLI) — a `.env` file next to `docker-compose.yml` is picked up automatically —
-or reuse your host CLI logins by uncommenting the read-only login-dir mounts in
-`docker-compose.yml`.
+**Auth model — two separate things, don't conflate them:**
+
+- **CLI credentials.** The wrapped CLIs authenticate _themselves_ from their own
+  stored logins — the same model as codex-mcp-server. A fresh container is logged
+  out, so `docker-compose.yml` **mounts your host login dirs read-only** to reuse
+  them. Which path each CLI needs:
+  - **codex / opencode / cursor** — file-based logins (`~/.codex`,
+    `~/.config/opencode` + `~/.local/share/opencode`,
+    `~/.local/share/cursor-agent`); the mounts carry them, no API key.
+  - **claude** — on **macOS** the OAuth token lives in the **Keychain**, not
+    `~/.claude`, so the mount carries config but not the login: set
+    `ANTHROPIC_API_KEY` (compose has it enabled). On **Linux**, claude stores
+    `~/.claude/.credentials.json` and the mount works. Note: an
+    `ANTHROPIC_API_KEY` bills pay-per-token via the API, separate from a Claude
+    Pro/Max subscription.
+  - Caveats: mounts are read-only, so if a CLI must _refresh_ its token
+    mid-session and fails, drop `:ro` for that mount or set its API key. **Comment
+    out the mount for any CLI you don't use** — a missing source dir is silently
+    auto-created **empty**, making that CLI act logged-out. On **native Linux**,
+    host cred files owned by your uid may be unreadable to the container's uid
+    1001 — then use the API-key fallbacks (macOS Docker Desktop mediates uids).
+- **`MCP_TOKEN` is NOT a CLI credential** — it guards the HTTP `/mcp` endpoint
+  (which can execute code) and is required whenever the server binds a network
+  interface (which the container does). See Security below.
+
+**Zero-config alternative — stdio (recommended for simple local use):** skip the
+container and token entirely. `npx agent-mcp-hub` runs over stdio with no HTTP
+endpoint, so there's no `MCP_TOKEN` and the CLIs use your host logins directly —
+the codex-mcp-server model. See [Install](#install).
 
 **Workspace:** mount the project you want the agents to work on into `/workspace`
 (the `./workspace` bind mount is preconfigured) and pass `cwd: "/workspace"` in
@@ -143,8 +167,6 @@ port beyond this host (plus TLS via a reverse proxy). The cursor CLI installs
 via the vendor's `curl | bash` script (no published checksums); opt out with
 `docker build --build-arg INSTALL_CURSOR=false .`
 
-Prefer stdio? `npx agent-mcp-hub` still works without Docker (see
-[Install](#install)).
 
 ## Development
 
