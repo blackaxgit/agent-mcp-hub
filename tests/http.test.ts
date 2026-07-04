@@ -1,9 +1,28 @@
 import type { AddressInfo } from "node:net";
 import type { Server } from "node:http";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { startHttpServer } from "../src/httpServer.js";
+
+// The request handler builds a fresh MCP server per request inside its try/catch.
+// We wrap the real buildServer so existing tests use the genuine implementation,
+// and a single flag lets one test force it to throw — the only practical way to
+// exercise the handler's 500 catch, since the SDK/Hono stack swallows malformed
+// I/O internally and never propagates it to that catch.
+const mockState = vi.hoisted(() => ({ buildServerThrows: false }));
+vi.mock("../src/server.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/server.js")>();
+  return {
+    ...actual,
+    buildServer: (...args: Parameters<typeof actual.buildServer>) => {
+      if (mockState.buildServerThrows) {
+        throw new Error("boom: buildServer exploded during request handling");
+      }
+      return actual.buildServer(...args);
+    },
+  };
+});
 
 let httpServer: Server;
 let baseUrl: string;
@@ -171,5 +190,34 @@ describe("security hardening", () => {
     } finally {
       delete process.env.MCP_ALLOWED_ORIGINS;
     }
+  });
+});
+
+describe("request-handler failure path", () => {
+  afterEach(() => {
+    mockState.buildServerThrows = false;
+    vi.restoreAllMocks();
+  });
+
+  it("returns 500 'internal error' and logs when request handling throws", async () => {
+    // Keep the expected error out of the test output, and assert we logged it.
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    mockState.buildServerThrows = true;
+
+    const res = await fetch(`${baseUrl}/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", method: "tools/list", id: 1 }),
+    });
+
+    // writeHead(500) -> status, .end("internal error") -> body, console.error(...) -> log.
+    // Each assertion pins a distinct line of the catch block (httpServer.ts 101-103).
+    expect(res.status).toBe(500);
+    expect(res.headers.get("content-type")).toContain("text/plain");
+    expect(await res.text()).toBe("internal error");
+    expect(errorSpy).toHaveBeenCalledWith("agent-mcp-hub http error:", expect.any(Error));
   });
 });

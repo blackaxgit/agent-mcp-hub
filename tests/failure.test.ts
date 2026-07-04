@@ -169,6 +169,12 @@ describe("classifyFailure — result branch (exit != 0)", () => {
     expect(c.message).toContain("(no output)");
   });
 
+  it("neither result nor error supplied -> tool_failure with (no output) fallback", () => {
+    const c = classifyFailure(codex, {});
+    expect(c.code).toBe("tool_failure");
+    expect(c.message).toContain("(no output)");
+  });
+
   it("falls back to stdout when stderr is empty", () => {
     const c = classifyFailure(codex, { result: res("", "downstream boom", 2) });
     expect(c.code).toBe("tool_failure");
@@ -186,12 +192,116 @@ describe("classifyFailure — result branch (exit != 0)", () => {
   });
 });
 
+describe("classifyFailure — cause/tail clipping & snippet sourcing", () => {
+  it("clips a long cause line to <=160 chars with a trailing ellipsis", () => {
+    // First non-empty stderr line is a primary auth phrase followed by a long run.
+    const longLine = "not logged in: " + "a".repeat(300);
+    const c = classifyFailure(cursor, { result: res(longLine, "", 1) });
+    expect(c.code).toBe("not_authenticated");
+    expect(c.message).toContain("not logged in");
+    // Truncation marker present, and the tail past the cap was dropped.
+    expect(c.message).toContain("…");
+    expect(c.message).not.toContain("a".repeat(200));
+    const causeLine = c.message.split("\n")[1];
+    // 160 kept chars + the one-char ellipsis marker.
+    expect(causeLine.length).toBeLessThanOrEqual(161);
+    expect(causeLine.endsWith("…")).toBe(true);
+  });
+
+  it("leaves a short cause line unchanged (no ellipsis added)", () => {
+    const c = classifyFailure(cursor, { result: res("not logged in", "", 1) });
+    expect(c.code).toBe("not_authenticated");
+    const causeLine = c.message.split("\n")[1];
+    expect(causeLine).toBe("not logged in");
+    expect(causeLine).not.toContain("…");
+  });
+
+  it("prefixes the tool_failure tail with an ellipsis when clipped", () => {
+    const long = "z".repeat(2000);
+    const c = classifyFailure(codex, { result: res(long, "", 2) });
+    expect(c.code).toBe("tool_failure");
+    const body = c.message.split("\n").slice(1).join("\n");
+    expect(body.startsWith("…")).toBe(true);
+    expect(body.length).toBeLessThanOrEqual(501);
+  });
+
+  it("draws the cause snippet from stdout when stderr is whitespace-only", () => {
+    // stderr trims to empty, so causeSnippet must fall back to stdout.
+    const c = classifyFailure(opencode, { result: res("   \n  ", "please log in via stdout", 1) });
+    expect(c.code).toBe("not_authenticated");
+    expect(c.message).toContain("please log in via stdout");
+  });
+
+  it("yields an empty cause (no crash) when the snippet source strips to nothing", () => {
+    // stderr is pure ANSI: raw .trim() is non-empty (so it is chosen as the source),
+    // but stripAnsi() reduces it to "", so no non-empty line is found -> "" fallback.
+    // The auth phrase in stdout still drives classification.
+    const c = classifyFailure(cursor, { result: res(`${ESC}[0m`, "not logged in", 1) });
+    expect(c.code).toBe("not_authenticated");
+    expect(c.message).toContain("cursor-agent login");
+    expect(c.message).not.toContain(ESC);
+    // Message stays well-formed: header, empty cause line, then remediation.
+    const lines = c.message.split("\n");
+    expect(lines[0]).toContain("not authenticated");
+    expect(lines[1]).toBe("");
+  });
+});
+
+describe("classifyFailure — non-Error throws & config/exit branches", () => {
+  it("stringifies a plain-string throw into the tool_failure message", () => {
+    const c = classifyFailure(codex, { error: "a plain string, not an Error" });
+    expect(c.code).toBe("tool_failure");
+    expect(c.message).toContain("a plain string, not an Error");
+  });
+
+  it("stringifies a non-Error object throw via String(error)", () => {
+    const c = classifyFailure(codex, { error: { toString: () => "objecty failure" } });
+    expect(c.code).toBe("tool_failure");
+    expect(c.message).toContain("objecty failure");
+  });
+
+  it("not_configured for an adapter WITH apiKeyEnv names the env var", () => {
+    const c = classifyFailure(codex, { result: res("no default model configured", "", 1) });
+    expect(c.code).toBe("not_configured");
+    expect(c.message).toContain("or set OPENAI_API_KEY");
+  });
+
+  it("not_configured for an adapter WITHOUT apiKeyEnv omits the 'or set' clause", () => {
+    const c = classifyFailure(opencode, { result: res("no default model configured", "", 1) });
+    expect(c.code).toBe("not_configured");
+    expect(c.message).toContain("opencode auth login");
+    expect(c.message).not.toContain("or set");
+  });
+
+  it("tool_failure with a null exitCode renders 'exit unknown'", () => {
+    const c = classifyFailure(codex, { result: { stderr: "boom", stdout: "", exitCode: null } });
+    expect(c.code).toBe("tool_failure");
+    expect(c.message).toContain("exit unknown");
+    expect(c.message).toContain("boom");
+  });
+});
+
 describe("classifyFailure — false positives & precedence (R10)", () => {
   it("'insufficient_quota: billing' is NOT not_authenticated", () => {
     const c = classifyFailure(codex, {
       result: res("insufficient_quota: billing hard limit", "", 1),
     });
     expect(c.code).not.toBe("not_authenticated");
+  });
+
+  it("quota marker suppresses auth classification when both are present", () => {
+    const c = classifyFailure(codex, {
+      result: res("insufficient_quota: billing limit reached; please sign in", "", 1),
+    });
+    expect(c.code).toBe("tool_failure");
+    expect(c.message).not.toContain("codex login");
+  });
+
+  it("bare 'unauthorized' (no primary auth phrase) is NOT not_authenticated", () => {
+    const c = classifyFailure(codex, {
+      result: res("unauthorized", "", 1),
+    });
+    expect(c.code).toBe("tool_failure");
   });
 
   it("bare 'HTTP 401 GET /x' (no primary phrase) is NOT not_authenticated", () => {
@@ -218,5 +328,93 @@ describe("classifyFailure — false positives & precedence (R10)", () => {
       result: res("invalid api key: insufficient_quota", "", 1),
     });
     expect(c.code).not.toBe("not_authenticated");
+  });
+});
+
+describe("classifyFailure — mutation-killing message pins (R10)", () => {
+  it("cursor not_authenticated pins agent name, 'not authenticated', login command, and cause snippet", () => {
+    const c = classifyFailure(cursor, { result: res("Press any key to sign in", "", 1) });
+    expect(c.code).toBe("not_authenticated");
+    expect(c.message).toContain("cursor");
+    expect(c.message).toContain("not authenticated");
+    expect(c.message).toContain("cursor-agent login");
+    expect(c.message).toContain("Press any key to sign in");
+  });
+
+  it("codex not_authenticated pins agent name, 'not authenticated', login command, OPENAI_API_KEY, and cause snippet", () => {
+    const c = classifyFailure(codex, { result: res("Error: set OPENAI_API_KEY", "", 1) });
+    expect(c.code).toBe("not_authenticated");
+    expect(c.message).toContain("codex");
+    expect(c.message).toContain("not authenticated");
+    expect(c.message).toContain("codex login");
+    expect(c.message).toContain("OPENAI_API_KEY");
+    expect(c.message).toContain("set OPENAI_API_KEY");
+  });
+
+  it("not_configured for codex pins 'not configured', login command, and 'or set OPENAI_API_KEY'", () => {
+    const c = classifyFailure(codex, { result: res("no default model configured", "", 1) });
+    expect(c.code).toBe("not_configured");
+    expect(c.message).toContain("not configured");
+    expect(c.message).toContain("codex login");
+    expect(c.message).toContain("or set OPENAI_API_KEY");
+  });
+
+  it("not_configured for opencode pins 'not configured' and login command but NOT 'or set'", () => {
+    const c = classifyFailure(opencode, { result: res("no default model configured", "", 1) });
+    expect(c.code).toBe("not_configured");
+    expect(c.message).toContain("not configured");
+    expect(c.message).toContain("opencode auth login");
+    expect(c.message).not.toContain("or set");
+  });
+
+  it("TimeoutError pins 'timed out' and the exact ms value", () => {
+    const c = classifyFailure(codex, { error: new TimeoutError("x timed out after 50ms", 50) });
+    expect(c.code).toBe("timed_out");
+    expect(c.message).toContain("timed out");
+    expect(c.message).toContain("50ms");
+  });
+
+  it("OutputLimitError pins the exact maxOutputBytes and 'output limit exceeded'", () => {
+    const c = classifyFailure(codex, {
+      error: new OutputLimitError('"codex" exceeded output limit of 4096 bytes', 4096),
+    });
+    expect(c.code).toBe("output_limit");
+    expect(c.message).toContain("4096");
+    expect(c.message).toContain("output limit exceeded");
+  });
+
+  it("'insufficient_quota: billing' exit 1 is tool_failure with no auth remediation", () => {
+    const c = classifyFailure(codex, {
+      result: res("insufficient_quota: billing hard limit", "", 1),
+    });
+    expect(c.code).toBe("tool_failure");
+    expect(c.message).not.toContain("codex login");
+    expect(c.message).not.toContain("OPENAI_API_KEY");
+  });
+
+  it("bare 'HTTP 401 GET /x' is tool_failure with no auth remediation", () => {
+    const c = classifyFailure(codex, { result: res("HTTP 401 GET /x", "", 1) });
+    expect(c.code).toBe("tool_failure");
+    expect(c.message).not.toContain("login");
+    expect(c.message).not.toContain("OPENAI_API_KEY");
+  });
+
+  it("long cause line is clipped with ellipsis and bounded in length", () => {
+    const longCause = "not logged in: " + "a".repeat(500);
+    const c = classifyFailure(cursor, { result: res(longCause, "", 1) });
+    expect(c.code).toBe("not_authenticated");
+    expect(c.message).toContain("…");
+    const causeLine = c.message.split("\n")[1];
+    expect(causeLine.length).toBeLessThanOrEqual(161);
+    expect(causeLine.endsWith("…")).toBe(true);
+  });
+
+  it("long stderr tail is clipped with leading ellipsis and bounded in length", () => {
+    const longStderr = "x".repeat(2000);
+    const c = classifyFailure(codex, { result: res(longStderr, "", 2) });
+    expect(c.code).toBe("tool_failure");
+    const body = c.message.split("\n").slice(1).join("\n");
+    expect(body.startsWith("…")).toBe(true);
+    expect(body.length).toBeLessThanOrEqual(501);
   });
 });

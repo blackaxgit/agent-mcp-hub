@@ -5,3 +5,8 @@ dist/
 
 # Internal process docs (plans, fixes, reviews) — kept local, not pushed
 docs/
+
+# test coverage output
+coverage/
+.stryker-tmp/
+reports/
