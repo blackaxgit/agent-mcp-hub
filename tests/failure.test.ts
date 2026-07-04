@@ -289,6 +289,21 @@ describe("classifyFailure — false positives & precedence (R10)", () => {
     expect(c.code).not.toBe("not_authenticated");
   });
 
+  it("quota marker suppresses auth classification when both are present", () => {
+    const c = classifyFailure(codex, {
+      result: res("insufficient_quota: billing limit reached; please sign in", "", 1),
+    });
+    expect(c.code).toBe("tool_failure");
+    expect(c.message).not.toContain("codex login");
+  });
+
+  it("bare 'unauthorized' (no primary auth phrase) is NOT not_authenticated", () => {
+    const c = classifyFailure(codex, {
+      result: res("unauthorized", "", 1),
+    });
+    expect(c.code).toBe("tool_failure");
+  });
+
   it("bare 'HTTP 401 GET /x' (no primary phrase) is NOT not_authenticated", () => {
     const c = classifyFailure(codex, { result: res("HTTP 401 GET /x", "", 1) });
     expect(c.code).toBe("tool_failure");
