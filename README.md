@@ -15,7 +15,9 @@ One MCP server that bridges multiple CLI coding agents — **Codex**, **Cursor**
 | `list_agents` | Which agent CLIs are installed and on PATH |
 | `ping` | Health check |
 
-Agent tools accept `prompt` (required), `model`, `cwd`, `timeoutMs` (default 300000).
+Agent tools accept `prompt` (required), `model`, `cwd`, `timeoutMs` (total runtime
+cap, default 1800000 = 30 min), and `idleTimeoutMs` (inactivity cap, default 300000
+= 5 min). See [Long-running tasks & timeouts](#long-running-tasks--timeouts).
 
 Known limitation: `opencode` prompts may not start with `-` (its CLI could parse
 them as flags); the tool returns an actionable error instead of guessing.
@@ -121,6 +123,33 @@ stateless HTTP transport — transparently run without a prompt (no hang, no err
   }
 }
 ```
+
+### Long-running tasks & timeouts
+
+A complex agent task can run for many minutes. The hub bounds each run with two
+independent timers so a productive long run survives while a genuinely stuck one
+fails fast:
+
+- **Idle (inactivity) timeout** — `idleTimeoutMs` (per call) / `MCP_AGENT_IDLE_TIMEOUT_MS`
+  (env), default **300000 (5 min)**. The timer resets on every chunk of output the
+  CLI produces, so an agent that keeps working (streaming output) never trips it. An
+  agent that goes silent — e.g. `opencode` stuck on an unreachable model backend —
+  is killed after the idle window with an actionable "no output — the agent may be
+  hung or its model/backend is unreachable" error, instead of burning the full cap.
+- **Total runtime cap** — `timeoutMs` (per call) / `MCP_AGENT_TIMEOUT_MS` (env),
+  default **1800000 (30 min)**. A hard upper bound regardless of activity.
+
+Whichever fires first kills the agent's process group. **Tradeoff:** the idle reset
+assumes the CLI streams intermediate output. `codex` and `opencode` do; `claude -p`
+and `cursor-agent -p` may emit only the final result, so a long **silent** task on
+those can be idle-killed at 5 min — raise `idleTimeoutMs` / `MCP_AGENT_IDLE_TIMEOUT_MS`
+for such tasks, or rely on the total cap.
+
+While an agent runs, the hub emits MCP **progress notifications** to clients that
+request them (`_meta.progressToken`) — live feedback and a keep-alive for
+HTTP/remote clients. Note: on **Claude Code (stdio)** the per-server request
+`timeout` (`.mcp.json`) is a hard wall-clock that progress does **not** reset
+(default ~28h) — raise it if you lowered it below your longest run.
 
 ## Run with Docker
 
