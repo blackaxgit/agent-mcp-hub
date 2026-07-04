@@ -2,6 +2,13 @@ import { createRequire } from "node:module";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { runCommand, type Exec, type ExecResult } from "./exec.js";
+import {
+  confirmEnabled,
+  buildConfirmMessage,
+  buildRunAllMessage,
+  CONFIRM_SCHEMA,
+  CANCEL_TAIL,
+} from "./confirm.js";
 import { classifyFailure } from "./failure.js";
 import { checkAvailability } from "./registry.js";
 import type { AgentAdapter } from "./types.js";
@@ -60,6 +67,28 @@ const agentInputSchema = {
 export function buildServer(adapters: AgentAdapter[], exec: Exec = runCommand): McpServer {
   const server = new McpServer({ name: "agent-mcp-hub", version });
 
+  /**
+   * Confirm-before-run gate (MCP elicitation). Returns true to proceed. Degrades
+   * to true (run-as-today) when disabled or the client lacks FORM elicitation —
+   * keyed ONLY on the standard protocol capability, never a product name (E7).
+   */
+  async function confirmOrCancel(summary: string): Promise<boolean> {
+    if (!confirmEnabled()) return true;
+    const caps = server.server.getClientCapabilities();
+    // Guard on .form: the SDK normalizes a client's elicitation:{} to {form:{}};
+    // URL-only / stateless-HTTP / non-elicit clients lack it and must degrade.
+    if (caps?.elicitation?.form === undefined) return true;
+    try {
+      const params = { message: summary, requestedSchema: CONFIRM_SCHEMA } as unknown as Parameters<
+        typeof server.server.elicitInput
+      >[0];
+      const r = await server.server.elicitInput(params);
+      return r.action === "accept" && r.content?.confirm === true;
+    } catch {
+      return false;
+    }
+  }
+
   server.registerTool(
     "ping",
     { description: "Health check for agent-mcp-hub", inputSchema: {} },
@@ -85,6 +114,12 @@ export function buildServer(adapters: AgentAdapter[], exec: Exec = runCommand): 
         inputSchema: agentInputSchema,
       },
       async ({ prompt, model, cwd, timeoutMs }) => {
+        if (!(await confirmOrCancel(buildConfirmMessage(adapter.name, { prompt, model, cwd })))) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: `${adapter.name}: ${CANCEL_TAIL}` }],
+          };
+        }
         try {
           const result = await runAdapter(adapter, exec, { prompt, model, cwd, timeoutMs });
           if (result.exitCode !== 0) {
@@ -112,6 +147,16 @@ export function buildServer(adapters: AgentAdapter[], exec: Exec = runCommand): 
       },
     },
     async ({ prompt, model, cwd, timeoutMs }) => {
+      if (
+        !(await confirmOrCancel(
+          buildRunAllMessage(
+            adapters.map((a) => a.name),
+            { prompt, cwd },
+          ),
+        ))
+      ) {
+        return { isError: true, content: [{ type: "text", text: `run_all: ${CANCEL_TAIL}` }] };
+      }
       const settled = await Promise.allSettled(
         adapters.map((adapter) => runAdapter(adapter, exec, { prompt, model, cwd, timeoutMs })),
       );

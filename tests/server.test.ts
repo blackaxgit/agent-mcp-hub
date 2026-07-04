@@ -2,6 +2,7 @@ import { createRequire } from "node:module";
 import { describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { SpawnError, TimeoutError, type Exec } from "../src/exec.js";
 import { allAdapters, enabledAdapters } from "../src/registry.js";
 import { buildServer } from "../src/server.js";
@@ -12,6 +13,24 @@ async function connectedClient(exec: Exec) {
   const server = buildServer(allAdapters(), exec);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "test-client", version: "0.0.0" });
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+  return client;
+}
+
+type ElicitHandler = Parameters<Client["setRequestHandler"]>[1];
+
+async function connectedClientWithElicit(
+  exec: Exec,
+  handler: ElicitHandler,
+  clientName = "test-client",
+) {
+  const server = buildServer(allAdapters(), exec);
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client(
+    { name: clientName, version: "0.0.0" },
+    { capabilities: { elicitation: {} } },
+  );
+  client.setRequestHandler(ElicitRequestSchema, handler);
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
   return client;
 }
@@ -293,5 +312,172 @@ describe("run_all", () => {
       ["-p", "--output-format", "text", "--model", "o3"],
       { cwd: undefined, timeoutMs: undefined, input: "compare" },
     );
+  });
+});
+
+// A2 / A4 — confirm-before-run gate (MCP elicitation). Env is restored with an
+// explicit if/else per test (never assign =undefined) so a set MCP_CONFIRM does
+// not leak into the other tests in the file.
+async function withConfirmEnv(value: string | undefined, fn: () => Promise<void>): Promise<void> {
+  const prev = process.env.MCP_CONFIRM;
+  if (value === undefined) delete process.env.MCP_CONFIRM;
+  else process.env.MCP_CONFIRM = value;
+  try {
+    await fn();
+  } finally {
+    if (prev === undefined) delete process.env.MCP_CONFIRM;
+    else process.env.MCP_CONFIRM = prev;
+  }
+}
+
+const acceptHandler: ElicitHandler = async () => ({ action: "accept", content: { confirm: true } });
+const declineHandler: ElicitHandler = async () => ({ action: "decline" });
+
+describe("confirm-before-run gate", () => {
+  it("A2(a) MCP_CONFIRM=1 + accept → agent runs and the summary carries agent name + prompt", async () => {
+    await withConfirmEnv("1", async () => {
+      const exec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
+      let seen = "";
+      const handler: ElicitHandler = async (req) => {
+        seen = (req.params as { message: string }).message;
+        return { action: "accept", content: { confirm: true } };
+      };
+      const client = await connectedClientWithElicit(exec, handler);
+      const res = await client.callTool({ name: "codex", arguments: { prompt: "hello world" } });
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(res.isError).toBeFalsy();
+      expect(textOf(res)).toBe("done");
+      expect(seen).toContain("codex");
+      expect(seen).toContain("hello world");
+    });
+  });
+
+  it("A2(b) decline → exec NOT called, isError with cancelled-by-user wording", async () => {
+    await withConfirmEnv("1", async () => {
+      const exec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
+      const client = await connectedClientWithElicit(exec, declineHandler);
+      const res = await client.callTool({ name: "codex", arguments: { prompt: "hello" } });
+      expect(exec).not.toHaveBeenCalled();
+      expect(res.isError).toBe(true);
+      expect(textOf(res)).toContain("cancelled by user");
+    });
+  });
+
+  it("A2(c) accept but confirm:false → treated as decline, not run", async () => {
+    await withConfirmEnv("1", async () => {
+      const exec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
+      const handler: ElicitHandler = async () => ({
+        action: "accept",
+        content: { confirm: false },
+      });
+      const client = await connectedClientWithElicit(exec, handler);
+      const res = await client.callTool({ name: "codex", arguments: { prompt: "hello" } });
+      expect(exec).not.toHaveBeenCalled();
+      expect(res.isError).toBe(true);
+      expect(textOf(res)).toContain("cancelled by user");
+    });
+  });
+
+  it("A2(d) MCP_CONFIRM unset + elicit-capable client → runs without eliciting", async () => {
+    await withConfirmEnv(undefined, async () => {
+      const exec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
+      let fired = false;
+      const handler: ElicitHandler = async () => {
+        fired = true;
+        return { action: "accept", content: { confirm: true } };
+      };
+      const client = await connectedClientWithElicit(exec, handler);
+      const res = await client.callTool({ name: "codex", arguments: { prompt: "hello" } });
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(fired).toBe(false);
+      expect(res.isError).toBeFalsy();
+    });
+  });
+
+  it("A2(e) MCP_CONFIRM=1 + client WITHOUT elicitation capability → runs (degrade)", async () => {
+    await withConfirmEnv("1", async () => {
+      const exec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
+      const client = await connectedClient(exec);
+      const res = await client.callTool({ name: "codex", arguments: { prompt: "hello" } });
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(res.isError).toBeFalsy();
+    });
+  });
+
+  it("A2(f) run_all + accept → all agents run with exactly ONE elicit", async () => {
+    await withConfirmEnv("1", async () => {
+      const exec: Exec = vi.fn(async (binary: string) => ({
+        stdout: `${binary} answer\n`,
+        stderr: "",
+        exitCode: 0,
+      }));
+      let fired = 0;
+      const handler: ElicitHandler = async () => {
+        fired += 1;
+        return { action: "accept", content: { confirm: true } };
+      };
+      const client = await connectedClientWithElicit(exec, handler);
+      const res = await client.callTool({ name: "run_all", arguments: { prompt: "compare" } });
+      expect(exec).toHaveBeenCalledTimes(4);
+      expect(fired).toBe(1);
+      expect(res.isError).toBeFalsy();
+    });
+  });
+
+  it("A2(f) run_all + decline → single cancelled result, nothing spawned", async () => {
+    await withConfirmEnv("1", async () => {
+      const exec: Exec = vi.fn(async () => ({ stdout: "x\n", stderr: "", exitCode: 0 }));
+      const client = await connectedClientWithElicit(exec, declineHandler);
+      const res = await client.callTool({ name: "run_all", arguments: { prompt: "compare" } });
+      expect(exec).not.toHaveBeenCalled();
+      expect(res.isError).toBe(true);
+      expect(textOf(res)).toContain("cancelled by user");
+    });
+  });
+
+  it("A2(g) handler throws → isError, exec NOT called (catch → cancelled)", async () => {
+    await withConfirmEnv("1", async () => {
+      const exec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
+      const handler: ElicitHandler = async () => {
+        throw new Error("client dropped mid-confirm");
+      };
+      const client = await connectedClientWithElicit(exec, handler);
+      const res = await client.callTool({ name: "codex", arguments: { prompt: "hello" } });
+      expect(exec).not.toHaveBeenCalled();
+      expect(res.isError).toBe(true);
+      expect(textOf(res)).toContain("cancelled by user");
+    });
+  });
+});
+
+describe("confirm gate is client-agnostic (A4/E7)", () => {
+  it("two clients with DIFFERENT clientInfo.name but identical elicitation cap both run on accept", async () => {
+    await withConfirmEnv("1", async () => {
+      const execA: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
+      const execB: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
+      const alpha = await connectedClientWithElicit(execA, acceptHandler, "ide-alpha");
+      const beta = await connectedClientWithElicit(execB, acceptHandler, "ide-beta");
+      const resA = await alpha.callTool({ name: "codex", arguments: { prompt: "hi" } });
+      const resB = await beta.callTool({ name: "codex", arguments: { prompt: "hi" } });
+      expect(execA).toHaveBeenCalledTimes(1);
+      expect(execB).toHaveBeenCalledTimes(1);
+      expect(resA.isError).toBeFalsy();
+      expect(resB.isError).toBeFalsy();
+    });
+  });
+
+  it("two clients with DIFFERENT clientInfo.name both cancel on decline", async () => {
+    await withConfirmEnv("1", async () => {
+      const execA: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
+      const execB: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
+      const alpha = await connectedClientWithElicit(execA, declineHandler, "ide-alpha");
+      const beta = await connectedClientWithElicit(execB, declineHandler, "ide-beta");
+      const resA = await alpha.callTool({ name: "codex", arguments: { prompt: "hi" } });
+      const resB = await beta.callTool({ name: "codex", arguments: { prompt: "hi" } });
+      expect(execA).not.toHaveBeenCalled();
+      expect(execB).not.toHaveBeenCalled();
+      expect(resA.isError).toBe(true);
+      expect(resB.isError).toBe(true);
+    });
   });
 });
