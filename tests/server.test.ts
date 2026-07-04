@@ -998,7 +998,10 @@ describe("review_change", () => {
       arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
     });
     expect(res.isError).toBe(true);
-    expect(textOf(res)).toContain("too large");
+    const text = textOf(res);
+    expect(text).toContain("done");
+    expect(text).toContain("review skipped");
+    expect(text).toContain("too large");
     expect(reviewerExec).not.toHaveBeenCalled();
   });
 
@@ -1026,7 +1029,10 @@ describe("review_change", () => {
     expect(res.isError).toBe(true);
     const text = textOf(res);
     expect(text).toContain("done editing");
+    expect(text).toContain("claude failed (exit 1)");
+    expect(text).toContain("reviewer boom");
     expect(text).toContain("Review could not run");
+    expect(text).not.toContain("## Review by claude");
   });
 
   it("A13 metadata: listTools shows review_change with required cwd and expected annotations", async () => {
@@ -1034,6 +1040,8 @@ describe("review_change", () => {
     const { tools } = await client.listTools();
     const review = tools.find((t) => t.name === "review_change");
     expect(review).toBeDefined();
+    expect(review!.outputSchema).toBeUndefined();
+    expect(review!.description).toContain("name only");
     const schema = review!.inputSchema as {
       properties: Record<string, { type: string; description: string }>;
       required: string[];

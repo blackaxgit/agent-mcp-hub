@@ -185,7 +185,7 @@ export function buildServer(adapters: AgentAdapter[], exec: Exec = runCommand): 
     "review_change",
     {
       description:
-        "Run an agent in a git worktree, capture the diff, and have a second agent judge the change (PASS/WARN/FAIL)",
+        "Run the `runner` agent in `cwd` (which edits files), capture the concrete `git diff` of the change, then have the `reviewer` agent judge it and return a PASS/WARN/FAIL verdict along with the runner output, the diff, and the review. Requires a git worktree. Newly-created (untracked) files are reviewed by name only (their contents are not in the diff). The diff may include pre-existing changes if the worktree was already dirty.",
       inputSchema: {
         runner: z.string().describe("Adapter name of the agent that edits files"),
         reviewer: z.string().describe("Adapter name of the agent that judges the change"),

@@ -70,6 +70,9 @@ describe("isGitRepo", () => {
     const result = await isGitRepo(exec, "/repo");
 
     expect(result).toBe(false);
+    expect(exec).toHaveBeenCalledWith("git", ["rev-parse", "--is-inside-work-tree"], {
+      cwd: "/repo",
+    });
   });
 });
 
