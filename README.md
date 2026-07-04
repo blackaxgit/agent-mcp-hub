@@ -129,9 +129,12 @@ claude mcp add --transport http agent-hub http://localhost:3919/mcp
   stored logins — the same model as codex-mcp-server. A fresh container is logged
   out, so `docker-compose.yml` **mounts your host login dirs read-only** to reuse
   them. Which path each CLI needs:
-  - **codex / opencode / cursor** — file-based logins (`~/.codex`,
-    `~/.config/opencode` + `~/.local/share/opencode`,
-    `~/.local/share/cursor-agent`); the mounts carry them, no API key.
+  - **codex / opencode** — file-based logins (`~/.codex`, `~/.config/opencode` +
+    `~/.local/share/opencode`); the mounts carry them, no API key.
+  - **cursor** — NOT mounted. Its binary and login live together in
+    `~/.local/share/cursor-agent`, so mounting that dir shadows the image's
+    cursor-agent (dangling symlink → "not found"). Use `CURSOR_API_KEY`, or run
+    `cursor-agent login` inside the container once.
   - **claude** — on **macOS** the OAuth token lives in the **Keychain**, not
     `~/.claude`, so the mount carries config but not the login: set
     `ANTHROPIC_API_KEY` (compose has it enabled). On **Linux**, claude stores
