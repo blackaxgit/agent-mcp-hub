@@ -148,8 +148,9 @@ for such tasks, or rely on the total cap.
 While an agent runs, the hub emits MCP **progress notifications** to clients that
 request them (`_meta.progressToken`) — live feedback and a keep-alive for
 HTTP/remote clients. Note: on **Claude Code (stdio)** the per-server request
-`timeout` (`.mcp.json`) is a hard wall-clock that progress does **not** reset
-(default ~28h) — raise it if you lowered it below your longest run.
+`timeout` in `.mcp.json` (or the `MCP_TOOL_TIMEOUT` env var it honors) is a hard
+wall-clock that progress does **not** reset (default ~28h) — raise it if you
+lowered it below your longest run.
 
 ## Run with Docker
 

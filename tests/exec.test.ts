@@ -7,6 +7,7 @@ import {
   DEFAULT_IDLE_TIMEOUT_MS,
   DEFAULT_TIMEOUT_MS,
   MAX_CONCURRENT_AGENTS,
+  OutputLimitError,
   ServerBusyError,
   TimeoutError,
   runCommand,
@@ -73,19 +74,21 @@ describe("runCommand", () => {
 
 describe("runCommand idle timeout", () => {
   it("A1: kills a silent child at the idle window with kind 'idle'", async () => {
-    // No output ever; a large total cap ensures the IDLE timer is what fires.
+    // Small idle window, LARGE total cap: the kill must come from the IDLE timer,
+    // not the total. Elapsed well under the 10s total (but above the 150ms idle)
+    // proves idle fired — a total-driven kill could not land this fast.
     const start = Date.now();
-    const err = await runCommand("node", ["-e", "setTimeout(()=>{},5000)"], {
-      idleTimeoutMs: 100,
-      timeoutMs: 30_000,
+    const err = await runCommand("node", ["-e", "setTimeout(()=>{},10000)"], {
+      idleTimeoutMs: 150,
+      timeoutMs: 10_000,
     }).catch((e: unknown) => e);
     const elapsed = Date.now() - start;
     expect(err).toBeInstanceOf(TimeoutError);
     expect((err as TimeoutError).kind).toBe("idle");
-    expect((err as TimeoutError).timeoutMs).toBe(100);
+    expect((err as TimeoutError).timeoutMs).toBe(150);
     expect((err as TimeoutError).message).toMatch(/no output/);
-    // Fired at ~the idle window, well before the total cap.
-    expect(elapsed).toBeLessThan(5000);
+    // Comfortably under the 10s total cap — proves idle, not total, did the kill.
+    expect(elapsed).toBeLessThan(2000);
   });
 
   it("A2: a periodically-printing child resets the idle timer and survives", async () => {
@@ -101,18 +104,50 @@ describe("runCommand idle timeout", () => {
   });
 
   it("A3: total cap fires before idle for a continuously-printing child", async () => {
-    // Never idle (prints constantly), idle window > total, so the TOTAL cap wins.
+    // Small total cap, LARGE idle window (10s) that the child never approaches —
+    // it prints every 10ms so the idle timer is perpetually re-armed and can never
+    // fire. The kill at well under 2s therefore can only be the TOTAL cap.
     const start = Date.now();
     const err = await runCommand(
       "node",
       ["-e", "setInterval(()=>console.log('x'),10);setTimeout(()=>{},30000);"],
-      { timeoutMs: 200, idleTimeoutMs: 5000 },
+      { timeoutMs: 300, idleTimeoutMs: 10_000 },
     ).catch((e: unknown) => e);
     const elapsed = Date.now() - start;
     expect(err).toBeInstanceOf(TimeoutError);
     expect((err as TimeoutError).kind).toBe("total");
+    expect((err as TimeoutError).timeoutMs).toBe(300);
     expect((err as TimeoutError).message).toMatch(/timed out/);
+    // Idle is 10s and never idle anyway — sub-2s can only be the total cap.
     expect(elapsed).toBeLessThan(2000);
+  });
+
+  it("A4: with idle === total both timers race but reject exactly once", async () => {
+    // Silent child, idleTimeoutMs === timeoutMs (both small + equal): the total
+    // and idle timers are scheduled for the same tick, so both callbacks are due
+    // together. markTimeout()'s guard must let only the FIRST win — a single
+    // TimeoutError, one kill, no double-reject and no unhandled rejection. The
+    // test simply completing (Promise settles once, process does not crash) is the
+    // proof; kind may be "idle" or "total" depending on timer ordering.
+    let rejections = 0;
+    const err = await runCommand("node", ["-e", "setTimeout(()=>{},10000)"], {
+      idleTimeoutMs: 120,
+      timeoutMs: 120,
+    }).then(
+      () => {
+        throw new Error("expected the racing timers to reject");
+      },
+      (e: unknown) => {
+        rejections += 1;
+        return e;
+      },
+    );
+    expect(rejections).toBe(1);
+    expect(err).toBeInstanceOf(TimeoutError);
+    expect(["idle", "total"]).toContain((err as TimeoutError).kind);
+    // Give any losing timer its chance to (wrongly) fire a second time; a stray
+    // reject/kill would surface as an unhandled rejection and fail the run.
+    await delay(300);
   });
 });
 
@@ -406,6 +441,38 @@ describe("runCommand output cap", () => {
     // re-enter the limit branch on every drained chunk and kill repeatedly.
     expect(groupKills).toBe(1);
     vi.restoreAllMocks();
+  });
+
+  it("clears the timers on the output-cap path so neither timer double-fires", async () => {
+    // The child floods stdout past a tiny cap while BOTH timeout windows are small
+    // enough that they WOULD otherwise fire. The output-cap breach must call
+    // clearTimers() and win: the call rejects with OutputLimitError (never a
+    // TimeoutError), exactly once, and no stray timer fires afterward (a leaked
+    // idle/total timer would markTimeout → double-kill → unhandled rejection).
+    let rejections = 0;
+    const flood =
+      "const b=Buffer.alloc(4096,120);" +
+      "function w(){if(process.stdout.write(b))setImmediate(w);else process.stdout.once('drain',w);}" +
+      "w();";
+    const err = await runCommand("node", ["-e", flood], {
+      maxOutputBytes: 10,
+      idleTimeoutMs: 100,
+      timeoutMs: 100,
+    }).then(
+      () => {
+        throw new Error("expected the output cap to reject");
+      },
+      (e: unknown) => {
+        rejections += 1;
+        return e;
+      },
+    );
+    expect(rejections).toBe(1);
+    expect(err).toBeInstanceOf(OutputLimitError);
+    expect(err).not.toBeInstanceOf(TimeoutError);
+    expect((err as OutputLimitError).maxOutputBytes).toBe(10);
+    // Past both timeout windows: a leaked timer would have double-fired by now.
+    await delay(300);
   });
 
   it("does not echo captured bytes in the limit error", async () => {
