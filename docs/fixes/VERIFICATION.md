@@ -1,23 +1,34 @@
-# VERIFICATION — re-review round 2 fixes (2026-07-03)
+# VERIFICATION — compose CLI-auth model (round 4, 2026-07-04)
 
-(Round-1 VERIFICATION preserved in git history at this path.)
+(Prior rounds preserved in git history.) Branch: `fix/compose-cli-auth`. No src/test changed → the 66 tests stay green; the gate is config validity + docs accuracy.
 
-Gates: **format:check PASS · lint PASS · 66/66 tests · typecheck clean · build clean.** Compose fail-closed confirmed (`docker compose config` errors without MCP_TOKEN, valid with it).
-Gate #2: four-eyes double-check **PASS (97)** · Codex fix-verify (6/7 FIXED + one fair "format" scope catch, now closed → all 7) · orchestrator integrated run green.
+Gates: **`docker compose config` valid · 66/66 tests · lint · format:check · build all green.**
+Gate #2: Codex fix-verify **AGREES (95)** · four-eyes double-check **PASS (93)**.
 
-| # | Issue | Status | Root cause | Fix (where) | Regression test | Confidence |
-|---|---|---|---|---|---|---|
-| P1.1 | Fail-open auth on RCE endpoint | FIXED | unset MCP_TOKEN ⇒ every POST accepted; image bound 0.0.0.0 | fail-closed startup guard: refuse non-loopback bind without MCP_TOKEN (`src/httpServer.ts`); drop `ENV HOST=0.0.0.0` (`Dockerfile`); require token in compose (`${MCP_TOKEN:?}`) | "refuses to bind a non-loopback host without MCP_TOKEN" (differentiating) | 99% |
-| P2.1 | Semaphore no fast-fail / unbounded queue | FIXED | `acquire()` only resolved, `waiters[]` unbounded | bounded queue → `ServerBusyError` before enqueue (`MCP_MAX_QUEUE`, `src/exec.ts`) → isError | "rejects with ServerBusyError when the queue is full" (differentiating) | 98% |
-| P3.1 | engines node>=20 vs Node 22 | FIXED | advisory floor below real floor | `"engines": {"node": ">=22"}` (`package.json`) | inspection | 99% |
-| P3.2 | Node PID 1, no init (zombie reaping) | FIXED | no init to reap re-parented orphans | bake `tini` as `ENTRYPOINT` (`Dockerfile`) | inspection + CI image smoke | 98% |
-| P3.3 | No lint/format gate | FIXED | no ESLint, no formatter | ESLint 9 flat config w/ `no-floating-promises` (src) + Prettier `format:check`; both wired into CI | `npm run lint` + `npm run format:check` exit 0 + CI steps | 98% |
-| P3.4 | compose image tag hardcodes version | FIXED | duplicated version literal | `image: agent-mcp-hub:${APP_VERSION:-latest}` (`docker-compose.yml`) | inspection | 98% |
+## Issue → resolution
 
-## Notes / honest caveats
-- **P3.3 "format" half:** Codex's fix-verification (04b) correctly flagged that the finding title said "lint/**format**" and only lint had shipped. Closed by adding Prettier (`.prettierrc.json`, `format`/`format:check` scripts, `eslint-config-prettier`, CI `format:check` step). Markdown is excluded from the formatter (prose, not code) — the gate governs code files. ESLint `no-floating-promises` found ZERO floating promises in src, confirming the round-1/round-2 `void`-discard patterns are correct.
-- **P3.3 test-scope:** `no-floating-promises` is scoped to `src/**` only (tsconfig `include` is `src`, so tests aren't in the type-checked project). Accepted, documented — tests aren't the code-execution surface; `no-unused-vars` still lints tests. (four-eyes DOWNGRADE reason; not an open defect.)
-- **Codex PLAN review (gate #1) was inconclusive** this round (forwarder issue, 03b) — compensated by 4-team re-review CONFIRMED findings + independent research + the Codex/four-eyes VERIFICATION at gate #2. The plan gate leaned on research rather than an independent engine; the fix gate had both.
+```
+Issue: compose required API keys, hiding that the wrapped CLIs self-authenticate → FIXED
+Root cause: fresh container is logged out + login mounts were commented/incomplete + keys framed as primary
+Fix: docker-compose.yml mounts host CLI login dirs read-only (codex/claude/opencode×2/cursor) as the
+  primary path; API keys demoted to optional (ANTHROPIC_API_KEY enabled for claude/macOS Keychain reality);
+  README rewritten with the two-concept auth model + stdio zero-config path.
+Regression proof: `docker compose config -q` validates; full suite/lint/format/build unaffected (66/66).
+Codex: agrees (95). Four-eyes: PASS (93). Confidence: 98%.
+```
 
-## Codex: agrees (after format closed). Four-eyes double-check: **PASSED (97)**.
-All 7 findings resolved at root cause, not masked or moved. Per-issue confidence ≥98%.
+## Codex plan-review findings (03b, NEEDS REVISION 86) — all folded in and re-verified FIXED
+1. Native-Linux uid-1001 read caveat — documented (compose + README).
+2. "Missing mount fails `up`" was WRONG → corrected to "auto-creates empty dir → CLI logged-out; comment out unused."
+3. Claude contradiction — resolved via host check (`~/.claude/.credentials.json` absent → macOS Keychain-backed), so claude uses `ANTHROPIC_API_KEY` in a container; codex/opencode/cursor use file mounts. README prereq + auth section now agree.
+
+## Four-eyes precision tweaks applied
+- README prereq line scoped to "containers **on macOS** use ANTHROPIC_API_KEY".
+- Added the cost note: `ANTHROPIC_API_KEY` bills pay-per-token, separate from a Claude Pro/Max subscription.
+
+## Honest caveats
+- The login mounts' actual runtime behavior in a live container is not exercised here (needs the GHCR pull + `docker compose up`, which requires the user's GHCR auth). Mitigated by documented per-CLI caveats; `docker compose config` validates the file.
+- macOS Docker Desktop mediates uid mapping (mounts read fine); native Linux may need the API-key fallback — documented.
+
+## Double-check: PASSED
+Four-eyes confirmed all items FIXED with file:line evidence, both behavioral facts (Keychain reality, RO+key coherence) correct, no over-promises, changed files limited to docker-compose.yml/README.md/docs. All bars ≥97% for the fix (config validity + docs accuracy); overall confidence 98%.
