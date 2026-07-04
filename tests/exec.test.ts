@@ -6,6 +6,7 @@ import {
   DEFAULT_TIMEOUT_MS,
   MAX_CONCURRENT_AGENTS,
   ServerBusyError,
+  TimeoutError,
   runCommand,
 } from "../src/exec.js";
 
@@ -42,6 +43,14 @@ describe("runCommand", () => {
     await expect(
       runCommand("node", ["-e", "setTimeout(() => {}, 10000)"], { timeoutMs: 200 }),
     ).rejects.toThrow(/timed out after 200ms/);
+  });
+
+  it("rejects timeout with a typed TimeoutError carrying timeoutMs", async () => {
+    const err = await runCommand("node", ["-e", "setTimeout(() => {}, 10000)"], {
+      timeoutMs: 200,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(TimeoutError);
+    expect((err as TimeoutError).timeoutMs).toBe(200);
   });
 
   it("defaults the timeout to 300000ms", () => {

@@ -3,6 +3,7 @@ import type { AgentAdapter, AgentInvocation, AgentRunOptions } from "../types.js
 export const opencodeAdapter: AgentAdapter = {
   name: "opencode",
   binary: "opencode",
+  loginCommand: "opencode auth login",
   buildInvocation(prompt: string, options: AgentRunOptions = {}): AgentInvocation {
     if (prompt.startsWith("-")) {
       // opencode documents neither stdin input nor a "--" delimiter, so a

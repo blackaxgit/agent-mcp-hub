@@ -3,6 +3,8 @@ import type { AgentAdapter, AgentInvocation, AgentRunOptions } from "../types.js
 export const codexAdapter: AgentAdapter = {
   name: "codex",
   binary: "codex",
+  loginCommand: "codex login",
+  apiKeyEnv: "OPENAI_API_KEY",
   buildInvocation(prompt: string, options: AgentRunOptions = {}): AgentInvocation {
     const args = ["exec", "--skip-git-repo-check"];
     if (options.model) args.push("--model", options.model);

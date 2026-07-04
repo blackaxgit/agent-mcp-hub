@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 import { describe, expect, it, vi } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import type { Exec } from "../src/exec.js";
+import { SpawnError, TimeoutError, type Exec } from "../src/exec.js";
 import { allAdapters, enabledAdapters } from "../src/registry.js";
 import { buildServer } from "../src/server.js";
 
@@ -60,28 +60,47 @@ describe("buildServer", () => {
     expect(textOf(res)).toBe("done");
   });
 
-  it("returns isError with stderr on non-zero exit", async () => {
-    const exec: Exec = vi.fn(async () => ({ stdout: "", stderr: "auth required", exitCode: 2 }));
+  it("returns a text-only tool_failure with (exit N) and the output tail on non-zero exit", async () => {
+    const exec: Exec = vi.fn(async () => ({ stdout: "", stderr: "boom", exitCode: 2 }));
     const client = await connectedClient(exec);
     const res = await client.callTool({ name: "cursor", arguments: { prompt: "x" } });
     expect(res.isError).toBe(true);
-    expect(textOf(res)).toContain("exit 2");
-    expect(textOf(res)).toContain("auth required");
+    expect(textOf(res)).toContain("(exit 2)");
+    expect(textOf(res)).toContain("boom");
+    const content = res.content as Array<{ type: string; text: string }>;
+    expect(content.length).toBe(1);
+    expect(content[0].type).toBe("text");
+    expect(res.structuredContent).toBeUndefined();
   });
 
-  it("returns isError when exec rejects with a spawn failure", async () => {
+  it("classifies a cursor ANSI sign-in banner as not authenticated with a clean remediation", async () => {
+    const banner = "\x1b[2K\x1b[1A Press any key to sign in...";
+    const exec: Exec = vi.fn(async () => ({ stdout: "", stderr: banner, exitCode: 1 }));
+    const client = await connectedClient(exec);
+    const res = await client.callTool({ name: "cursor", arguments: { prompt: "x" } });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain("cursor-agent login");
+    expect(text).toContain("not authenticated");
+    expect(text.includes("\x1b")).toBe(false);
+    expect((res.content as unknown[]).length).toBe(1);
+    expect(res.structuredContent).toBeUndefined();
+  });
+
+  it("classifies a SpawnError as not installed with an install hint", async () => {
     const exec: Exec = vi.fn(async () => {
-      throw new Error('Failed to start "opencode": ENOENT. Is it installed and on PATH?');
+      throw new SpawnError('Failed to start "opencode": ENOENT. Is it installed and on PATH?');
     });
     const client = await connectedClient(exec);
     const res = await client.callTool({ name: "opencode", arguments: { prompt: "x" } });
     expect(res.isError).toBe(true);
-    expect(textOf(res)).toContain("Is it installed");
+    expect(textOf(res)).toContain("not installed");
+    expect(res.structuredContent).toBeUndefined();
   });
 
-  it("returns isError with the timeout message when exec times out", async () => {
+  it("classifies a TimeoutError as timed_out and states the ms", async () => {
     const exec: Exec = vi.fn(async () => {
-      throw new Error('"cursor-agent" timed out after 50ms');
+      throw new TimeoutError('"cursor-agent" timed out after 50ms', 50);
     });
     const client = await connectedClient(exec);
     const res = await client.callTool({
@@ -89,7 +108,10 @@ describe("buildServer", () => {
       arguments: { prompt: "x", timeoutMs: 50 },
     });
     expect(res.isError).toBe(true);
-    expect(textOf(res)).toContain("timed out after 50ms");
+    const text = textOf(res);
+    expect(text).toContain("timed out");
+    expect(text).toContain("50");
+    expect(res.structuredContent).toBeUndefined();
   });
 
   it("returns isError for opencode prompts starting with '-' without calling exec", async () => {
@@ -197,7 +219,7 @@ describe("run_all", () => {
     expect(text).toContain("## codex (ok)");
     expect(text).toContain("codex answer");
     expect(text).toContain("## cursor (failed)");
-    expect(text).toContain("not logged in");
+    expect(text).toContain("cursor-agent login");
     expect(text).toContain("## opencode (ok)");
     expect(text).toContain("## claude (ok)");
     expect(text).toContain("claude answer");

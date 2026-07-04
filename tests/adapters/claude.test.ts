@@ -26,4 +26,9 @@ describe("claudeAdapter", () => {
     expect(claudeAdapter.name).toBe("claude");
     expect(claudeAdapter.binary).toBe("claude");
   });
+
+  it("exposes remediation metadata", () => {
+    expect(claudeAdapter.loginCommand).toBe("claude  (then /login)");
+    expect(claudeAdapter.apiKeyEnv).toBe("ANTHROPIC_API_KEY");
+  });
 });

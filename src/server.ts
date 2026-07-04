@@ -2,6 +2,7 @@ import { createRequire } from "node:module";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { runCommand, type Exec, type ExecResult } from "./exec.js";
+import { classifyFailure } from "./failure.js";
 import { checkAvailability } from "./registry.js";
 import type { AgentAdapter } from "./types.js";
 
@@ -87,22 +88,13 @@ export function buildServer(adapters: AgentAdapter[], exec: Exec = runCommand): 
         try {
           const result = await runAdapter(adapter, exec, { prompt, model, cwd, timeoutMs });
           if (result.exitCode !== 0) {
-            return {
-              isError: true,
-              content: [
-                {
-                  type: "text",
-                  text: `${adapter.name} failed (exit ${result.exitCode}):\n${result.stderr || result.stdout}`,
-                },
-              ],
-            };
+            const { message } = classifyFailure(adapter, { result });
+            return { isError: true, content: [{ type: "text", text: message }] };
           }
           return { content: [{ type: "text", text: result.stdout.trim() }] };
         } catch (err) {
-          return {
-            isError: true,
-            content: [{ type: "text", text: err instanceof Error ? err.message : String(err) }],
-          };
+          const { message } = classifyFailure(adapter, { error: err });
+          return { isError: true, content: [{ type: "text", text: message }] };
         }
       },
     );
@@ -124,19 +116,17 @@ export function buildServer(adapters: AgentAdapter[], exec: Exec = runCommand): 
         adapters.map((adapter) => runAdapter(adapter, exec, { prompt, model, cwd, timeoutMs })),
       );
       const content = settled.map((outcome, i) => {
-        const name = adapters[i].name;
+        const adapter = adapters[i];
+        const name = adapter.name;
         if (outcome.status === "rejected") {
-          const msg =
-            outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason);
-          return { type: "text" as const, text: `## ${name} (failed)\n${msg}` };
+          const { message } = classifyFailure(adapter, { error: outcome.reason });
+          return { type: "text" as const, text: `## ${name} (failed)\n${message}` };
         }
-        const { stdout, stderr, exitCode } = outcome.value;
-        return exitCode === 0
-          ? { type: "text" as const, text: `## ${name} (ok)\n${stdout.trim()}` }
-          : {
-              type: "text" as const,
-              text: `## ${name} (failed)\nexit ${exitCode}: ${stderr || stdout}`,
-            };
+        if (outcome.value.exitCode === 0) {
+          return { type: "text" as const, text: `## ${name} (ok)\n${outcome.value.stdout.trim()}` };
+        }
+        const { message } = classifyFailure(adapter, { result: outcome.value });
+        return { type: "text" as const, text: `## ${name} (failed)\n${message}` };
       });
       return { content };
     },

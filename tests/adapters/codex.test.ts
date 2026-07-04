@@ -26,4 +26,9 @@ describe("codexAdapter", () => {
     expect(codexAdapter.name).toBe("codex");
     expect(codexAdapter.binary).toBe("codex");
   });
+
+  it("exposes remediation metadata", () => {
+    expect(codexAdapter.loginCommand).toBe("codex login");
+    expect(codexAdapter.apiKeyEnv).toBe("OPENAI_API_KEY");
+  });
 });

@@ -47,6 +47,42 @@ export class ServerBusyError extends Error {
   }
 }
 
+/** Thrown when the child process fails to spawn (binary missing / not on PATH). */
+export class SpawnError extends Error {
+  readonly code = "spawn";
+  constructor(
+    message: string,
+    readonly cause?: unknown,
+  ) {
+    super(message);
+    this.name = "SpawnError";
+  }
+}
+
+/** Thrown when the child is killed for exceeding `timeoutMs`. Carries the bound. */
+export class TimeoutError extends Error {
+  readonly code = "timeout";
+  constructor(
+    message: string,
+    readonly timeoutMs: number,
+  ) {
+    super(message);
+    this.name = "TimeoutError";
+  }
+}
+
+/** Thrown when the child is killed for exceeding `maxOutputBytes`. Carries the cap. */
+export class OutputLimitError extends Error {
+  readonly code = "output_limit";
+  constructor(
+    message: string,
+    readonly maxOutputBytes: number,
+  ) {
+    super(message);
+    this.name = "OutputLimitError";
+  }
+}
+
 /**
  * Kill an entire process group. Children are spawned `detached`, making each the
  * leader of its own group, so `process.kill(-pid, …)` reaps the child and every
@@ -178,7 +214,10 @@ const runCommandInner: Exec = (binary, args, opts = {}) => {
       if (settled) return;
       settled = true;
       reject(
-        new Error(`Failed to start "${binary}": ${err.message}. Is it installed and on PATH?`),
+        new SpawnError(
+          `Failed to start "${binary}": ${err.message}. Is it installed and on PATH?`,
+          err,
+        ),
       );
     });
 
@@ -188,11 +227,16 @@ const runCommandInner: Exec = (binary, args, opts = {}) => {
       settled = true;
       if (killedForOutput) {
         // Never echo the captured bytes back — only the limit that was breached.
-        reject(new Error(`"${binary}" exceeded output limit of ${maxOutputBytes} bytes`));
+        reject(
+          new OutputLimitError(
+            `"${binary}" exceeded output limit of ${maxOutputBytes} bytes`,
+            maxOutputBytes,
+          ),
+        );
         return;
       }
       if (timedOut) {
-        reject(new Error(`"${binary}" timed out after ${timeoutMs}ms`));
+        reject(new TimeoutError(`"${binary}" timed out after ${timeoutMs}ms`, timeoutMs));
         return;
       }
       resolve({

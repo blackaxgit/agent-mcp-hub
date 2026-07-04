@@ -26,4 +26,9 @@ describe("opencodeAdapter", () => {
     expect(opencodeAdapter.name).toBe("opencode");
     expect(opencodeAdapter.binary).toBe("opencode");
   });
+
+  it("exposes remediation metadata", () => {
+    expect(opencodeAdapter.loginCommand).toBe("opencode auth login");
+    expect(opencodeAdapter.apiKeyEnv).toBeUndefined();
+  });
 });
