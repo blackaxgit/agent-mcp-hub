@@ -20,6 +20,25 @@ Agent tools accept `prompt` (required), `model`, `cwd`, `timeoutMs` (default 300
 Known limitation: `opencode` prompts may not start with `-` (its CLI could parse
 them as flags); the tool returns an actionable error instead of guessing.
 
+### Error handling
+
+When a wrapped CLI fails, the hub classifies the failure and returns a clean,
+ANSI-free, actionable `isError` result — never a raw terminal dump — naming the
+class and the exact fix:
+
+| Class | Example remediation |
+|---|---|
+| `not_installed` | install the CLI (e.g. `npm i -g @openai/codex`) / fix PATH |
+| `not_authenticated` | `codex login` · `cursor-agent login` · `opencode auth login` · `claude` → `/login` (or set the matching API key) |
+| `not_configured` | set a model/provider in the CLI's config |
+| `timed_out` | raise `timeoutMs`, or check the agent/model is responsive |
+| `server_busy` | retry shortly (upstream rate-limit, or the local agent-spawn queue is full) |
+| `tool_failure` | generic non-zero exit — the message includes `(exit N)` and a trimmed output tail |
+
+For example, an unauthenticated `cursor` no longer returns its ANSI "press any
+key to sign in" banner — it returns `cursor is not authenticated … Fix: run
+`cursor-agent login``.
+
 ## Prerequisites
 
 Install and authenticate the CLIs you want to use (any subset works):
