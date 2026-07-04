@@ -41,6 +41,39 @@ For example, an unauthenticated `cursor` no longer returns its ANSI "press any
 key to sign in" banner — it returns `cursor is not authenticated … Fix: run
 `cursor-agent login``.
 
+### Review a change (`review_change`)
+
+Runs a `runner` agent in a git `cwd` to make a change, captures the actual
+`git diff` of what changed, then has a `reviewer` agent judge that diff. Returns
+the runner's output, the diff (`--stat`), and a **PASS / WARN / FAIL** verdict
+with findings.
+
+**Inputs:** `runner`, `reviewer` (agent names), `prompt`, `cwd` (must be a git
+worktree), optional `model`, `timeoutMs`.
+
+**Key notes:**
+
+- Cross-agent by design — e.g. `codex` writes, `claude` reviews.
+- Returns the concrete diff that the plain agent tools don't expose.
+- Newly-created (untracked) files are reviewed by **name only** — their contents
+  are not in the diff.
+- If the worktree was already dirty, the diff may include pre-existing changes
+  (noted in the output).
+- Complements — does not replace — client-side stop-hooks or PR-time CI review.
+- The confirm gate (`MCP_CONFIRM`) applies.
+
+```json
+{
+  "tool": "review_change",
+  "arguments": {
+    "runner": "codex",
+    "reviewer": "claude",
+    "prompt": "Add a health check endpoint",
+    "cwd": "/workspace"
+  }
+}
+```
+
 ## Prerequisites
 
 Install and authenticate the CLIs you want to use (any subset works):

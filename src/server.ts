@@ -1,7 +1,7 @@
 import { createRequire } from "node:module";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { runCommand, type Exec, type ExecResult } from "./exec.js";
+import { runCommand, type Exec, type ExecResult, OutputLimitError } from "./exec.js";
 import {
   confirmEnabled,
   buildConfirmMessage,
@@ -10,6 +10,7 @@ import {
   CANCEL_TAIL,
 } from "./confirm.js";
 import { classifyFailure } from "./failure.js";
+import { isGitRepo, worktreeDirty, captureChange } from "./git.js";
 import { checkAvailability } from "./registry.js";
 import type { ElicitRequestFormParams } from "@modelcontextprotocol/sdk/types.js";
 import type { AgentAdapter } from "./types.js";
@@ -112,22 +113,34 @@ function makeProgressEmitter(
 }
 
 const agentInputSchema = {
-  prompt: z.string().describe("The task or question to send to the agent"),
-  model: z.string().optional().describe("Model override passed to the agent CLI"),
-  cwd: z.string().optional().describe("Working directory for the agent process"),
+  prompt: z.string().describe("The task or question for the agent, in natural language."),
+  model: z
+    .string()
+    .optional()
+    .describe(
+      'Optional model id passed through to the CLI, overriding that CLI\'s configured/default model (e.g. "o3"). Model names are agent-specific.',
+    ),
+  cwd: z
+    .string()
+    .optional()
+    .describe(
+      "Working directory for the CLI. Prefer an absolute path; a relative path resolves from the server process's cwd. Not a sandbox — the agent may read/edit any files it can access.",
+    ),
   timeoutMs: z
     .number()
     .int()
     .positive()
     .optional()
-    .describe("Total runtime cap: kill the agent after this many ms overall (default 1800000)"),
+    .describe(
+      "Total runtime cap in milliseconds — the hard upper bound on the whole run once the CLI starts (excludes time queued behind the concurrency limit); the process group is killed if exceeded (default 1800000 = 30 minutes).",
+    ),
   idleTimeoutMs: z
     .number()
     .int()
     .positive()
     .optional()
     .describe(
-      "Idle/inactivity timeout in ms: the run is killed only if the agent produces NO output for this long (default 300000)",
+      "Idle/inactivity timeout in milliseconds — the run is killed only if the agent produces NO output for this long (the timer resets on each output chunk; default 300000 = 5 minutes).",
     ),
 };
 
@@ -160,13 +173,22 @@ export function buildServer(adapters: AgentAdapter[], exec: Exec = runCommand): 
 
   server.registerTool(
     "ping",
-    { description: "Health check for agent-mcp-hub", inputSchema: {} },
+    {
+      description: 'Liveness check for agent-mcp-hub — returns "pong". Read-only, no side effects.',
+      inputSchema: {},
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
     async () => ({ content: [{ type: "text", text: "pong" }] }),
   );
 
   server.registerTool(
     "list_agents",
-    { description: "List wrapped CLI agents and whether each is installed", inputSchema: {} },
+    {
+      description:
+        "List the wrapped coding-agent CLIs and whether each is installed on PATH (probes each with `--version`; edits nothing). Read-only — call this first to choose an available agent before delegating.",
+      inputSchema: {},
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
     async () => {
       const statuses = await Promise.all(
         adapters.map(async (a) => ({ name: a.name, available: await checkAvailability(a, exec) })),
@@ -179,8 +201,9 @@ export function buildServer(adapters: AgentAdapter[], exec: Exec = runCommand): 
     server.registerTool(
       adapter.name,
       {
-        description: `Delegate a prompt to the ${adapter.name} CLI agent (non-interactive) and return its output`,
+        description: `${adapter.summary} Runs the \`${adapter.binary}\` CLI non-interactively in \`cwd\` — it can read and edit files there and may take time or use the agent's own model quota — and returns its output. On common failures returns a classified, actionable error (not installed / not authenticated with the exact login command / not configured / timed out / busy / output-limit); other non-zero exits return a clipped stderr/stdout tail. Check availability with list_agents first.`,
         inputSchema: agentInputSchema,
+        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
       },
       async ({ prompt, model, cwd, timeoutMs, idleTimeoutMs }, extra) => {
         if (!(await confirmOrCancel(buildConfirmMessage(adapter.name, { prompt, model, cwd })))) {
@@ -213,21 +236,42 @@ export function buildServer(adapters: AgentAdapter[], exec: Exec = runCommand): 
   server.registerTool(
     "run_all",
     {
-      description: "Send the same prompt to every wrapped agent in parallel and return all answers",
+      description:
+        "Fan the SAME prompt out to every enabled agent concurrently and return each agent's answer, labelled per agent — for comparing agents or cross-checking a result. Spawns every CLI (each can read/edit files in `cwd`) so it can be slow or use several agents' quotas; one confirmation covers the whole batch.",
       inputSchema: {
-        prompt: z.string().describe("The task or question to send to all agents"),
-        model: z.string().optional().describe("Model override passed to every agent CLI"),
-        cwd: z.string().optional().describe("Working directory for the agent processes"),
-        timeoutMs: z.number().int().positive().optional().describe("Per-agent timeout in ms"),
+        prompt: z
+          .string()
+          .describe("The task or question to send to every agent, in natural language."),
+        model: z
+          .string()
+          .optional()
+          .describe(
+            "Optional model id override passed through to each agent CLI. Names are agent-specific.",
+          ),
+        cwd: z
+          .string()
+          .optional()
+          .describe(
+            "Working directory for every CLI. Prefer an absolute path; a relative path resolves from the server process's cwd. Not a sandbox.",
+          ),
+        timeoutMs: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe(
+            "Per-agent TOTAL runtime cap in milliseconds once each CLI starts (process group killed if exceeded; default 1800000 = 30 minutes).",
+          ),
         idleTimeoutMs: z
           .number()
           .int()
           .positive()
           .optional()
           .describe(
-            "Idle/inactivity timeout in ms: the run is killed only if the agent produces NO output for this long (default 300000)",
+            "Per-agent idle/inactivity timeout in milliseconds — killed only if the agent produces NO output for this long (resets on each output chunk; default 300000 = 5 minutes).",
           ),
       },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
     },
     async ({ prompt, model, cwd, timeoutMs, idleTimeoutMs }, extra) => {
       if (
@@ -263,6 +307,223 @@ export function buildServer(adapters: AgentAdapter[], exec: Exec = runCommand): 
         return { type: "text" as const, text: `## ${name} (failed)\n${message}` };
       });
       return { content };
+    },
+  );
+
+  server.registerTool(
+    "review_change",
+    {
+      description:
+        "Run the `runner` agent in `cwd` (which edits files), capture the concrete `git diff` of the change, then have the `reviewer` agent judge it and return a PASS/WARN/FAIL verdict along with the runner output, the diff, and the review. Requires a git worktree. Newly-created (untracked) files are reviewed by name only (their contents are not in the diff). The diff may include pre-existing changes if the worktree was already dirty.",
+      inputSchema: {
+        runner: z.string().describe("Adapter name of the agent that edits files"),
+        reviewer: z.string().describe("Adapter name of the agent that judges the change"),
+        prompt: z.string().describe("Task or question to send to the runner agent"),
+        cwd: z.string().describe("Git working tree the runner operates in (REQUIRED)"),
+        model: z.string().optional().describe("Model override passed to both agents"),
+        timeoutMs: z.number().int().positive().optional().describe("Per-agent timeout in ms"),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+    },
+    async ({ runner, reviewer, prompt, cwd, model, timeoutMs }) => {
+      const runnerAdapter = adapters.find((a) => a.name === runner);
+      const reviewerAdapter = adapters.find((a) => a.name === reviewer);
+      if (!runnerAdapter || !reviewerAdapter) {
+        const valid = adapters.map((a) => a.name).join(", ");
+        const missing: string[] = [];
+        if (!runnerAdapter) missing.push(runner);
+        if (!reviewerAdapter) missing.push(reviewer);
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `unknown agent "${missing.join(", ")}"; valid: ${valid}`,
+            },
+          ],
+        };
+      }
+
+      if (
+        !(await confirmOrCancel(
+          `review_change: run ${runner} in ${cwd}, then review with ${reviewer}\nprompt: ${prompt}`,
+        ))
+      ) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `review_change: ${CANCEL_TAIL}` }],
+        };
+      }
+
+      let isRepo: boolean;
+      try {
+        isRepo = await isGitRepo(exec, cwd);
+      } catch (err) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `review_change: git failed: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+        };
+      }
+      if (!isRepo) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `cwd is not a git repository (or \`git\` is not on PATH): ${cwd}`,
+            },
+          ],
+        };
+      }
+
+      let wasDirty: boolean;
+      try {
+        wasDirty = await worktreeDirty(exec, cwd);
+      } catch (err) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `review_change: git failed: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+        };
+      }
+
+      let runnerResult: ExecResult;
+      try {
+        runnerResult = await runAdapter(runnerAdapter, exec, { prompt, model, cwd, timeoutMs });
+      } catch (err) {
+        const { message } = classifyFailure(runnerAdapter, { error: err });
+        return { isError: true, content: [{ type: "text", text: message }] };
+      }
+      if (runnerResult.exitCode !== 0) {
+        const { message } = classifyFailure(runnerAdapter, { result: runnerResult });
+        return { isError: true, content: [{ type: "text", text: message }] };
+      }
+
+      let change;
+      try {
+        change = await captureChange(exec, cwd);
+      } catch (err) {
+        const base = `## ${runner} output\n${runnerResult.stdout.trim()}\n\n`;
+        if (err instanceof OutputLimitError) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text:
+                  base +
+                  "The diff is too large to review (exceeded the output limit); review skipped.",
+              },
+            ],
+          };
+        }
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text:
+                base +
+                `git failed capturing the diff: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+        };
+      }
+
+      if (change.diff.trim() === "" && change.untracked.length === 0) {
+        let text = `## ${runner} output\n${runnerResult.stdout.trim()}\n\nNo file changes detected; review skipped.`;
+        if (wasDirty) {
+          text =
+            "⚠ worktree was already dirty; the diff may include pre-existing changes.\n\n" + text;
+        }
+        return { isError: false, content: [{ type: "text", text }] };
+      }
+
+      const untrackedLine =
+        change.untracked.length > 0
+          ? `New untracked files: ${change.untracked.join(", ")}`
+          : "New untracked files: (none)";
+      const diffText = change.diff.trim() === "" ? "(no tracked diff)" : change.diff;
+      const reviewPrompt = [
+        `Task: ${prompt}`,
+        `Runner output:`,
+        runnerResult.stdout.trim(),
+        `Diff:`,
+        diffText,
+        untrackedLine,
+        "Respond with EXACTLY one of PASS, WARN, or FAIL on the FIRST line, then your findings.",
+      ].join("\n");
+
+      let reviewResult: ExecResult;
+      try {
+        reviewResult = await runAdapter(reviewerAdapter, exec, {
+          prompt: reviewPrompt,
+          model,
+          cwd,
+          timeoutMs,
+        });
+      } catch (err) {
+        const statSection =
+          change.stat.trim() === "" ? "" : `## Change (git diff --stat)\n${change.stat}`;
+        const untrackedNote =
+          change.untracked.length > 0 ? `\nNew files: ${change.untracked.join(", ")}` : "";
+        const { message } = classifyFailure(reviewerAdapter, { error: err });
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `## ${runner} output\n${runnerResult.stdout.trim()}\n\n${statSection}${untrackedNote}\n\nReview could not run: ${message}`,
+            },
+          ],
+        };
+      }
+      if (reviewResult.exitCode !== 0) {
+        const statSection =
+          change.stat.trim() === "" ? "" : `## Change (git diff --stat)\n${change.stat}`;
+        const untrackedNote =
+          change.untracked.length > 0 ? `\nNew files: ${change.untracked.join(", ")}` : "";
+        const { message } = classifyFailure(reviewerAdapter, { result: reviewResult });
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `## ${runner} output\n${runnerResult.stdout.trim()}\n\n${statSection}${untrackedNote}\n\nReview could not run: ${message}`,
+            },
+          ],
+        };
+      }
+
+      const firstLine = reviewResult.stdout
+        .split("\n")
+        .map((l) => l.trim())
+        .find((l) => l.length > 0);
+      const verdict = /^(PASS|WARN|FAIL)\b/i.exec(firstLine ?? "")?.[1].toUpperCase() ?? "WARN";
+
+      const lines: string[] = [];
+      if (wasDirty) {
+        lines.push("⚠ worktree was already dirty; the diff may include pre-existing changes.");
+      }
+      lines.push(
+        `## ${runner} output\n${runnerResult.stdout.trim()}`,
+        `## Change (git diff --stat)\n${change.stat}`,
+      );
+      if (change.untracked.length > 0) {
+        lines.push(`New files: ${change.untracked.join(", ")}`);
+      }
+      lines.push(`## Review by ${reviewer} — ${verdict}\n${reviewResult.stdout.trim()}`);
+
+      return { isError: false, content: [{ type: "text", text: lines.join("\n") }] };
     },
   );
 

@@ -2,6 +2,8 @@ import type { AgentAdapter, AgentInvocation, AgentRunOptions } from "../types.js
 
 export const opencodeAdapter: AgentAdapter = {
   name: "opencode",
+  summary:
+    "OpenCode — an open-source, provider-agnostic coding agent for agentic code changes; its model defaults to the user's opencode config unless a model is provided. Prompts must not start with '-'.",
   binary: "opencode",
   loginCommand: "opencode auth login",
   buildInvocation(prompt: string, options: AgentRunOptions = {}): AgentInvocation {
