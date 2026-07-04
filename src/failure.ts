@@ -80,7 +80,8 @@ const PRIMARY_AUTH_PHRASES = [
   "invalid api key",
   "api key not found",
   "press any key to sign in",
-  "please run",
+  // NB: only the specific "please run /login" (above) — bare "please run" is too
+  // broad (e.g. "please run `npm install`" is NOT an auth failure).
   "auth login",
 ];
 

@@ -22,6 +22,15 @@ const res = (stderr: string, stdout: string, exitCode: number): ExecResult => ({
 
 const ESC = "";
 
+describe("auth precision (R10) — bare 'please run' is not auth", () => {
+  it("does not classify a generic 'please run <cmd>' failure as not_authenticated", () => {
+    const out = classifyFailure(codex, {
+      result: res("Error: please run `terraform init` before plan", "", 1),
+    });
+    expect(out.code).toBe("tool_failure");
+  });
+});
+
 describe("stripAnsi", () => {
   it("removes a cursor-style sign-in banner's escape sequences", () => {
     const banner = `${ESC}[2K${ESC}[36mPress any key to sign in${ESC}[0m`;

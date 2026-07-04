@@ -83,6 +83,8 @@ describe("buildServer", () => {
     expect(text).toContain("cursor-agent login");
     expect(text).toContain("not authenticated");
     expect(text.includes("\x1b")).toBe(false);
+    expect((res.content as unknown[]).length).toBe(1);
+    expect(res.structuredContent).toBeUndefined();
   });
 
   it("classifies a SpawnError as not installed with an install hint", async () => {
@@ -93,6 +95,7 @@ describe("buildServer", () => {
     const res = await client.callTool({ name: "opencode", arguments: { prompt: "x" } });
     expect(res.isError).toBe(true);
     expect(textOf(res)).toContain("not installed");
+    expect(res.structuredContent).toBeUndefined();
   });
 
   it("classifies a TimeoutError as timed_out and states the ms", async () => {
@@ -108,6 +111,7 @@ describe("buildServer", () => {
     const text = textOf(res);
     expect(text).toContain("timed out");
     expect(text).toContain("50");
+    expect(res.structuredContent).toBeUndefined();
   });
 
   it("returns isError for opencode prompts starting with '-' without calling exec", async () => {
