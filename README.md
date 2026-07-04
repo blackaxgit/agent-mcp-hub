@@ -97,6 +97,31 @@ For Docker Compose, put it in the `.env` file next to `docker-compose.yml`:
 MCP_AGENTS=codex,claude
 ```
 
+### Confirm before running an agent — `MCP_CONFIRM`
+
+Set `MCP_CONFIRM=1` (values `1`/`true`/`on`/`all`; default off) to require a
+confirmation before any agent tool — and `run_all` — actually spawns a CLI. The
+server sends a brief summary (agent · prompt · cwd · model) and waits: **accept**
+runs the agent, **decline** runs nothing and returns a terminal cancellation.
+
+This uses the standard MCP **elicitation** capability, so it is **client/IDE-agnostic** —
+it works with any MCP client that supports form elicitation (Claude Code, Cursor,
+VS Code, Zed, Windsurf, custom SDK clients, …); the gate keys on the protocol
+capability, never a product name. Clients that don't support elicitation — and the
+stateless HTTP transport — transparently run without a prompt (no hang, no error).
+
+```json
+{
+  "mcpServers": {
+    "agent-hub": {
+      "command": "npx",
+      "args": ["-y", "agent-mcp-hub"],
+      "env": { "MCP_CONFIRM": "1" }
+    }
+  }
+}
+```
+
 ## Run with Docker
 
 Build and start the server (HTTP transport) with Docker Compose:
