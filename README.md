@@ -89,6 +89,22 @@ docker compose up -d --build
 The server listens on `http://localhost:3919/mcp`; health check is at
 `http://localhost:3919/healthz`.
 
+### Prebuilt image (GHCR)
+
+Publishing a GitHub Release builds and pushes the image to the GitHub Container
+Registry (`.github/workflows/release.yml`). The package is **private** (it
+inherits the repository's visibility), so pull it with a token that has
+`read:packages`:
+
+```bash
+echo "$GITHUB_TOKEN" | docker login ghcr.io -u blackaxgit --password-stdin
+docker pull ghcr.io/blackaxgit/agent-mcp-hub:latest   # or :<version>
+```
+
+The release tag must match `package.json`'s version, and the workflow
+smoke-tests the image against `/healthz` before publishing, so a broken image
+is never pushed. (Single-arch `linux/amd64`, built on the self-hosted runner.)
+
 Point an MCP client at it via `mcp.json`:
 
 ```json
