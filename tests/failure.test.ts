@@ -315,3 +315,91 @@ describe("classifyFailure — false positives & precedence (R10)", () => {
     expect(c.code).not.toBe("not_authenticated");
   });
 });
+
+describe("classifyFailure — mutation-killing message pins (R10)", () => {
+  it("cursor not_authenticated pins agent name, 'not authenticated', login command, and cause snippet", () => {
+    const c = classifyFailure(cursor, { result: res("Press any key to sign in", "", 1) });
+    expect(c.code).toBe("not_authenticated");
+    expect(c.message).toContain("cursor");
+    expect(c.message).toContain("not authenticated");
+    expect(c.message).toContain("cursor-agent login");
+    expect(c.message).toContain("Press any key to sign in");
+  });
+
+  it("codex not_authenticated pins agent name, 'not authenticated', login command, OPENAI_API_KEY, and cause snippet", () => {
+    const c = classifyFailure(codex, { result: res("Error: set OPENAI_API_KEY", "", 1) });
+    expect(c.code).toBe("not_authenticated");
+    expect(c.message).toContain("codex");
+    expect(c.message).toContain("not authenticated");
+    expect(c.message).toContain("codex login");
+    expect(c.message).toContain("OPENAI_API_KEY");
+    expect(c.message).toContain("set OPENAI_API_KEY");
+  });
+
+  it("not_configured for codex pins 'not configured', login command, and 'or set OPENAI_API_KEY'", () => {
+    const c = classifyFailure(codex, { result: res("no default model configured", "", 1) });
+    expect(c.code).toBe("not_configured");
+    expect(c.message).toContain("not configured");
+    expect(c.message).toContain("codex login");
+    expect(c.message).toContain("or set OPENAI_API_KEY");
+  });
+
+  it("not_configured for opencode pins 'not configured' and login command but NOT 'or set'", () => {
+    const c = classifyFailure(opencode, { result: res("no default model configured", "", 1) });
+    expect(c.code).toBe("not_configured");
+    expect(c.message).toContain("not configured");
+    expect(c.message).toContain("opencode auth login");
+    expect(c.message).not.toContain("or set");
+  });
+
+  it("TimeoutError pins 'timed out' and the exact ms value", () => {
+    const c = classifyFailure(codex, { error: new TimeoutError("x timed out after 50ms", 50) });
+    expect(c.code).toBe("timed_out");
+    expect(c.message).toContain("timed out");
+    expect(c.message).toContain("50ms");
+  });
+
+  it("OutputLimitError pins the exact maxOutputBytes and 'output limit exceeded'", () => {
+    const c = classifyFailure(codex, {
+      error: new OutputLimitError('"codex" exceeded output limit of 4096 bytes', 4096),
+    });
+    expect(c.code).toBe("output_limit");
+    expect(c.message).toContain("4096");
+    expect(c.message).toContain("output limit exceeded");
+  });
+
+  it("'insufficient_quota: billing' exit 1 is tool_failure with no auth remediation", () => {
+    const c = classifyFailure(codex, {
+      result: res("insufficient_quota: billing hard limit", "", 1),
+    });
+    expect(c.code).toBe("tool_failure");
+    expect(c.message).not.toContain("codex login");
+    expect(c.message).not.toContain("OPENAI_API_KEY");
+  });
+
+  it("bare 'HTTP 401 GET /x' is tool_failure with no auth remediation", () => {
+    const c = classifyFailure(codex, { result: res("HTTP 401 GET /x", "", 1) });
+    expect(c.code).toBe("tool_failure");
+    expect(c.message).not.toContain("login");
+    expect(c.message).not.toContain("OPENAI_API_KEY");
+  });
+
+  it("long cause line is clipped with ellipsis and bounded in length", () => {
+    const longCause = "not logged in: " + "a".repeat(500);
+    const c = classifyFailure(cursor, { result: res(longCause, "", 1) });
+    expect(c.code).toBe("not_authenticated");
+    expect(c.message).toContain("…");
+    const causeLine = c.message.split("\n")[1];
+    expect(causeLine.length).toBeLessThanOrEqual(161);
+    expect(causeLine.endsWith("…")).toBe(true);
+  });
+
+  it("long stderr tail is clipped with leading ellipsis and bounded in length", () => {
+    const longStderr = "x".repeat(2000);
+    const c = classifyFailure(codex, { result: res(longStderr, "", 2) });
+    expect(c.code).toBe("tool_failure");
+    const body = c.message.split("\n").slice(1).join("\n");
+    expect(body.startsWith("…")).toBe(true);
+    expect(body.length).toBeLessThanOrEqual(501);
+  });
+});
