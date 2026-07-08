@@ -85,10 +85,14 @@ Install and authenticate the CLIs you want to use (any subset works):
 
 ## Install
 
+The package is **not yet published to npm**, so install straight from GitHub
+(`npx` clones the repo and the `prepare` script builds it automatically). Once
+it is published, the plain `agent-mcp-hub` name will work in its place.
+
 ### Claude Code
 
 ```bash
-claude mcp add agent-hub -- npx -y agent-mcp-hub
+claude mcp add agent-hub -- npx -y github:blackaxgit/agent-mcp-hub
 ```
 
 ### Cursor / generic mcp.json
@@ -98,7 +102,7 @@ claude mcp add agent-hub -- npx -y agent-mcp-hub
   "mcpServers": {
     "agent-hub": {
       "command": "npx",
-      "args": ["-y", "agent-mcp-hub"]
+      "args": ["-y", "github:blackaxgit/agent-mcp-hub"]
     }
   }
 }
@@ -119,7 +123,7 @@ For stdio, set it in the client's `mcp.json`:
   "mcpServers": {
     "agent-hub": {
       "command": "npx",
-      "args": ["-y", "agent-mcp-hub"],
+      "args": ["-y", "github:blackaxgit/agent-mcp-hub"],
       "env": { "MCP_AGENTS": "codex,claude" }
     }
   }
@@ -150,7 +154,7 @@ stateless HTTP transport — transparently run without a prompt (no hang, no err
   "mcpServers": {
     "agent-hub": {
       "command": "npx",
-      "args": ["-y", "agent-mcp-hub"],
+      "args": ["-y", "github:blackaxgit/agent-mcp-hub"],
       "env": { "MCP_CONFIRM": "1" }
     }
   }
@@ -195,6 +199,18 @@ docker compose up -d --build
 
 The server listens on `http://localhost:3919/mcp`; health check is at
 `http://localhost:3919/healthz`.
+
+**`INSTALL_CURSOR`** (build arg, default `true`) — whether the image installs
+the cursor CLI via the vendor's install script. Set it in the `.env` file next
+to `docker-compose.yml`:
+
+```bash
+INSTALL_CURSOR=false
+```
+
+Set `false` behind TLS-intercepting corporate proxies (where the installer's
+download fails, see [Troubleshooting](#troubleshooting)) or to opt out of the
+unpinned vendor install script entirely.
 
 ### Prebuilt image (GHCR)
 
@@ -259,7 +275,7 @@ claude mcp add --transport http agent-hub http://localhost:3919/mcp
   interface (which the container does). See Security below.
 
 **Zero-config alternative — stdio (recommended for simple local use):** skip the
-container and token entirely. `npx agent-mcp-hub` runs over stdio with no HTTP
+container and token entirely. `npx -y github:blackaxgit/agent-mcp-hub` runs over stdio with no HTTP
 endpoint, so there's no `MCP_TOKEN` and the CLIs use your host logins directly —
 the codex-mcp-server model. See [Install](#install).
 
@@ -274,9 +290,20 @@ from non-loopback Origins get 403 (DNS-rebinding guard; extend via
 `MCP_ALLOWED_ORIGINS`). Set `MCP_TOKEN` to require
 `Authorization: Bearer <token>` on every call — mandatory before exposing the
 port beyond this host (plus TLS via a reverse proxy). The cursor CLI installs
-via the vendor's `curl | bash` script (no published checksums); opt out with
-`docker build --build-arg INSTALL_CURSOR=false .`
+via the vendor's install script (no published checksums); opt out with
+`INSTALL_CURSOR=false` in `.env` (or `docker build --build-arg INSTALL_CURSOR=false .`).
 
+### Troubleshooting
+
+- **Docker build fails installing cursor behind a corporate proxy** — symptom:
+  `curl: (60) SSL certificate problem: self-signed certificate in certificate
+  chain` during the `INSTALL_CURSOR` build step. A TLS-intercepting proxy breaks
+  the installer's download; the build now fails loudly instead of silently
+  producing an image without cursor-agent. Fix: set `INSTALL_CURSOR=false` in
+  `.env` (skips cursor), or inject your proxy's CA certificate into the build.
+- **`claude` tool returns `not_authenticated` in the container on macOS** — the
+  Keychain-stored OAuth login can't be mounted; set `ANTHROPIC_API_KEY`. See
+  the auth model notes above.
 
 ## Development
 
