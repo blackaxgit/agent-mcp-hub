@@ -10,11 +10,17 @@
 #     can execute code. The container binds 0.0.0.0 (to be reachable via the
 #     published port), so the fail-closed server requires it.
 #
-# Prefer no token/container at all? Run stdio: `npx agent-mcp-hub` (the
-# codex-mcp-server model — no HTTP endpoint, no token, CLIs use host logins).
+# Prefer no token/container at all? Run stdio: `npx -y github:blackaxgit/agent-mcp-hub`
+# (the codex-mcp-server model — no HTTP endpoint, no token, CLIs use host logins).
 services:
   agent-mcp-hub:
-    build: .
+    build:
+      context: .
+      args:
+        # INSTALL_CURSOR=false in .env skips the cursor CLI install — needed
+        # behind TLS-intercepting proxies where the vendor installer's download
+        # fails, or to opt out of the unpinned vendor install script.
+        INSTALL_CURSOR: ${INSTALL_CURSOR:-true}
     image: agent-mcp-hub:${APP_VERSION:-latest}
     ports:
       # Loopback-only publish: the /mcp endpoint can spawn coding agents, so
