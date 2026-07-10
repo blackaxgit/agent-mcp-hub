@@ -10,9 +10,3 @@ docs/
 coverage/
 .stryker-tmp/
 reports/
-
-# Proxy CA certificates are environment-specific — never commit them.
-# certs/ itself is tracked (README + .gitkeep) so the Dockerfile COPY always resolves.
-certs/*
-!certs/.gitkeep
-!certs/README.md

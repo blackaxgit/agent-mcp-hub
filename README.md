@@ -3,6 +3,12 @@
 One MCP server that bridges multiple CLI coding agents — **Codex**, **Cursor**,
 **OpenCode**, and **Claude** — into any MCP client.
 
+> **Breaking change (v0.5.0):** The Docker image, HTTP transport, and the
+> separate HTTP binary have been removed. The hub now ships stdio-only.
+> A containerised server cannot see the caller's repository path or reuse the
+> caller's CLI logins, so the Docker deployment broke the product contract on
+> both halves.
+
 ## Tools
 
 | Tool | Description |
@@ -68,8 +74,8 @@ worktree), optional `model`, `timeoutMs`.
   "arguments": {
     "runner": "codex",
     "reviewer": "claude",
-    "prompt": "Add a health check endpoint",
-    "cwd": "/workspace"
+    "prompt": "Add retry with exponential backoff to the API client",
+    "cwd": "/Users/you/projects/my-app"
   }
 }
 ```
@@ -81,7 +87,7 @@ Install and authenticate the CLIs you want to use (any subset works):
 - Codex: `npm i -g @openai/codex && codex login`
 - Cursor: `curl https://cursor.com/install -fsS | bash && cursor-agent login`
 - OpenCode: `npm i -g opencode-ai && opencode auth login`
-- Claude Code: `npm i -g @anthropic-ai/claude-code && claude` (first run logs in; containers on macOS use `ANTHROPIC_API_KEY`)
+- Claude Code: `npm i -g @anthropic-ai/claude-code && claude` (first run logs in)
 
 ## Install
 
@@ -130,12 +136,6 @@ For stdio, set it in the client's `mcp.json`:
 }
 ```
 
-For Docker Compose, put it in the `.env` file next to `docker-compose.yml`:
-
-```bash
-MCP_AGENTS=codex,claude
-```
-
 ### Confirm before running an agent — `MCP_CONFIRM`
 
 Set `MCP_CONFIRM=1` (values `1`/`true`/`on`/`all`; default off) to require a
@@ -146,8 +146,8 @@ runs the agent, **decline** runs nothing and returns a terminal cancellation.
 This uses the standard MCP **elicitation** capability, so it is **client/IDE-agnostic** —
 it works with any MCP client that supports form elicitation (Claude Code, Cursor,
 VS Code, Zed, Windsurf, custom SDK clients, …); the gate keys on the protocol
-capability, never a product name. Clients that don't support elicitation — and the
-stateless HTTP transport — transparently run without a prompt (no hang, no error).
+capability, never a product name. Clients that don't support elicitation
+transparently run without a prompt (no hang, no error).
 
 ```json
 {
@@ -183,127 +183,10 @@ those can be idle-killed at 5 min — raise `idleTimeoutMs` / `MCP_AGENT_IDLE_TI
 for such tasks, or rely on the total cap.
 
 While an agent runs, the hub emits MCP **progress notifications** to clients that
-request them (`_meta.progressToken`) — live feedback and a keep-alive for
-HTTP/remote clients. Note: on **Claude Code (stdio)** the per-server request
-`timeout` in `.mcp.json` (or the `MCP_TOOL_TIMEOUT` env var it honors) is a hard
-wall-clock that progress does **not** reset (default ~28h) — raise it if you
-lowered it below your longest run.
-
-## Run with Docker
-
-Build and start the server (HTTP transport) with Docker Compose:
-
-```bash
-docker compose up -d --build
-```
-
-The server listens on `http://localhost:3919/mcp`; health check is at
-`http://localhost:3919/healthz`.
-
-**`INSTALL_CURSOR`** (build arg, default `true`) — whether the image installs
-the cursor CLI via the vendor's install script. Set it in the `.env` file next
-to `docker-compose.yml`:
-
-```bash
-INSTALL_CURSOR=false
-```
-
-Set `false` behind TLS-intercepting corporate proxies (where the installer's
-download fails, see [Troubleshooting](#troubleshooting)) or to opt out of the
-unpinned vendor install script entirely.
-
-### Prebuilt image (GHCR)
-
-Publishing a GitHub Release builds and pushes the image to the GitHub Container
-Registry (`.github/workflows/release.yml`). The package is **private** (it
-inherits the repository's visibility), so pull it with a token that has
-`read:packages`:
-
-```bash
-echo "$GITHUB_TOKEN" | docker login ghcr.io -u blackaxgit --password-stdin
-docker pull ghcr.io/blackaxgit/agent-mcp-hub:latest   # or :<version>
-```
-
-The release tag must match `package.json`'s version, and the workflow
-smoke-tests the image against `/healthz` before publishing, so a broken image
-is never pushed. (Single-arch `linux/amd64`, built on the self-hosted runner.)
-
-Point an MCP client at it via `mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "agent-hub": {
-      "url": "http://localhost:3919/mcp"
-    }
-  }
-}
-```
-
-Or with Claude Code:
-
-```bash
-claude mcp add --transport http agent-hub http://localhost:3919/mcp
-```
-
-**Auth model — two separate things, don't conflate them:**
-
-- **CLI credentials.** The wrapped CLIs authenticate _themselves_ from their own
-  stored logins — the same model as codex-mcp-server. A fresh container is logged
-  out, so `docker-compose.yml` **mounts your host login dirs read-only** to reuse
-  them. Which path each CLI needs:
-  - **codex / opencode** — file-based logins (`~/.codex`, `~/.config/opencode` +
-    `~/.local/share/opencode`); the mounts carry them, no API key.
-  - **cursor** — NOT mounted. Its binary and login live together in
-    `~/.local/share/cursor-agent`, so mounting that dir shadows the image's
-    cursor-agent (dangling symlink → "not found"). Use `CURSOR_API_KEY`, or run
-    `cursor-agent login` inside the container once.
-  - **claude** — on **macOS** the OAuth token lives in the **Keychain**, not
-    `~/.claude`, so the mount carries config but not the login: set
-    `ANTHROPIC_API_KEY` (compose has it enabled). On **Linux**, claude stores
-    `~/.claude/.credentials.json` and the mount works. Note: an
-    `ANTHROPIC_API_KEY` bills pay-per-token via the API, separate from a Claude
-    Pro/Max subscription.
-  - Caveats: mounts are read-only, so if a CLI must _refresh_ its token
-    mid-session and fails, drop `:ro` for that mount or set its API key. **Comment
-    out the mount for any CLI you don't use** — a missing source dir is silently
-    auto-created **empty**, making that CLI act logged-out. On **native Linux**,
-    host cred files owned by your uid may be unreadable to the container's uid
-    1001 — then use the API-key fallbacks (macOS Docker Desktop mediates uids).
-- **`MCP_TOKEN` is NOT a CLI credential** — it guards the HTTP `/mcp` endpoint
-  (which can execute code) and is required whenever the server binds a network
-  interface (which the container does). See Security below.
-
-**Zero-config alternative — stdio (recommended for simple local use):** skip the
-container and token entirely. `npx -y github:blackaxgit/agent-mcp-hub` runs over stdio with no HTTP
-endpoint, so there's no `MCP_TOKEN` and the CLIs use your host logins directly —
-the codex-mcp-server model. See [Install](#install).
-
-**Workspace:** mount the project you want the agents to work on into `/workspace`
-(the `./workspace` bind mount is preconfigured) and pass `cwd: "/workspace"` in
-your tool calls.
-
-**Security:** the `/mcp` endpoint can spawn coding agents, so treat it like a
-shell. The server binds `127.0.0.1` by default (`HOST=0.0.0.0` only inside the
-container) and compose publishes the port on loopback only. Browser requests
-from non-loopback Origins get 403 (DNS-rebinding guard; extend via
-`MCP_ALLOWED_ORIGINS`). Set `MCP_TOKEN` to require
-`Authorization: Bearer <token>` on every call — mandatory before exposing the
-port beyond this host (plus TLS via a reverse proxy). The cursor CLI installs
-via the vendor's install script (no published checksums); opt out with
-`INSTALL_CURSOR=false` in `.env` (or `docker build --build-arg INSTALL_CURSOR=false .`).
-
-### Troubleshooting
-
-- **Docker build fails installing cursor behind a corporate proxy** — symptom:
-  `curl: (60) SSL certificate problem: self-signed certificate in certificate
-  chain` during the `INSTALL_CURSOR` build step. A TLS-intercepting proxy breaks
-  the installer's download; the build now fails loudly instead of silently
-  producing an image without cursor-agent. Fix: set `INSTALL_CURSOR=false` in
-  `.env` (skips cursor), or inject your proxy's CA certificate into the build.
-- **`claude` tool returns `not_authenticated` in the container on macOS** — the
-  Keychain-stored OAuth login can't be mounted; set `ANTHROPIC_API_KEY`. See
-  the auth model notes above.
+request them (`_meta.progressToken`) — live feedback during long runs. Note: on
+**Claude Code (stdio)** the per-server request `timeout` in `.mcp.json` (or the
+`MCP_TOOL_TIMEOUT` env var it honors) is a hard wall-clock that progress does
+**not** reset (default ~28h) — raise it if you lowered it below your longest run.
 
 ## Development
 
@@ -318,5 +201,5 @@ npm run build      # emit dist/
 ## Architecture
 
 Pure adapters (`src/adapters/*` — prompt → `{args, stdin?}`, no I/O) → one
-subprocess boundary (`src/exec.ts`) → MCP wiring (`src/server.ts`). Adding an
-agent = one ~15-line adapter file + one line in `src/registry.ts`.
+subprocess boundary (`src/exec.ts`) → MCP stdio server (`src/server.ts`). Adding
+an agent = one ~15-line adapter file + one line in `src/registry.ts`.

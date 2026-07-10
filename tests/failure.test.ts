@@ -24,7 +24,7 @@ describe("classifyFailure — invalid cwd", () => {
     const c = classifyFailure(adapter, { error: new InvalidCwdError("/nope/here") });
     expect(c.message).toContain("/nope/here");
     expect(c.message).not.toMatch(/not found on PATH/i);
-    expect(c.message).toMatch(/mounted volumes/i);
+    expect(c.message).toMatch(/Fix:.*resolvable/i);
   });
 
   it("still classifies a genuine spawn failure as not_installed", () => {

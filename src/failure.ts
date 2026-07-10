@@ -144,8 +144,8 @@ function classifyError(adapter: AdapterMeta, error: unknown): FailureClassificat
       message:
         `${adapter.name} failed: cwd is not a directory this server can see.\n` +
         `${error.cwd}\n` +
-        `Fix: pass a path that exists for the server process. A containerised server ` +
-        `only sees its mounted volumes, not the host filesystem.`,
+        `Fix: pass an absolute path that exists on this machine — the path must be ` +
+        `resolvable by the server process itself.`,
     };
   }
   if (error instanceof SpawnError) {

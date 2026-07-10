@@ -162,7 +162,7 @@ export function buildServer(
     if (!confirmEnabled()) return true;
     const caps = server.server.getClientCapabilities();
     // Guard on .form: the SDK normalizes a client's elicitation:{} to {form:{}};
-    // URL-only / stateless-HTTP / non-elicit clients lack it and must degrade.
+    // clients that do not advertise it lack the capability and must degrade.
     if (caps?.elicitation?.form === undefined) return true;
     try {
       const params: ElicitRequestFormParams = {

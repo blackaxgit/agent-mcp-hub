@@ -1,12 +1,11 @@
 {
   "name": "agent-mcp-hub",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "One MCP server bridging the Codex, Cursor, OpenCode, and Claude CLI agents",
   "license": "MIT",
   "type": "module",
   "bin": {
-    "agent-mcp-hub": "dist/index.js",
-    "agent-mcp-hub-http": "dist/http.js"
+    "agent-mcp-hub": "dist/index.js"
   },
   "files": [
     "dist"
