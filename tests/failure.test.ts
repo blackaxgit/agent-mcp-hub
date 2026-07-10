@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { classifyFailure, normalize, stripAnsi } from "../src/failure.js";
 import {
+  AgentStalledError,
   InvalidCwdError,
   OutputLimitError,
   ServerBusyError,
@@ -479,5 +480,71 @@ describe("classifyFailure — mutation-killing message pins (R10)", () => {
     const body = c.message.split("\n").slice(1).join("\n");
     expect(body.startsWith("…")).toBe(true);
     expect(body.length).toBeLessThanOrEqual(501);
+  });
+});
+
+describe("classifyFailure — AgentStalledError -> stream_stalled", () => {
+  it("codes as stream_stalled, not timed_out or tool_failure", () => {
+    const c = classifyFailure(codex, {
+      error: new AgentStalledError(
+        "stalled",
+        "Connection lost, reconnecting to https://x.y (attempt 1)...",
+        3,
+      ),
+    });
+    expect(c.code).toBe("stream_stalled");
+    expect(c.code).not.toBe("timed_out");
+    expect(c.code).not.toBe("tool_failure");
+  });
+
+  it("names the agent and quotes the matched signature line", () => {
+    const sig =
+      "Connection lost, reconnecting to https://agentn.global.api5.cursor.sh (attempt 1)...";
+    const c = classifyFailure(cursor, {
+      error: new AgentStalledError("stalled", sig, 3),
+    });
+    expect(c.message).toContain("cursor");
+    expect(c.message).toContain(sig);
+  });
+
+  it("says the agent cannot complete a run in this environment", () => {
+    const c = classifyFailure(codex, {
+      error: new AgentStalledError("stalled", "Retry attempt 1...", 2),
+    });
+    expect(c.message).toMatch(/cannot complete a run in this environment/i);
+  });
+
+  it("says to treat the agent as unavailable", () => {
+    const c = classifyFailure(codex, {
+      error: new AgentStalledError("stalled", "Retry attempt 1...", 2),
+    });
+    expect(c.message).toMatch(/treat.*unavailable/i);
+    expect(c.message).toContain("unavailable");
+  });
+
+  it("does NOT suggest raising timeoutMs", () => {
+    const c = classifyFailure(codex, {
+      error: new AgentStalledError("stalled", "Retry attempt 1...", 2),
+    });
+    expect(c.message).not.toMatch(/raise .*timeoutMs/i);
+    expect(c.message).not.toMatch(/raise.*timeout/i);
+    expect(c.message).not.toContain("MCP_AGENT_TIMEOUT_MS");
+  });
+
+  it("matches BEFORE TimeoutError in precedence", () => {
+    // AgentStalledError must be classified as stream_stalled, never as timed_out.
+    const c = classifyFailure(codex, {
+      error: new AgentStalledError("stalled", "Retry attempt 1...", 2),
+    });
+    expect(c.code).toBe("stream_stalled");
+  });
+
+  it("carries strikes count on the error", () => {
+    const err = new AgentStalledError("stalled", "Retry attempt 1...", 5);
+    expect(err.strikes).toBe(5);
+    expect(err.signature).toBe("Retry attempt 1...");
+    expect(err.code).toBe("stream_stalled");
+    expect(err).toBeInstanceOf(AgentStalledError);
+    expect(err).toBeInstanceOf(Error);
   });
 });

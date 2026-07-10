@@ -54,6 +54,7 @@ async function runAdapter(
       idleTimeoutMs: params.idleTimeoutMs,
       input: invocation.stdin,
       onActivity,
+      stallSignatures: adapter.stallSignatures,
     });
     audit(result.exitCode);
     return result;

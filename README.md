@@ -40,6 +40,7 @@ class and the exact fix:
 | `not_authenticated` | `codex login` · `cursor-agent login` · `opencode auth login` · `claude` → `/login` (or set the matching API key) |
 | `not_configured` | set a model/provider in the CLI's config |
 | `timed_out` | raise `timeoutMs`, or check the agent/model is responsive |
+| `stream_stalled` | the agent reached the network but its stream keeps dropping (e.g. `cursor` behind a TLS-intercepting proxy) — treat that agent as unavailable; raising `timeoutMs` will not help |
 | `server_busy` | retry shortly (upstream rate-limit, or the local agent-spawn queue is full) |
 | `tool_failure` | generic non-zero exit — the message includes `(exit N)` and a trimmed output tail |
 

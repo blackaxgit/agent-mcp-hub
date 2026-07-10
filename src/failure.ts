@@ -1,4 +1,5 @@
 import {
+  AgentStalledError,
   InvalidCwdError,
   OutputLimitError,
   ServerBusyError,
@@ -6,23 +7,9 @@ import {
   TimeoutError,
   type ExecResult,
 } from "./exec.js";
+import { stripAnsi } from "./ansi.js";
 
-/**
- * Canonical zero-dep `ansi-regex` pattern source. Matches 7-bit `ESC[…`, 8-bit
- * CSI (``), OSC (`ESC]…BEL`), private `?`/`#` params, SGR, and cursor
- * moves. Built with the `g` flag so `.replace` clears every occurrence. Kept as
- * a string so the source is auditable against upstream.
- */
-const ANSI_PATTERN =
-  "[\\u001B\\u009B][[\\]()#;?]*(?:(?:(?:(?:;[-a-zA-Z\\d\\/#&.:=?%@~_]+)*|[a-zA-Z\\d]+(?:;[-a-zA-Z\\d\\/#&.:=?%@~_]*)*)?\\u0007)|(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PR-TZcf-nq-uy=><~]))";
-
-/**
- * Remove ANSI escape sequences and collapse carriage-return spinner runs so the
- * text is safe to embed in a plain MCP message. Pure: no I/O.
- */
-export function stripAnsi(s: string): string {
-  return s.replace(new RegExp(ANSI_PATTERN, "g"), "").replace(/\r+/g, "");
-}
+export { stripAnsi } from "./ansi.js";
 
 /** Lowercased, ANSI-free view of `s` used for phrase matching (never shown). */
 export function normalize(s: string): string {
@@ -36,6 +23,7 @@ export type FailureCode =
   | "not_configured"
   | "timed_out"
   | "output_limit"
+  | "stream_stalled"
   | "server_busy"
   | "tool_failure";
 
@@ -164,6 +152,22 @@ function classifyError(adapter: AdapterMeta, error: unknown): FailureClassificat
         `${adapter.name} failed: server busy.\n` +
         `The agent pool/queue is full.\n` +
         `Fix: retry shortly.`,
+    };
+  }
+  if (error instanceof AgentStalledError) {
+    // Matched BEFORE TimeoutError: a stalled agent is a network-path problem, not
+    // a "wait longer" problem. The message names the agent, quotes the matched
+    // signature, points at the common cause (TLS-intercepting proxy), and tells
+    // the caller to treat the agent as unavailable. Never suggests raising the
+    // timeout — that is what the timed_out message wrongly says.
+    return {
+      code: "stream_stalled",
+      message:
+        `${adapter.name} failed: stream stalled.\n` +
+        `Detected diagnostic reconnect pattern: "${error.signature}" (strike ${error.strikes}).\n` +
+        `The agent cannot complete a run in this environment — common cause is a TLS-intercepting ` +
+        `proxy or a network path that drops the agent's backend connection.\n` +
+        `Treat ${adapter.name} as unavailable until the network path is fixed.`,
     };
   }
   if (error instanceof TimeoutError) {

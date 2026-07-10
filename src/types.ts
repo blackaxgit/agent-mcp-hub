@@ -36,4 +36,10 @@ export interface AgentAdapter {
   readonly probeRequiresOutput?: boolean;
   /** Pure function: prompt + options -> invocation. No I/O allowed here. */
   buildInvocation(prompt: string, options?: AgentRunOptions): AgentInvocation;
+  /**
+   * Line patterns the CLI prints on its DIAGNOSTIC stream (stderr) when it cannot reach its
+   * backend. Matched against stderr ONLY: the model's answer arrives on stdout, so a model
+   * that quotes one of these phrases can never trip the detector.
+   */
+  readonly stallSignatures?: readonly RegExp[];
 }

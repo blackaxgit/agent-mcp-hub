@@ -12,6 +12,13 @@ export const cursorAdapter: AgentAdapter = {
   // prints prose ("gpt-5.3-codex-low - Codex 5.3 Low"), not bare ids, so the
   // identifier heuristic would find nothing and condemn a healthy CLI.
   probeArgs: ["models"],
+  // Line-anchored on purpose: a loose /retry attempt \d+/i would also match that
+  // phrase appearing mid-line in output from a build script the agent runs.
+  stallSignatures: [
+    /^connection lost, reconnecting to \S+ \(attempt \d+\)\.*$/i,
+    /^retry attempt \d+\.*$/i,
+    /^retriable\s*error:\s*connection stalled\b/i,
+  ],
   buildInvocation(prompt: string, options: AgentRunOptions = {}): AgentInvocation {
     // --trust: cursor-agent otherwise blocks on an interactive "Workspace Trust
     // Required" prompt in any directory it has not seen before, which for a server

@@ -49,4 +49,33 @@ describe("cursorAdapter", () => {
     expect(cursorAdapter.probeArgs).toEqual(["models"]);
     expect(cursorAdapter.probeRequiresOutput).toBeFalsy();
   });
+
+  it("declares stallSignatures for the observed cursor-agent reconnect phrases", () => {
+    expect(cursorAdapter.stallSignatures).toBeDefined();
+    expect(Array.isArray(cursorAdapter.stallSignatures)).toBe(true);
+    const sigs = cursorAdapter.stallSignatures!;
+    expect(sigs.length).toBe(3);
+
+    const connectLost =
+      "Connection lost, reconnecting to https://agentn.global.api5.cursor.sh (attempt 1)...";
+    const retry = "Retry attempt 1...";
+    const retriable = "RetriableError: Connection stalled";
+
+    // All three verbatim lines must match.
+    expect(sigs[0].test(connectLost)).toBe(true);
+    expect(sigs[1].test(retry)).toBe(true);
+    expect(sigs[2].test(retriable)).toBe(true);
+  });
+
+  it("does NOT match benign lines that contain similar words", () => {
+    expect(cursorAdapter.stallSignatures).toBeDefined();
+    const sigs = cursorAdapter.stallSignatures!;
+
+    const benign1 = "Reconnecting the debugger to the test runner";
+    const benign2 = "  see docs: retry attempt limits";
+
+    const allMatch = (line: string) => sigs.some((s) => s.test(line));
+    expect(allMatch(benign1)).toBe(false);
+    expect(allMatch(benign2)).toBe(false);
+  });
 });
