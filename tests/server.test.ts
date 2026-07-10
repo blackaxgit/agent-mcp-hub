@@ -5,13 +5,16 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { SpawnError, TimeoutError, OutputLimitError, type Exec } from "../src/exec.js";
-import { allAdapters, enabledAdapters } from "../src/registry.js";
+import { allAdapters, enabledAdapters, type ResolveBinary } from "../src/registry.js";
 import { buildServer } from "../src/server.js";
 
 const pkg = createRequire(import.meta.url)("../package.json") as { version: string };
 
-async function connectedClient(exec: Exec) {
-  const server = buildServer(allAdapters(), exec);
+/** Every binary resolves, so availability turns purely on the injected exec. */
+const allResolve: ResolveBinary = (b) => `/usr/local/bin/${b}`;
+
+async function connectedClient(exec: Exec, resolve: ResolveBinary = allResolve) {
+  const server = buildServer(allAdapters(), exec, resolve);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "test-client", version: "0.0.0" });
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
@@ -159,20 +162,53 @@ describe("buildServer", () => {
     expect(exec).not.toHaveBeenCalled();
   });
 
-  it("list_agents reports availability per adapter", async () => {
+  it("list_agents separates installed from usable and explains every failure", async () => {
     const exec: Exec = vi.fn(async (binary: string) => {
       if (binary === "codex") return { stdout: "1.0\n", stderr: "", exitCode: 0 };
       throw new Error("missing");
     });
+    // cursor-agent does not resolve; the rest do. So cursor is not installed, while
+    // opencode/claude are installed-but-unusable (their probe throws).
+    const resolve = (b: string) => (b === "cursor-agent" ? undefined : `/usr/local/bin/${b}`);
+    const client = await connectedClient(exec, resolve);
+    const res = await client.callTool({ name: "list_agents", arguments: {} });
+    const parsed = JSON.parse(textOf(res)) as Array<{
+      name: string;
+      installed: boolean;
+      usable: boolean;
+      available: boolean;
+      reason?: string;
+    }>;
+
+    expect(parsed.map((p) => p.name)).toEqual(["codex", "cursor", "opencode", "claude"]);
+    expect(parsed[0]).toEqual({ name: "codex", installed: true, usable: true, available: true });
+
+    const cursor = parsed[1]!;
+    expect(cursor).toMatchObject({ installed: false, usable: false, available: false });
+    expect(cursor.reason).toMatch(/not found on PATH/);
+
+    // The distinction that matters: present on disk, still cannot run.
+    for (const name of ["opencode", "claude"]) {
+      const entry = parsed.find((p) => p.name === name)!;
+      expect(entry).toMatchObject({ installed: true, usable: false, available: false });
+      expect(entry.reason).toBeTruthy();
+    }
+  });
+
+  it("list_agents marks a zero-exit probe unusable when it reports a fatal condition", async () => {
+    const exec: Exec = vi.fn(async () => ({
+      stdout: "codex-cli 0.142.5\n",
+      stderr: "WARNING: could not create PATH aliases: Read-only file system (os error 30)\n",
+      exitCode: 0,
+    }));
     const client = await connectedClient(exec);
     const res = await client.callTool({ name: "list_agents", arguments: {} });
-    const parsed = JSON.parse(textOf(res)) as Array<{ name: string; available: boolean }>;
-    expect(parsed).toEqual([
-      { name: "codex", available: true },
-      { name: "cursor", available: false },
-      { name: "opencode", available: false },
-      { name: "claude", available: false },
-    ]);
+    const parsed = JSON.parse(textOf(res)) as Array<{ name: string; usable: boolean }>;
+    expect(parsed.find((p) => p.name === "codex")).toMatchObject({
+      installed: true,
+      usable: false,
+      available: false,
+    });
   });
 
   it("advertises the package.json version to clients", async () => {
@@ -306,7 +342,7 @@ describe("run_all", () => {
     );
     expect(exec).toHaveBeenCalledWith(
       "cursor-agent",
-      ["-p", "--output-format", "text"],
+      ["-p", "--output-format", "text", "--trust"],
       expect.objectContaining({ cwd: "/tmp", timeoutMs: 1234, input: "p" }),
     );
     expect(exec).toHaveBeenCalledWith(
@@ -343,7 +379,7 @@ describe("run_all", () => {
     );
     expect(exec).toHaveBeenCalledWith(
       "cursor-agent",
-      ["-p", "--output-format", "text", "--model", "o3"],
+      ["-p", "--output-format", "text", "--trust", "--model", "o3"],
       expect.objectContaining({ cwd: undefined, timeoutMs: undefined, input: "compare" }),
     );
   });

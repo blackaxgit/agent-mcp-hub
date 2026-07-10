@@ -11,7 +11,7 @@ import {
 } from "./confirm.js";
 import { classifyFailure } from "./failure.js";
 import { isGitRepo, worktreeDirty, captureChange } from "./git.js";
-import { checkAvailability } from "./registry.js";
+import { checkAvailability, resolveOnPath, type ResolveBinary } from "./registry.js";
 import type { ElicitRequestFormParams } from "@modelcontextprotocol/sdk/types.js";
 import type { AgentAdapter } from "./types.js";
 
@@ -144,7 +144,13 @@ const agentInputSchema = {
     ),
 };
 
-export function buildServer(adapters: AgentAdapter[], exec: Exec = runCommand): McpServer {
+export function buildServer(
+  adapters: AgentAdapter[],
+  exec: Exec = runCommand,
+  // Injected alongside exec so list_agents stays testable without depending on
+  // which CLIs happen to be installed on the machine running the tests.
+  resolve: ResolveBinary = resolveOnPath,
+): McpServer {
   const server = new McpServer({ name: "agent-mcp-hub", version });
 
   /**
@@ -185,14 +191,17 @@ export function buildServer(adapters: AgentAdapter[], exec: Exec = runCommand): 
     "list_agents",
     {
       description:
-        "List the wrapped coding-agent CLIs and whether each is installed on PATH (probes each with `--version`; edits nothing). Read-only — call this first to choose an available agent before delegating.",
+        "List the wrapped coding-agent CLIs and whether each can actually run (edits nothing). " +
+        "Each entry reports `installed` (binary resolves on PATH with the exec bit) and `usable` " +
+        "(a probe succeeded), plus a `reason` when it cannot run; `available` mirrors `usable`. " +
+        "A CLI can be installed but unusable — codex exits 0 from `--version` even when its home " +
+        "is unwritable and no real run can succeed — so prefer `usable`. Read-only; call this " +
+        "first to choose an agent before delegating.",
       inputSchema: {},
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async () => {
-      const statuses = await Promise.all(
-        adapters.map(async (a) => ({ name: a.name, available: await checkAvailability(a, exec) })),
-      );
+      const statuses = await Promise.all(adapters.map((a) => checkAvailability(a, exec, resolve)));
       return { content: [{ type: "text", text: JSON.stringify(statuses, null, 2) }] };
     },
   );

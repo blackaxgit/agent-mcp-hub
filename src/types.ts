@@ -21,6 +21,19 @@ export interface AgentAdapter {
   readonly loginCommand: string;
   /** Env var carrying an API key fallback, when the CLI supports one. */
   readonly apiKeyEnv?: string;
+  /**
+   * Args for the availability probe. Defaults to ["--version"], which proves only
+   * that the binary starts — codex exits 0 from `--version` even when its home is
+   * unwritable and no real run can succeed. Prefer a command whose OUTPUT proves
+   * the CLI can work. There is no single such command across the CLIs: `opencode
+   * models` lists models, while `codex models` is not a subcommand at all.
+   */
+  readonly probeArgs?: string[];
+  /**
+   * When true, the probe must emit at least one identifier-shaped line, not merely
+   * exit 0 — a CLI can exit 0 while printing a banner or a "not logged in" notice.
+   */
+  readonly probeRequiresOutput?: boolean;
   /** Pure function: prompt + options -> invocation. No I/O allowed here. */
   buildInvocation(prompt: string, options?: AgentRunOptions): AgentInvocation;
 }
