@@ -15,6 +15,17 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl git tini \
  && rm -rf /var/lib/apt/lists/*
 
+# TLS-intercepting corporate proxies (e.g. Cloudflare Gateway) inject a self-signed
+# root into every chain, which breaks `npm install -g` and the cursor installer's
+# `curl https://cursor.com/install` with "self-signed certificate in certificate
+# chain". Drop the proxy's root CA into certs/ as a PEM file with a .crt extension
+# and it is trusted image-wide, by curl (system store) AND node (NODE_EXTRA_CA_CERTS
+# — curl does NOT read that variable, so the system store is the load-bearing half).
+# certs/ ships with only .gitkeep, so builds without a proxy are unaffected.
+COPY certs/ /usr/local/share/ca-certificates/extra/
+RUN update-ca-certificates
+ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+
 # Agent CLIs available on PATH for the server to spawn
 # @anthropic-ai/claude-code ships a native binary and needs Node 22+ (satisfied here).
 # Pinned for reproducible builds. Dependabot's docker ecosystem does not track npm -g

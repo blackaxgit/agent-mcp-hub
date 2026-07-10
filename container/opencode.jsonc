@@ -1,0 +1,32 @@
+// Container-side opencode config, selected via OPENCODE_CONFIG in docker-compose.yml.
+//
+// WHY THIS FILE EXISTS
+// The host config (~/.config/opencode/opencode.jsonc) points the mlx-local provider
+// at http://127.0.0.1:8080/v1 — correct on the host, where mlx-lm serves the model.
+// Inside the container, 127.0.0.1 is the CONTAINER, so opencode blocks forever
+// waiting on a server that isn't there and the MCP call dies on timeout (no error,
+// just a hang). This copy is identical except the baseURL reaches back to the host.
+//
+// Keep this in sync with ~/.config/opencode/opencode.jsonc; only baseURL differs.
+// host.docker.internal is provided automatically by Docker Desktop; the
+// extra_hosts entry in docker-compose.yml makes it work on native Linux too.
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "mlx-local/mlx-community/Ornith-1.0-35B-6bit",
+  "small_model": "mlx-local/mlx-community/Ornith-1.0-35B-6bit",
+  "provider": {
+    "mlx-local": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Local MLX (mlx-lm)",
+      "options": {
+        "baseURL": "http://host.docker.internal:8080/v1",
+        "apiKey": "local"
+      },
+      "models": {
+        "mlx-community/Ornith-1.0-35B-6bit": {
+          "name": "Ornith 1.0 35B (local)"
+        }
+      }
+    }
+  }
+}
