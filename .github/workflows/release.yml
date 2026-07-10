@@ -66,10 +66,10 @@ jobs:
             echo "PROXY_CA_PEM not set; skipping (no intercepting proxy assumed)"
           fi
 
-      # INSTALL_CURSOR=true publishes cursor-agent in the image. The vendor
-      # installer is unpinned and publishes no checksums, so this accepts that
-      # supply-chain risk deliberately; the Dockerfile downloads-then-executes
-      # (never curl|bash) and aborts the build on a failed download.
+      # INSTALL_CURSOR=true publishes cursor-agent in the image. The Dockerfile
+      # installs it from a pinned URL verified against a SHA256 — never the vendor's
+      # unchecksummed `curl https://cursor.com/install | bash` — so a substituted or
+      # truncated artifact aborts the build.
       - name: Build image
         env:
           VERSION: ${{ steps.ver.outputs.version }}

@@ -52,6 +52,14 @@ services:
       # 127.0.0.1:8080, which inside the container resolves to the container itself —
       # opencode then hangs until the MCP call times out. See container/opencode.jsonc.
       OPENCODE_CONFIG: /etc/agent-hub/opencode.jsonc
+      # Runtime proxy-CA injection, so ONE image works on every network instead of
+      # needing a rebuild per environment. Behind a TLS-intercepting proxy, drop the
+      # root CA in certs/ (mounted below) and set these in .env:
+      #   NODE_EXTRA_CA_CERTS=/etc/agent-hub/certs/proxy-ca.crt   # node CLIs (cursor, claude)
+      #   SSL_CERT_FILE=/etc/agent-hub/certs/proxy-ca.crt         # native CLIs (codex)
+      # Unset resolves to empty, which both runtimes ignore — correct off-proxy.
+      NODE_EXTRA_CA_CERTS: ${NODE_EXTRA_CA_CERTS:-}
+      SSL_CERT_FILE: ${SSL_CERT_FILE:-}
     volumes:
       # Directory the agents operate on (pass cwd: "/workspace" in tool calls).
       - ./workspace:/workspace
@@ -82,6 +90,9 @@ services:
       # Container-side opencode config (baseURL -> host.docker.internal). Selected
       # via OPENCODE_CONFIG above so the host's own config stays untouched.
       - ./container/opencode.jsonc:/etc/agent-hub/opencode.jsonc:ro
+      # Proxy CA(s), read at RUNTIME via NODE_EXTRA_CA_CERTS / SSL_CERT_FILE above.
+      # Ships as .gitkeep + README only, so this mount is an empty dir off-proxy.
+      - ./certs:/etc/agent-hub/certs:ro
     # Docker Desktop provides host.docker.internal automatically; this makes the
     # same name resolve on native Linux, where opencode must reach the host's mlx-lm.
     extra_hosts:
