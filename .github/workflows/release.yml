@@ -49,11 +49,32 @@ jobs:
       - name: Reclaim docker disk
         run: docker system prune -af
 
+      # The runner is self-hosted, so it may sit behind a TLS-intercepting proxy.
+      # The cursor installer's curl reads the SYSTEM trust store, so without the
+      # proxy CA the build aborts. Set the PROXY_CA_PEM repo secret to the proxy's
+      # root CA (PEM) to fix that; absent the secret this is a no-op, which is the
+      # correct behaviour on a runner with a clean chain. Read via env, not inline
+      # ${{ }}, to avoid workflow injection.
+      - name: Trust proxy CA (optional)
+        env:
+          PROXY_CA_PEM: ${{ secrets.PROXY_CA_PEM }}
+        run: |
+          if [ -n "${PROXY_CA_PEM:-}" ]; then
+            printf '%s\n' "$PROXY_CA_PEM" > certs/proxy-ca.crt
+            echo "wrote certs/proxy-ca.crt ($(wc -c < certs/proxy-ca.crt) bytes)"
+          else
+            echo "PROXY_CA_PEM not set; skipping (no intercepting proxy assumed)"
+          fi
+
+      # INSTALL_CURSOR=true publishes cursor-agent in the image. The vendor
+      # installer is unpinned and publishes no checksums, so this accepts that
+      # supply-chain risk deliberately; the Dockerfile downloads-then-executes
+      # (never curl|bash) and aborts the build on a failed download.
       - name: Build image
         env:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
-          docker build --build-arg INSTALL_CURSOR=false \
+          docker build --build-arg INSTALL_CURSOR=true \
             -t "$IMAGE:$VERSION" \
             -t "$IMAGE:latest" .
 
