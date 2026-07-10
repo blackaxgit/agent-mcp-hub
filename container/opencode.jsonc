@@ -20,13 +20,13 @@
       "name": "Local MLX (mlx-lm)",
       "options": {
         "baseURL": "http://host.docker.internal:8080/v1",
-        "apiKey": "local"
+        "apiKey": "local",
       },
       "models": {
         "mlx-community/Ornith-1.0-35B-6bit": {
-          "name": "Ornith 1.0 35B (local)"
-        }
-      }
-    }
-  }
+          "name": "Ornith 1.0 35B (local)",
+        },
+      },
+    },
+  },
 }

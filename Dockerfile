@@ -32,18 +32,44 @@ ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
 # installs — bump these manually (or move to a tracked manifest) when updating agents.
 RUN npm install -g @openai/codex@0.142.5 opencode-ai@1.17.13 @anthropic-ai/claude-code@2.1.199
 
+# cursor-agent, installed from a PINNED, checksum-verified release tarball rather
+# than the vendor's `curl https://cursor.com/install | bash`. That installer verifies
+# no checksums and pipes curl straight into tar, so a truncated or substituted
+# download can partially extract. Here it is download -> verify sha256 -> extract, so
+# a corrupted or swapped artifact aborts the build. This is the same integrity-pinned
+# pattern used for other vendor binaries in CI.
+#
+# Bump CURSOR_VERSION and BOTH hashes together. Obtain them with:
+#   curl -fsSL https://downloads.cursor.com/lab/<version>/linux/<arm64|x64>/agent-cli-package.tar.gz | sha256sum
+#
+# Opt out entirely with: docker build --build-arg INSTALL_CURSOR=false .
+ARG INSTALL_CURSOR=true
+ARG CURSOR_VERSION=2026.07.09-a3815c0
+ARG CURSOR_SHA256_ARM64=11b2b6801136a11a3632a4b1080ea3bfc7d97d0a68382be9ede1faf5333207fb
+ARG CURSOR_SHA256_X64=c7c1f32249cedb99cc20cd4eed1f9308dc2299a78c283bbc6efd6d658cd4977e
+ARG TARGETARCH
+RUN set -eu; \
+    if [ "$INSTALL_CURSOR" != "true" ]; then \
+      echo "INSTALL_CURSOR=false — skipping cursor-agent"; exit 0; \
+    fi; \
+    arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    case "$arch" in \
+      arm64) carch=arm64; sha="$CURSOR_SHA256_ARM64" ;; \
+      amd64) carch=x64;   sha="$CURSOR_SHA256_X64" ;; \
+      *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    url="https://downloads.cursor.com/lab/${CURSOR_VERSION}/linux/${carch}/agent-cli-package.tar.gz"; \
+    tmp="$(mktemp -d)"; \
+    curl --proto '=https' --tlsv1.2 -fsSL -o "$tmp/cursor.tgz" "$url"; \
+    echo "${sha}  $tmp/cursor.tgz" | sha256sum -c -; \
+    mkdir -p /opt/cursor-agent; \
+    tar --strip-components=1 -xzf "$tmp/cursor.tgz" -C /opt/cursor-agent; \
+    ln -sf /opt/cursor-agent/cursor-agent /usr/local/bin/cursor-agent; \
+    ln -sf /opt/cursor-agent/cursor-agent /usr/local/bin/agent; \
+    rm -rf "$tmp"
+
 RUN useradd -m -u 1001 mcp
 USER mcp
-# cursor-agent ships only via the vendor's install script (no checksums
-# published, so it cannot be integrity-pinned). Opt out of the curl|bash-style
-# supply-chain risk with: docker build --build-arg INSTALL_CURSOR=false .
-# Download-then-execute (not curl|bash): POSIX sh has no pipefail, so a piped
-# curl failure would feed bash an empty script and exit 0 — this form makes a
-# failed download or install abort the build. Known cause: TLS-intercepting
-# corporate proxies ("self-signed certificate in certificate chain") — build
-# with --build-arg INSTALL_CURSOR=false or provide the proxy CA certificate.
-ARG INSTALL_CURSOR=true
-RUN if [ "$INSTALL_CURSOR" = "true" ]; then curl -fsS -o /tmp/cursor-install.sh https://cursor.com/install && bash /tmp/cursor-install.sh && rm /tmp/cursor-install.sh; fi
 ENV PATH="/home/mcp/.local/bin:${PATH}"
 
 WORKDIR /app
