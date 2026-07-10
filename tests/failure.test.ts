@@ -1,12 +1,36 @@
 import { describe, expect, it } from "vitest";
 import { classifyFailure, normalize, stripAnsi } from "../src/failure.js";
 import {
+  InvalidCwdError,
   OutputLimitError,
   ServerBusyError,
   SpawnError,
   TimeoutError,
   type ExecResult,
 } from "../src/exec.js";
+
+describe("classifyFailure — invalid cwd", () => {
+  const adapter = { name: "codex", loginCommand: "codex login" };
+
+  // A missing cwd and a missing binary both surface as ENOENT from spawn. Reporting
+  // the former as "not installed" sent us hunting a healthy CLI for hours.
+  it("reports invalid_cwd, never not_installed", () => {
+    const c = classifyFailure(adapter, { error: new InvalidCwdError("/nope/here") });
+    expect(c.code).toBe("invalid_cwd");
+    expect(c.code).not.toBe("not_installed");
+  });
+
+  it("names the offending path and does not blame PATH", () => {
+    const c = classifyFailure(adapter, { error: new InvalidCwdError("/nope/here") });
+    expect(c.message).toContain("/nope/here");
+    expect(c.message).not.toMatch(/not found on PATH/i);
+    expect(c.message).toMatch(/mounted volumes/i);
+  });
+
+  it("still classifies a genuine spawn failure as not_installed", () => {
+    expect(classifyFailure(adapter, { error: new SpawnError("boom") }).code).toBe("not_installed");
+  });
+});
 
 const cursor = { name: "cursor", loginCommand: "cursor-agent login", apiKeyEnv: "CURSOR_API_KEY" };
 const codex = { name: "codex", loginCommand: "codex login", apiKeyEnv: "OPENAI_API_KEY" };

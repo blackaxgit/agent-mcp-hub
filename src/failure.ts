@@ -1,4 +1,5 @@
 import {
+  InvalidCwdError,
   OutputLimitError,
   ServerBusyError,
   SpawnError,
@@ -30,6 +31,7 @@ export function normalize(s: string): string {
 
 export type FailureCode =
   | "not_installed"
+  | "invalid_cwd"
   | "not_authenticated"
   | "not_configured"
   | "timed_out"
@@ -134,6 +136,18 @@ function remediation(adapter: AdapterMeta): string {
 }
 
 function classifyError(adapter: AdapterMeta, error: unknown): FailureClassification {
+  // Before SpawnError: a missing cwd also surfaces as ENOENT, and reporting it as
+  // "not installed" sends the caller after the wrong fault entirely.
+  if (error instanceof InvalidCwdError) {
+    return {
+      code: "invalid_cwd",
+      message:
+        `${adapter.name} failed: cwd is not a directory this server can see.\n` +
+        `${error.cwd}\n` +
+        `Fix: pass a path that exists for the server process. A containerised server ` +
+        `only sees its mounted volumes, not the host filesystem.`,
+    };
+  }
   if (error instanceof SpawnError) {
     return {
       code: "not_installed",

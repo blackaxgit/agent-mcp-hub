@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { statSync } from "node:fs";
 
 export interface ExecResult {
   stdout: string;
@@ -85,6 +86,21 @@ export class SpawnError extends Error {
   ) {
     super(message);
     this.name = "SpawnError";
+  }
+}
+
+/**
+ * Thrown when `cwd` does not exist (or is not a directory). Checked BEFORE spawn
+ * because both a missing binary and a missing cwd surface as bare ENOENT from
+ * spawn, and collapsing them is actively misleading: a caller passing a repo path
+ * the server cannot see was told "codex was not found on PATH" while codex was
+ * installed and healthy. Distinguishing them up front makes the real fault legible.
+ */
+export class InvalidCwdError extends Error {
+  readonly code = "invalid_cwd";
+  constructor(readonly cwd: string) {
+    super(`cwd does not exist or is not a directory: ${cwd}`);
+    this.name = "InvalidCwdError";
   }
 }
 
@@ -193,11 +209,25 @@ async function withSlot<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 const runCommandInner: Exec = (binary, args, opts = {}) => {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const idleTimeoutMs = opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
   const maxOutputBytes = opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
   return new Promise<ExecResult>((resolve, reject) => {
+    // Pre-flight the cwd so a missing directory is never mistaken for a missing
+    // binary (spawn reports ENOENT for both). See InvalidCwdError.
+    if (opts.cwd !== undefined && !isDirectory(opts.cwd)) {
+      reject(new InvalidCwdError(opts.cwd));
+      return;
+    }
     const child = spawn(binary, args, {
       cwd: opts.cwd,
       detached: true,

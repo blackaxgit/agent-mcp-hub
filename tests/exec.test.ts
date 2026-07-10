@@ -1,11 +1,12 @@
 import { ChildProcess } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_IDLE_TIMEOUT_MS,
   DEFAULT_TIMEOUT_MS,
+  InvalidCwdError,
   MAX_CONCURRENT_AGENTS,
   OutputLimitError,
   ServerBusyError,
@@ -553,6 +554,51 @@ describe("runCommand concurrency semaphore", () => {
     } finally {
       if (prev === undefined) delete process.env.MCP_MAX_QUEUE;
       else process.env.MCP_MAX_QUEUE = prev;
+    }
+  });
+});
+
+describe("runCommand — cwd preflight", () => {
+  it("rejects with InvalidCwdError when cwd does not exist, without spawning", async () => {
+    const missing = join(tmpdir(), "agent-mcp-hub-no-such-dir-xyz");
+    await expect(
+      runCommand(process.execPath, ["-e", "0"], { cwd: missing }),
+    ).rejects.toBeInstanceOf(InvalidCwdError);
+  });
+
+  it("rejects when cwd exists but is a file, not a directory", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-mcp-hub-cwd-"));
+    const file = join(dir, "a-file");
+    writeFileSync(file, "x");
+    try {
+      await expect(runCommand(process.execPath, ["-e", "0"], { cwd: file })).rejects.toBeInstanceOf(
+        InvalidCwdError,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("carries the offending path on the error", async () => {
+    const missing = join(tmpdir(), "agent-mcp-hub-no-such-dir-xyz");
+    await expect(runCommand(process.execPath, ["-e", "0"], { cwd: missing })).rejects.toMatchObject(
+      {
+        cwd: missing,
+        code: "invalid_cwd",
+      },
+    );
+  });
+
+  it("still runs normally when cwd is a real directory", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-mcp-hub-cwd-"));
+    try {
+      const r = await runCommand(process.execPath, ["-e", "process.stdout.write(process.cwd())"], {
+        cwd: dir,
+      });
+      expect(r.exitCode).toBe(0);
+      expect(statSync(r.stdout).isDirectory()).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });
