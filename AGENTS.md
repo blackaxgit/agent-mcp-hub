@@ -88,8 +88,17 @@ Workflows involved:
 
 ## Install & update the MCP (consumer)
 
-Default install is **pinned to a published version** (prebuilt tarball, fast, no
-source build):
+**Recommended — global install** (instant startup, reliable connection):
+
+```bash
+npm i -g agent-mcp-hub@0.5.0
+claude mcp add agent-hub -- agent-mcp-hub
+# or in mcp.json:  "command": "agent-mcp-hub"
+```
+
+**Zero-install alternative — npx** (no global install, but re-resolves each
+launch, so first start is slower and can trip a client's connection-probe
+timeout — the server is fine, just retry):
 
 ```bash
 claude mcp add agent-hub -- npx -y agent-mcp-hub@0.5.0
@@ -97,14 +106,14 @@ claude mcp add agent-hub -- npx -y agent-mcp-hub@0.5.0
 ```
 
 **Update to a new version:**
-- Pinned (recommended): bump the number, e.g.
-  `claude mcp remove agent-hub -s user && claude mcp add agent-hub -s user -- npx -y agent-mcp-hub@0.6.0`
-  (or edit the `args` version in `mcp.json`). Reproducible; you choose when.
-- Floating (`agent-mcp-hub@latest`): updates on next client start, but npx caches
-  by version and can serve a stale copy — force a refresh with `npx clear-npx-cache`
+- Global: `npm i -g agent-mcp-hub@0.6.0` — the `agent-mcp-hub` command picks it up
+  on next client start.
+- npx pinned: bump the number in `args`, e.g. `agent-mcp-hub@0.6.0`. Reproducible.
+- Floating (`agent-mcp-hub@latest`): updates on next start, but npx caches by
+  version and can serve a stale copy — force a refresh with `npx clear-npx-cache`
   (or `npx --prefer-online agent-mcp-hub`), then restart the client.
 
 **Pre-release / unreleased code** (fallback, builds from source):
 `npx -y github:blackaxgit/agent-mcp-hub#<tag-or-sha>`.
 
-See the README **Upgrading** section for the same, consumer-facing.
+See the README **Install** / **Upgrading** sections for the same, consumer-facing.

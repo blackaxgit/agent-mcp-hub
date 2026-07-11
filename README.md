@@ -92,21 +92,18 @@ Install and authenticate the CLIs you want to use (any subset works):
 
 ## Install
 
-Run from the npm registry — no clone, no global install:
+**Recommended — global install (fast, reliable startup):** install the pinned
+version once, then point your client at the `agent-mcp-hub` binary. Startup is
+instant and the client connects reliably.
 
+```bash
+npm i -g agent-mcp-hub@0.5.0
 ```
-npx -y agent-mcp-hub@0.5.0
-```
-
-> **Pre-release / fallback:** To test an unreleased commit, run directly from
-> GitHub: `npx -y github:blackaxgit/agent-mcp-hub#<tag-or-sha>`. This builds
-> from source on first fetch, so under npm v12+ you must allow the `prepare`
-> script.
 
 ### Claude Code
 
 ```bash
-claude mcp add agent-hub -- npx -y agent-mcp-hub@0.5.0
+claude mcp add agent-hub -- agent-mcp-hub
 ```
 
 ### Cursor / generic mcp.json
@@ -115,12 +112,28 @@ claude mcp add agent-hub -- npx -y agent-mcp-hub@0.5.0
 {
   "mcpServers": {
     "agent-hub": {
-      "command": "npx",
-      "args": ["-y", "agent-mcp-hub@0.5.0"]
+      "command": "agent-mcp-hub"
     }
   }
 }
 ```
+
+### Zero-install alternative (npx)
+
+No global install, but npx re-resolves the package on every launch, so first
+start is slower and can occasionally trip a client's connection-probe timeout
+(the server itself is fine — just retry). Prefer the global install for a
+persistent setup.
+
+```bash
+claude mcp add agent-hub -- npx -y agent-mcp-hub@0.5.0
+# mcp.json:  "command": "npx", "args": ["-y", "agent-mcp-hub@0.5.0"]
+```
+
+> **Pre-release / fallback:** To test an unreleased commit, run directly from
+> GitHub: `npx -y github:blackaxgit/agent-mcp-hub#<tag-or-sha>`. This builds
+> from source on first fetch, so under npm v12+ you must allow the `prepare`
+> script.
 
 ## Configuration
 
@@ -198,9 +211,15 @@ request them (`_meta.progressToken`) — live feedback during long runs. Note: o
 
 ## Upgrading
 
-To upgrade, bump the pinned version in your MCP config. For example, when
-`agent-mcp-hub@0.6.0` is released, change `agent-mcp-hub@0.5.0` to
-`agent-mcp-hub@0.6.0` everywhere.
+**Global install:** install the new version — the pinned `agent-mcp-hub` command
+in your MCP config picks it up on the next client start:
+
+```bash
+npm i -g agent-mcp-hub@0.6.0
+```
+
+**npx (pinned):** bump the pinned version in your MCP config — e.g. change
+`agent-mcp-hub@0.5.0` to `agent-mcp-hub@0.6.0` everywhere.
 
 **Always-latest (not recommended for shared configs):** use `agent-mcp-hub@latest`
 instead of a pinned version. Note that `npx` caches by version — it may serve a
