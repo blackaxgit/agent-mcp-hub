@@ -30,5 +30,11 @@ export default tseslint.config(
       "@typescript-eslint/no-floating-promises": "error",
     },
   },
+  {
+    files: ["src/**/*.ts"],
+    rules: {
+      "no-console": ["error", { allow: ["error", "warn"] }],
+    },
+  },
   eslintConfigPrettier,
 );
