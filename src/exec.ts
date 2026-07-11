@@ -37,6 +37,16 @@ export type Exec = (
      * repeated "RetriableError: …"). Default 4.
      */
     stallStrikeLimit?: number;
+    /**
+     * Env-var names to DELETE from the child's environment. Least-privilege
+     * denylist that keeps exec generic — it never learns which adapter owns
+     * which key. Callers pass the OTHER agents' credential var names (the union
+     * of every agent's apiKeyEnv MINUS the one being spawned) so a compromised
+     * or prompt-injected child can never read a sibling agent's secret. Every
+     * other var (PATH, HOME, proxy/CA/XDG/locale) is preserved. Undefined or
+     * empty leaves behavior identical to inheriting the full parent env.
+     */
+    stripEnvKeys?: readonly string[];
   },
 ) => Promise<ExecResult>;
 
@@ -285,10 +295,19 @@ const runCommandInner: Exec = (binary, args, opts = {}) => {
       reject(new InvalidCwdError(opts.cwd));
       return;
     }
+    // Only build an explicit env when there is something to strip; otherwise omit
+    // the option so the child inherits process.env verbatim (unchanged behavior).
+    const stripEnvKeys = opts.stripEnvKeys;
+    let childEnv: NodeJS.ProcessEnv | undefined;
+    if (stripEnvKeys && stripEnvKeys.length > 0) {
+      childEnv = { ...process.env };
+      for (const key of stripEnvKeys) delete childEnv[key];
+    }
     const child = spawn(binary, args, {
       cwd: opts.cwd,
       detached: true,
       stdio: [opts.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+      ...(childEnv ? { env: childEnv } : {}),
     });
     const killTree = () => killGroup(child.pid, "SIGKILL", () => child.kill("SIGKILL"));
 

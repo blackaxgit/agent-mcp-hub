@@ -560,6 +560,56 @@ describe("runCommand concurrency semaphore", () => {
   });
 });
 
+describe("runCommand — stripEnvKeys least-privilege child env", () => {
+  const printEnv =
+    "process.stdout.write(JSON.stringify({" +
+    "a:process.env.SECRET_A ?? null,b:process.env.SECRET_B ?? null}))";
+
+  let prevA: string | undefined;
+  let prevB: string | undefined;
+
+  beforeEach(() => {
+    prevA = process.env.SECRET_A;
+    prevB = process.env.SECRET_B;
+    process.env.SECRET_A = "sibling-agent-key";
+    process.env.SECRET_B = "keep-me";
+  });
+
+  afterEach(() => {
+    if (prevA === undefined) delete process.env.SECRET_A;
+    else process.env.SECRET_A = prevA;
+    if (prevB === undefined) delete process.env.SECRET_B;
+    else process.env.SECRET_B = prevB;
+  });
+
+  it("strips only the listed keys; every other parent var is preserved", async () => {
+    const r = await runCommand(process.execPath, ["-e", printEnv], {
+      stripEnvKeys: ["SECRET_A"],
+    });
+    const seen = JSON.parse(r.stdout) as { a: string | null; b: string | null };
+    // The sibling agent's secret is gone from the child…
+    expect(seen.a).toBeNull();
+    // …while an unrelated inherited var (PATH-like) survives intact.
+    expect(seen.b).toBe("keep-me");
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("without stripEnvKeys the child inherits the full parent env (unchanged behavior)", async () => {
+    const r = await runCommand(process.execPath, ["-e", printEnv]);
+    const seen = JSON.parse(r.stdout) as { a: string | null; b: string | null };
+    expect(seen.a).toBe("sibling-agent-key");
+    expect(seen.b).toBe("keep-me");
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("an empty stripEnvKeys array leaves the env untouched", async () => {
+    const r = await runCommand(process.execPath, ["-e", printEnv], { stripEnvKeys: [] });
+    const seen = JSON.parse(r.stdout) as { a: string | null; b: string | null };
+    expect(seen.a).toBe("sibling-agent-key");
+    expect(seen.b).toBe("keep-me");
+  });
+});
+
 describe("runCommand — cwd preflight", () => {
   it("rejects with InvalidCwdError when cwd does not exist, without spawning", async () => {
     const missing = join(tmpdir(), "agent-mcp-hub-no-such-dir-xyz");

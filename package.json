@@ -25,7 +25,11 @@
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "prepublishOnly": "npm run build && npm run typecheck && npm test"
+    "prepublishOnly": "npm run build && npm run typecheck && npm run test:coverage"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

@@ -92,14 +92,16 @@ Install and authenticate the CLIs you want to use (any subset works):
 
 ## Install
 
-The package is **not yet published to npm**, so install straight from GitHub
-(`npx` clones the repo and the `prepare` script builds it automatically). Once
-it is published, the plain `agent-mcp-hub` name will work in its place.
+The package is **published to npm**, so `npx -y agent-mcp-hub` fetches a prebuilt
+tarball — no build step, no install scripts. Installing from GitHub
+(`npx -y github:blackaxgit/agent-mcp-hub`) still works as a fallback, but it
+builds from source, so under npm v12+ it requires allowing the `prepare` install
+script.
 
 ### Claude Code
 
 ```bash
-claude mcp add agent-hub -- npx -y github:blackaxgit/agent-mcp-hub
+claude mcp add agent-hub -- npx -y agent-mcp-hub
 ```
 
 ### Cursor / generic mcp.json
@@ -109,7 +111,7 @@ claude mcp add agent-hub -- npx -y github:blackaxgit/agent-mcp-hub
   "mcpServers": {
     "agent-hub": {
       "command": "npx",
-      "args": ["-y", "github:blackaxgit/agent-mcp-hub"]
+      "args": ["-y", "agent-mcp-hub"]
     }
   }
 }
@@ -130,7 +132,7 @@ For stdio, set it in the client's `mcp.json`:
   "mcpServers": {
     "agent-hub": {
       "command": "npx",
-      "args": ["-y", "github:blackaxgit/agent-mcp-hub"],
+      "args": ["-y", "agent-mcp-hub"],
       "env": { "MCP_AGENTS": "codex,claude" }
     }
   }
@@ -155,7 +157,7 @@ transparently run without a prompt (no hang, no error).
   "mcpServers": {
     "agent-hub": {
       "command": "npx",
-      "args": ["-y", "github:blackaxgit/agent-mcp-hub"],
+      "args": ["-y", "agent-mcp-hub"],
       "env": { "MCP_CONFIRM": "1" }
     }
   }
