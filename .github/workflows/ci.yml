@@ -21,8 +21,10 @@ jobs:
         with:
           fetch-depth: 0
       # Secret scanning is paid-only on private personal repos, so CI runs the
-      # same gitleaks scan as the local pre-push gate (rootless Docker).
-      - run: docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.24.3 detect --source /repo --no-banner
+      # same gitleaks scan as the local pre-push gate via the official action.
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   test:
     runs-on: [self-hosted, linux, x64, ubuntu-2404, "repo:agent-mcp-hub"]
