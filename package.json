@@ -1,12 +1,11 @@
 {
   "name": "agent-mcp-hub",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "One MCP server bridging the Codex, Cursor, OpenCode, and Claude CLI agents",
   "license": "MIT",
   "type": "module",
   "bin": {
-    "agent-mcp-hub": "dist/index.js",
-    "agent-mcp-hub-http": "dist/http.js"
+    "agent-mcp-hub": "dist/index.js"
   },
   "files": [
     "dist"
@@ -26,7 +25,11 @@
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "prepublishOnly": "npm run build && npm run typecheck && npm test"
+    "prepublishOnly": "npm run build && npm run typecheck && npm run test:coverage"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

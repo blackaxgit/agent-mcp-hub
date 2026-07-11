@@ -1,17 +1,20 @@
 import { ChildProcess } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  AgentStalledError,
   DEFAULT_IDLE_TIMEOUT_MS,
   DEFAULT_TIMEOUT_MS,
+  InvalidCwdError,
   MAX_CONCURRENT_AGENTS,
   OutputLimitError,
   ServerBusyError,
   TimeoutError,
   runCommand,
 } from "../src/exec.js";
+import { cursorAdapter } from "../src/adapters/cursor.js";
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -554,5 +557,436 @@ describe("runCommand concurrency semaphore", () => {
       if (prev === undefined) delete process.env.MCP_MAX_QUEUE;
       else process.env.MCP_MAX_QUEUE = prev;
     }
+  });
+});
+
+describe("runCommand — stripEnvKeys least-privilege child env", () => {
+  const printEnv =
+    "process.stdout.write(JSON.stringify({" +
+    "a:process.env.SECRET_A ?? null,b:process.env.SECRET_B ?? null}))";
+
+  let prevA: string | undefined;
+  let prevB: string | undefined;
+
+  beforeEach(() => {
+    prevA = process.env.SECRET_A;
+    prevB = process.env.SECRET_B;
+    process.env.SECRET_A = "sibling-agent-key";
+    process.env.SECRET_B = "keep-me";
+  });
+
+  afterEach(() => {
+    if (prevA === undefined) delete process.env.SECRET_A;
+    else process.env.SECRET_A = prevA;
+    if (prevB === undefined) delete process.env.SECRET_B;
+    else process.env.SECRET_B = prevB;
+  });
+
+  it("strips only the listed keys; every other parent var is preserved", async () => {
+    const r = await runCommand(process.execPath, ["-e", printEnv], {
+      stripEnvKeys: ["SECRET_A"],
+    });
+    const seen = JSON.parse(r.stdout) as { a: string | null; b: string | null };
+    // The sibling agent's secret is gone from the child…
+    expect(seen.a).toBeNull();
+    // …while an unrelated inherited var (PATH-like) survives intact.
+    expect(seen.b).toBe("keep-me");
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("without stripEnvKeys the child inherits the full parent env (unchanged behavior)", async () => {
+    const r = await runCommand(process.execPath, ["-e", printEnv]);
+    const seen = JSON.parse(r.stdout) as { a: string | null; b: string | null };
+    expect(seen.a).toBe("sibling-agent-key");
+    expect(seen.b).toBe("keep-me");
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("an empty stripEnvKeys array leaves the env untouched", async () => {
+    const r = await runCommand(process.execPath, ["-e", printEnv], { stripEnvKeys: [] });
+    const seen = JSON.parse(r.stdout) as { a: string | null; b: string | null };
+    expect(seen.a).toBe("sibling-agent-key");
+    expect(seen.b).toBe("keep-me");
+  });
+});
+
+describe("runCommand — cwd preflight", () => {
+  it("rejects with InvalidCwdError when cwd does not exist, without spawning", async () => {
+    const missing = join(tmpdir(), "agent-mcp-hub-no-such-dir-xyz");
+    await expect(
+      runCommand(process.execPath, ["-e", "0"], { cwd: missing }),
+    ).rejects.toBeInstanceOf(InvalidCwdError);
+  });
+
+  it("rejects when cwd exists but is a file, not a directory", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-mcp-hub-cwd-"));
+    const file = join(dir, "a-file");
+    writeFileSync(file, "x");
+    try {
+      await expect(runCommand(process.execPath, ["-e", "0"], { cwd: file })).rejects.toBeInstanceOf(
+        InvalidCwdError,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("carries the offending path on the error", async () => {
+    const missing = join(tmpdir(), "agent-mcp-hub-no-such-dir-xyz");
+    await expect(runCommand(process.execPath, ["-e", "0"], { cwd: missing })).rejects.toMatchObject(
+      {
+        cwd: missing,
+        code: "invalid_cwd",
+      },
+    );
+  });
+
+  it("still runs normally when cwd is a real directory", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agent-mcp-hub-cwd-"));
+    try {
+      const r = await runCommand(process.execPath, ["-e", "process.stdout.write(process.cwd())"], {
+        cwd: dir,
+      });
+      expect(r.exitCode).toBe(0);
+      expect(statSync(r.stdout).isDirectory()).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Fake child that emits stall-signature lines on stderr and nothing on stdout.
+ * `cycle` controls how many full reconnect cycles to emit (each cycle = one
+ * "Connection lost … (attempt N)…" + one "Retry attempt N…" line). After the
+ * cycles the child sleeps forever so the idle cap would fire if the stall
+ * detector did not kill it first.
+ */
+const stallChildScript = (cycle: number) =>
+  "const {stderr}=process;" +
+  `for(let i=1;i<=${cycle};i++){` +
+  "stderr.write(`Connection lost, reconnecting to https://agentn.global.api5.cursor.sh (attempt ${i})...\\n`);" +
+  "stderr.write(`Retry attempt ${i}...\\n`);" +
+  "}" +
+  "setTimeout(()=>{},30000);";
+
+/**
+ * Fake child that emits stall lines on stderr AND productive lines on stdout.
+ * `stallCycles` = how many reconnect cycles to emit; `stdoutLines` = how many
+ * stdout lines to emit before the stall lines begin.
+ */
+const stallWithStdoutScript = (stallCycles: number, stdoutLines: number) => {
+  const parts: string[] = [];
+  for (let i = 0; i < stdoutLines; i++) {
+    parts.push(`console.log('stdout-line-${i}');`);
+  }
+  parts.push(stallChildScript(stallCycles));
+  return parts.join("");
+};
+
+describe("runCommand stall detector", () => {
+  const stallSig = [/^connection lost, reconnecting to \S+ \(attempt \d+\)\.*$/i];
+
+  it("S1: two reconnect cycles on stderr, no stdout -> AgentStalledError fast", async () => {
+    const start = Date.now();
+    const err = await runCommand(process.execPath, ["-e", stallChildScript(2)], {
+      idleTimeoutMs: 60_000,
+      timeoutMs: 60_000,
+      stallSignatures: stallSig,
+    }).catch((e: unknown) => e);
+    const elapsed = Date.now() - start;
+    expect(err).toBeInstanceOf(AgentStalledError);
+    expect((err as AgentStalledError).code).toBe("stream_stalled");
+    expect((err as AgentStalledError).signature).toMatch(/Connection lost/);
+    expect((err as AgentStalledError).strikes).toBeGreaterThanOrEqual(2);
+    // Far under both caps — proves the stall detector fired, not a timeout.
+    expect(elapsed).toBeLessThan(5_000);
+  });
+
+  it("S2: CONTROL — same chatty child, NO stallSignatures -> runs to total cap", async () => {
+    // Without stallSignatures the child's stderr chatter is just activity; the
+    // idle timer keeps resetting and the child runs until the total cap.
+    const err = await runCommand(process.execPath, ["-e", stallChildScript(2)], {
+      idleTimeoutMs: 60_000,
+      timeoutMs: 400,
+      // stallSignatures intentionally omitted.
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(TimeoutError);
+    expect((err as TimeoutError).kind).toBe("total");
+  });
+
+  it("S3: CONTROL — silent child -> still TimeoutError kind:'idle'", async () => {
+    const err = await runCommand(process.execPath, ["-e", "setTimeout(()=>{},5000)"], {
+      idleTimeoutMs: 150,
+      timeoutMs: 10_000,
+      stallSignatures: stallSig,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(TimeoutError);
+    expect((err as TimeoutError).kind).toBe("idle");
+  });
+
+  it("S4: signature chatter but stdout produced first -> NOT AgentStalledError; idle fires", async () => {
+    // productiveStdoutBytes > 0 suppresses the stall abort even when strikes accumulate.
+    const err = await runCommand(process.execPath, ["-e", stallWithStdoutScript(3, 2)], {
+      idleTimeoutMs: 150,
+      timeoutMs: 60_000,
+      stallSignatures: stallSig,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(TimeoutError);
+    expect((err as TimeoutError).kind).toBe("idle");
+    expect((err as TimeoutError).message).toMatch(/no output/);
+  });
+
+  it("S5: exactly ONE reconnect cycle (attempt 1), then silence -> NOT AgentStalledError; idle fires", async () => {
+    // A single legitimate reconnect cycle must survive: attempt 1 never reaches
+    // stallAttemptLimit (2), and 2 strikes (connection-lost + retry) is below
+    // stallStrikeLimit (4). The idle timer eventually kills the silent child.
+    const start = Date.now();
+    const err = await runCommand(process.execPath, ["-e", stallChildScript(1)], {
+      idleTimeoutMs: 200,
+      timeoutMs: 30_000,
+      stallSignatures: stallSig,
+    }).catch((e: unknown) => e);
+    const elapsed = Date.now() - start;
+    expect(err).toBeInstanceOf(TimeoutError);
+    expect((err as TimeoutError).kind).toBe("idle");
+    // Above the 200ms idle window but far under the 30s total cap.
+    expect(elapsed).toBeGreaterThan(150);
+    expect(elapsed).toBeLessThan(5_000);
+  });
+
+  it("S6: the phrase arrives on STDOUT, not stderr -> NOT AgentStalledError", async () => {
+    // The detector matches stderr ONLY. A model that quotes the phrase in its
+    // answer on stdout must never trip the stall detector. The child prints the
+    // phrase to stdout and then keeps printing to stay alive past the idle cap,
+    // then exits cleanly so the run resolves with exitCode 0.
+    const script =
+      "console.log('Connection lost, reconnecting to https://example.com (attempt 1)...');" +
+      "let n=0; const iv=setInterval(()=>{ if(++n>5){ clearInterval(iv); process.exit(0);} console.log('keep-alive'); }, 20);";
+    const r = await runCommand(process.execPath, ["-e", script], {
+      idleTimeoutMs: 200,
+      timeoutMs: 60_000,
+      stallSignatures: stallSig,
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("Connection lost");
+  });
+
+  it("S7: non-matching stderr chatter -> still re-arms idle", async () => {
+    // A CLI that streams diagnostic text on stderr (non-matching) must behave as
+    // today: each chunk resets the idle timer and the child survives. The child
+    // exits cleanly so the run resolves with exitCode 0.
+    const script =
+      "let n=0; const iv=setInterval(()=>{ if(++n>5){ clearInterval(iv); process.exit(0);} console.error('diag line'); }, 20);";
+    const r = await runCommand(process.execPath, ["-e", script], {
+      idleTimeoutMs: 200,
+      timeoutMs: 30_000,
+      stallSignatures: stallSig,
+    });
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("S8: after AgentStalledError the child AND a grandchild it forked are both dead", async () => {
+    const workDir = mkdtempSync(join(tmpdir(), "exec-stall-"));
+    const marker = join(workDir, "grandchild.log");
+    const pidFile = join(workDir, "grandchild.pid");
+    try {
+      // The child forks a grandchild that keeps appending to a file. The process
+      // group kill must reap both. The child spawns the grandchild first, records
+      // its PID, then emits stall lines to trigger the stall detector.
+      const childScript =
+        "const {spawn}=require('node:child_process');" +
+        "const fs=require('node:fs');" +
+        "const marker=process.argv[1];" +
+        "const pidFile=process.argv[2];" +
+        "const gc=spawn(process.execPath,['-e'," +
+        '\'const fs=require("node:fs");setInterval(()=>{try{fs.appendFileSync(process.argv[1],"x")}catch(e){}},50)\',' +
+        'marker,{stdio:"ignore"}]);' +
+        "fs.writeFileSync(pidFile,String(gc.pid));" +
+        "process.stderr.write('Connection lost, reconnecting to https://agentn.global.api5.cursor.sh (attempt 1)...\\n');" +
+        "process.stderr.write('Retry attempt 1...\\n');" +
+        "process.stderr.write('Connection lost, reconnecting to https://agentn.global.api5.cursor.sh (attempt 2)...\\n');" +
+        "process.stderr.write('Retry attempt 2...\\n');" +
+        "setTimeout(()=>{},30000);";
+
+      const err = await runCommand(process.execPath, ["-e", childScript, marker, pidFile], {
+        idleTimeoutMs: 60_000,
+        timeoutMs: 60_000,
+        stallSignatures: stallSig,
+      }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(AgentStalledError);
+
+      // Let any in-flight write settle, then confirm the grandchild is dead.
+      await delay(300);
+      const gcPid = Number(readFileSync(pidFile, "utf8").trim());
+      // Grandchild must be dead: process.kill(pid, 0) throws ESRCH when gone.
+      expect(() => process.kill(gcPid, 0)).toThrow();
+    } finally {
+      rmSync(workDir, { recursive: true, force: true });
+    }
+  });
+
+  it("S9: a signature SPLIT ACROSS TWO data chunks -> still detected", async () => {
+    // Force the child to write the stall line in two separate writes with a
+    // setImmediate between them, so Node's data event may split it across chunks.
+    const line =
+      "Connection lost, reconnecting to https://agentn.global.api5.cursor.sh (attempt 1)...";
+    const half = Math.ceil(line.length / 2);
+    // Use Buffer.from to avoid shell-escaping issues.
+    const script = [
+      `process.stderr.write(Buffer.from(${JSON.stringify(line.slice(0, half))}, 'utf8'));`,
+      `setImmediate(()=>process.stderr.write(Buffer.from(${JSON.stringify(line.slice(half) + "\n")}, 'utf8')));`,
+      `setImmediate(()=>process.stderr.write('Retry attempt 1...\\n'));`,
+      `setImmediate(()=>process.stderr.write(Buffer.from(${JSON.stringify("Connection lost, reconnecting to https://agentn.global.api5.cursor.sh (attempt 2)..." + "\n")}, 'utf8')));`,
+      `setImmediate(()=>process.stderr.write('Retry attempt 2...\\n'));`,
+      `setTimeout(()=>{},30000);`,
+    ].join("");
+
+    const start = Date.now();
+    const err = await runCommand(process.execPath, ["-e", script], {
+      idleTimeoutMs: 60_000,
+      timeoutMs: 60_000,
+      stallSignatures: stallSig,
+    }).catch((e: unknown) => e);
+    const elapsed = Date.now() - start;
+    expect(err).toBeInstanceOf(AgentStalledError);
+    expect(elapsed).toBeLessThan(5_000);
+  });
+
+  it("S10: signature line wrapped in ANSI colour codes -> still detected", async () => {
+    // Use the actual ESC character (0x1B) to wrap the signature in ANSI colour.
+    const esc = "\u001B[31m";
+    const reset = "\u001B[0m";
+    const line1 =
+      "Connection lost, reconnecting to https://agentn.global.api5.cursor.sh (attempt 1)...";
+    const line2 =
+      "Connection lost, reconnecting to https://agentn.global.api5.cursor.sh (attempt 2)...";
+    // Build the script using Buffer.from to avoid shell-escaping issues with ESC.
+    const script = [
+      `process.stderr.write(Buffer.from(${JSON.stringify(esc + line1 + reset + "\n")}, 'utf8'));`,
+      `process.stderr.write('Retry attempt 1...\\n');`,
+      `process.stderr.write(Buffer.from(${JSON.stringify(esc + line2 + reset + "\n")}, 'utf8'));`,
+      `process.stderr.write('Retry attempt 2...\\n');`,
+      `setTimeout(()=>{},30000);`,
+    ].join("");
+
+    const err = await runCommand(process.execPath, ["-e", script], {
+      idleTimeoutMs: 60_000,
+      timeoutMs: 60_000,
+      stallSignatures: stallSig,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(AgentStalledError);
+    // The signature stored on the error is the ANSI-stripped text.
+    expect((err as AgentStalledError).signature).not.toContain("\u001B");
+  });
+
+  it("S11: stall fires, then buffered output would breach maxOutputBytes -> AgentStalledError, NOT OutputLimitError", async () => {
+    // The stall detector fires BEFORE the output cap has a chance to breach.
+    // Even though the child would later exceed maxOutputBytes, the stall cause
+    // is recorded first and the single-terminal-cause discipline ensures the
+    // stall error wins.
+    const script =
+      stallChildScript(2) +
+      // After the stall lines, flood stdout past a tiny cap.
+      "setInterval(()=>process.stdout.write(Buffer.alloc(4096, 120)), 1);";
+
+    const err = await runCommand(process.execPath, ["-e", script], {
+      idleTimeoutMs: 60_000,
+      timeoutMs: 60_000,
+      maxOutputBytes: 1024,
+      stallSignatures: stallSig,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(AgentStalledError);
+    expect(err).not.toBeInstanceOf(OutputLimitError);
+  });
+
+  it("S12: after AgentStalledError, a subsequent runCommand still acquires a semaphore slot", async () => {
+    // The stall path kills the group and rejects on `close`, so the semaphore
+    // permit is released. A follow-up run must succeed (not throw ServerBusy).
+    const marker = join(tmpdir(), `exec-stall-sem-${Date.now()}.log`);
+    try {
+      await runCommand(process.execPath, ["-e", stallChildScript(2)], {
+        idleTimeoutMs: 60_000,
+        timeoutMs: 60_000,
+        stallSignatures: stallSig,
+      }).catch(() => {});
+      const r = await runCommand(process.execPath, [
+        "-e",
+        `require('node:fs').writeFileSync('${marker}','ok')`,
+      ]);
+      expect(r.exitCode).toBe(0);
+      expect(readFileSync(marker, "utf8")).toBe("ok");
+    } finally {
+      rmSync(marker, { force: true });
+    }
+  });
+
+  it("S13: two attempt lines in ONE stderr write -> AgentStalledError, not idle", async () => {
+    // A single stderr.write() containing three lines (two "connection lost" + one "retry")
+    // must be detected as a stall — not misclassified as idle. The child stays silent
+    // after the write, so the stall detector is the only thing that can end it quickly.
+    // Both attempt lines in one chunk must be processed (attempt 2 reaches the threshold).
+    const script =
+      'process.stderr.write("Connection lost, reconnecting to https://x.example (attempt 1)...\\n' +
+      "Retry attempt 1...\\n" +
+      'Connection lost, reconnecting to https://x.example (attempt 2)...\\n");' +
+      "setTimeout(() => {}, 10000);";
+
+    const start = Date.now();
+    const err = await runCommand(process.execPath, ["-e", script], {
+      idleTimeoutMs: 30_000,
+      timeoutMs: 60_000,
+      stallSignatures: stallSig,
+    }).catch((e: unknown) => e);
+    const elapsed = Date.now() - start;
+    expect(err).toBeInstanceOf(AgentStalledError);
+    expect((err as AgentStalledError).code).toBe("stream_stalled");
+    expect((err as AgentStalledError).strikes).toBeGreaterThanOrEqual(2);
+    // Far under both caps — proves the stall detector fired, not a timeout.
+    expect(elapsed).toBeLessThan(3_000);
+  });
+
+  it("S14: two separate attempt-1 reconnect cycles (max attempt == 1) -> idle, NOT stall", async () => {
+    // Two complete reconnect cycles, each resetting to attempt 1, must NOT trigger
+    // the stall fallback. Four matched lines but max attempt 1 and zero attempt-less
+    // strikes => the strike fallback must NOT fire. The child dies only by idle.
+    const script =
+      'process.stderr.write("Connection lost, reconnecting to https://x.example (attempt 1)...\\n' +
+      'Retry attempt 1...\\n");' +
+      'setTimeout(() => { process.stderr.write("Connection lost, reconnecting to https://x.example (attempt 1)...\\n' +
+      'Retry attempt 1...\\n"); }, 120);' +
+      "setTimeout(() => {}, 10000);";
+
+    const err = await runCommand(process.execPath, ["-e", script], {
+      idleTimeoutMs: 400,
+      timeoutMs: 60_000,
+      // All three cursor patterns, so BOTH the "connection lost" and "retry
+      // attempt" lines match — four matched, attempt-numbered lines across two
+      // cycles. A raw-strike fallback would fire at four; keying on the distinct
+      // attempt number (still 1) must not.
+      stallSignatures: cursorAdapter.stallSignatures,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(TimeoutError);
+    expect((err as TimeoutError).kind).toBe("idle");
+  });
+
+  it("S15: bare no-attempt signature repeated >=4 times -> AgentStalledError via strike fallback", async () => {
+    // A signature that carries no attempt number (e.g. "RetriableError: …") must
+    // still stall when repeated enough times. The strike fallback (stallNoAttemptStrikes
+    // >= stallStrikeLimit) is the only path here — attempt counters never increment.
+    const script =
+      "let n=0;" +
+      "function w(){if(++n<=5){process.stderr.write('RetriableError: Connection stalled\\n');setTimeout(w,30)}else{setTimeout(()=>{},30000)}}" +
+      "w();";
+
+    const err = await runCommand(process.execPath, ["-e", script], {
+      idleTimeoutMs: 60_000,
+      timeoutMs: 60_000,
+      stallSignatures: cursorAdapter.stallSignatures,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(AgentStalledError);
+    expect((err as AgentStalledError).code).toBe("stream_stalled");
+    // Proves the strike fallback (stallNoAttemptStrikes >= 4) works for
+    // signatures that carry no attempt number.
   });
 });

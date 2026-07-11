@@ -5,6 +5,10 @@ export const opencodeAdapter: AgentAdapter = {
   summary:
     "OpenCode — an open-source, provider-agnostic coding agent for agentic code changes; its model defaults to the user's opencode config unless a model is provided. Prompts must not start with '-'.",
   binary: "opencode",
+  // `opencode models` prints bare ids ("opencode/big-pickle"), one per line, and
+  // exercises config + provider resolution rather than just starting the binary.
+  probeArgs: ["models"],
+  probeRequiresOutput: true,
   loginCommand: "opencode auth login",
   buildInvocation(prompt: string, options: AgentRunOptions = {}): AgentInvocation {
     if (prompt.startsWith("-")) {

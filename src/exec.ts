@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { statSync } from "node:fs";
+import { stripAnsi } from "./ansi.js";
 
 export interface ExecResult {
   stdout: string;
@@ -17,6 +19,34 @@ export type Exec = (
     maxOutputBytes?: number;
     /** Fired synchronously once per ACCEPTED output chunk. Never awaited. */
     onActivity?: () => void;
+    /**
+     * Line patterns the CLI prints on its DIAGNOSTIC stream (stderr) when it
+     * cannot reach its backend. Matched against stderr ONLY: the model's answer
+     * arrives on stdout, so a model that quotes one of these phrases can never
+     * trip the detector.
+     */
+    stallSignatures?: readonly RegExp[];
+    /**
+     * How many distinct reconnect cycles (each cycle = one "attempt N" line) the
+     * child must emit before we treat the stall as permanent. Default 2 — a
+     * single legitimate reconnect cycle emits exactly one attempt line.
+     */
+    stallAttemptLimit?: number;
+    /**
+     * Absolute strike cap for signatures that carry no attempt number (e.g. a
+     * repeated "RetriableError: …"). Default 4.
+     */
+    stallStrikeLimit?: number;
+    /**
+     * Env-var names to DELETE from the child's environment. Least-privilege
+     * denylist that keeps exec generic — it never learns which adapter owns
+     * which key. Callers pass the OTHER agents' credential var names (the union
+     * of every agent's apiKeyEnv MINUS the one being spawned) so a compromised
+     * or prompt-injected child can never read a sibling agent's secret. Every
+     * other var (PATH, HOME, proxy/CA/XDG/locale) is preserved. Undefined or
+     * empty leaves behavior identical to inheriting the full parent env.
+     */
+    stripEnvKeys?: readonly string[];
   },
 ) => Promise<ExecResult>;
 
@@ -44,6 +74,8 @@ export const DEFAULT_IDLE_TIMEOUT_MS = parsePositiveInt(
 );
 
 export const DEFAULT_MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
+export const DEFAULT_STALL_ATTEMPT_LIMIT = 2;
+export const DEFAULT_STALL_STRIKE_LIMIT = 4;
 
 /** Positive finite integer only; NaN/0/negative/non-integer all fall back to 4. */
 function parseConcurrency(raw: string | undefined): number {
@@ -89,6 +121,21 @@ export class SpawnError extends Error {
 }
 
 /**
+ * Thrown when `cwd` does not exist (or is not a directory). Checked BEFORE spawn
+ * because both a missing binary and a missing cwd surface as bare ENOENT from
+ * spawn, and collapsing them is actively misleading: a caller passing a repo path
+ * the server cannot see was told "codex was not found on PATH" while codex was
+ * installed and healthy. Distinguishing them up front makes the real fault legible.
+ */
+export class InvalidCwdError extends Error {
+  readonly code = "invalid_cwd";
+  constructor(readonly cwd: string) {
+    super(`cwd does not exist or is not a directory: ${cwd}`);
+    this.name = "InvalidCwdError";
+  }
+}
+
+/**
  * Thrown when the child is killed for exceeding a timeout. Carries the bound and
  * WHICH cap fired: `"idle"` (no output for idleTimeoutMs — likely hung/unreachable)
  * or `"total"` (exceeded the total runtime cap). `kind` is additive and defaults
@@ -115,6 +162,25 @@ export class OutputLimitError extends Error {
   ) {
     super(message);
     this.name = "OutputLimitError";
+  }
+}
+
+/**
+ * Thrown when the child is detected as stalled: it prints diagnostic reconnect
+ * phrases on stderr (the adapter's `stallSignatures`) but never produces stdout,
+ * and the attempt/strike counters corroborate that it will not recover. The
+ * process group is killed; the rejection surfaces on `close` so the semaphore
+ * permit is released only after the tree is actually gone.
+ */
+export class AgentStalledError extends Error {
+  readonly code = "stream_stalled";
+  constructor(
+    message: string,
+    readonly signature: string,
+    readonly strikes: number,
+  ) {
+    super(message);
+    this.name = "AgentStalledError";
   }
 }
 
@@ -193,50 +259,107 @@ async function withSlot<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Single terminal cause. Replaces the old two-flag scheme (`killedForOutput` +
+ * `timeoutCause`) so a cause recorded earlier can never be masked by a later
+ * output-cap breach. `markTerminal` is idempotent — a second call is a no-op —
+ * and it clears BOTH timers and kills the group in one shot. The `close`
+ * handler rejects based on `terminalCause.kind`; we never reject from inside
+ * the detector, because rejecting early would release the concurrency semaphore
+ * permit BEFORE the process group is actually gone.
+ */
+type TerminalCause =
+  | { kind: "idle" | "total"; windowMs: number }
+  | { kind: "output"; maxOutputBytes: number }
+  | { kind: "stall"; signature: string; strikes: number };
+
 const runCommandInner: Exec = (binary, args, opts = {}) => {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const idleTimeoutMs = opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
   const maxOutputBytes = opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+  const stallSignatures = opts.stallSignatures ?? null;
+  const stallAttemptLimit = opts.stallAttemptLimit ?? DEFAULT_STALL_ATTEMPT_LIMIT;
+  const stallStrikeLimit = opts.stallStrikeLimit ?? DEFAULT_STALL_STRIKE_LIMIT;
   return new Promise<ExecResult>((resolve, reject) => {
+    // Pre-flight the cwd so a missing directory is never mistaken for a missing
+    // binary (spawn reports ENOENT for both). See InvalidCwdError.
+    if (opts.cwd !== undefined && !isDirectory(opts.cwd)) {
+      reject(new InvalidCwdError(opts.cwd));
+      return;
+    }
+    // Only build an explicit env when there is something to strip; otherwise omit
+    // the option so the child inherits process.env verbatim (unchanged behavior).
+    const stripEnvKeys = opts.stripEnvKeys;
+    let childEnv: NodeJS.ProcessEnv | undefined;
+    if (stripEnvKeys && stripEnvKeys.length > 0) {
+      childEnv = { ...process.env };
+      for (const key of stripEnvKeys) delete childEnv[key];
+    }
     const child = spawn(binary, args, {
       cwd: opts.cwd,
       detached: true,
       stdio: [opts.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
+      ...(childEnv ? { env: childEnv } : {}),
     });
     const killTree = () => killGroup(child.pid, "SIGKILL", () => child.kill("SIGKILL"));
 
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
     let outputBytes = 0;
-    // Which cap fired, if any. Recorded exactly once by markTimeout so a losing
-    // timer can never overwrite the kind or double-kill.
-    let timeoutCause: { kind: "idle" | "total"; windowMs: number } | undefined;
-    let killedForOutput = false;
+    // Single terminal cause: first to fire wins, recorded exactly once by
+    // markTerminal so a losing timer can never overwrite it or double-kill.
+    let terminalCause: TerminalCause | undefined;
     let settled = false;
+
+    // Stall detector state (only armed when stallSignatures is non-empty).
+    let stallStrikes = 0;
+    let stallMaxAttempt = 0;
+    let stallNoAttemptStrikes = 0;
+    let stallSignatureLast = "";
+    // Rolling buffer: a data chunk may split a line mid-byte, so we keep the
+    // trailing partial across chunks and only test complete lines.
+    let stderrRemainder = "";
+    // Only stdout bytes count as "productive" — stderr reconnect phrases are
+    // diagnostic noise, not progress toward a model answer.
+    let productiveStdoutBytes = 0;
 
     // The TOTAL timer bounds runtime and is NEVER reset. The IDLE timer is reset
     // on every accepted chunk. Both start after the semaphore slot is acquired,
     // so the caps bound the child's runtime, not time spent queued behind the cap.
     let idleTimer: NodeJS.Timeout;
-    const totalTimer = setTimeout(() => markTimeout("total", timeoutMs), timeoutMs);
+    const totalTimer = setTimeout(
+      () => markTerminal({ kind: "total", windowMs: timeoutMs }),
+      timeoutMs,
+    );
 
     const clearTimers = () => {
       clearTimeout(totalTimer);
       clearTimeout(idleTimer);
     };
 
-    // Single guarded terminal path: first timer to fire wins, records the cause,
+    // Single guarded terminal path: first cause to fire wins, records the cause,
     // stops BOTH timers, then kills the tree. Idempotent — a second call (losing
     // timer, or a race with settle) is a no-op, so no double-kill / overwrite.
-    function markTimeout(kind: "idle" | "total", windowMs: number): void {
-      /* v8 ignore next -- unreachable: clearTimers() cancels the losing timer before it can fire, so markTimeout runs at most once (settled/timeoutCause never true on entry) */
-      if (settled || timeoutCause) return;
-      timeoutCause = { kind, windowMs };
+    function markTerminal(cause: TerminalCause): void {
+      /* v8 ignore next -- unreachable: clearTimers() cancels the losing timer before it can fire, so markTerminal runs at most once (settled/terminalCause never true on entry) */
+      if (settled || terminalCause) return;
+      terminalCause = cause;
       clearTimers();
       killTree();
     }
 
-    idleTimer = setTimeout(() => markTimeout("idle", idleTimeoutMs), idleTimeoutMs);
+    idleTimer = setTimeout(
+      () => markTerminal({ kind: "idle", windowMs: idleTimeoutMs }),
+      idleTimeoutMs,
+    );
 
     if (opts.input !== undefined) {
       // Swallow EPIPE if the child exits before reading its stdin.
@@ -245,31 +368,116 @@ const runCommandInner: Exec = (binary, args, opts = {}) => {
       child.stdin?.end();
     }
 
-    const track = (chunk: Buffer, sink: Buffer[]) => {
-      if (killedForOutput) return;
+    // Test a complete stderr line against the stall signatures. Returns the
+    // matched signature text (already stripped/trimmed) or undefined.
+    const testStallLine = (line: string): string | undefined => {
+      if (!stallSignatures || stallSignatures.length === 0) return undefined;
+      const stripped = stripAnsi(line).trim();
+      if (stripped.length === 0) return undefined;
+      for (const re of stallSignatures) {
+        if (re.test(stripped)) return stripped;
+      }
+      return undefined;
+    };
+
+    // Parse an attempt number out of a stall line, e.g. "… (attempt 1)…" → 1.
+    // Returns undefined when no attempt number is present.
+    const parseAttempt = (line: string): number | undefined => {
+      const m = /attempt\D{0,10}(\d+)/i.exec(line);
+      return m ? Number(m[1]) : undefined;
+    };
+
+    const track = (chunk: Buffer, sink: Buffer[], isStdout: boolean) => {
+      if (terminalCause) return;
       outputBytes += chunk.length;
       if (outputBytes > maxOutputBytes) {
         // Stop accumulating and drop what we captured: memory must not keep
         // growing between the breach and the child actually dying. The fatal
         // breach chunk is NOT activity — it neither re-arms idle nor fires a
         // heartbeat right before the kill.
-        killedForOutput = true;
+        markTerminal({ kind: "output", maxOutputBytes });
         stdoutChunks.length = 0;
         stderrChunks.length = 0;
-        clearTimers();
-        killTree();
         return;
       }
+
+      if (isStdout) {
+        sink.push(chunk);
+        productiveStdoutBytes += chunk.length;
+        // ACCEPTED stdout chunk: this counts as progress. Fire the (synchronous)
+        // activity hook and reset the idle window from now.
+        opts.onActivity?.();
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(
+          () => markTerminal({ kind: "idle", windowMs: idleTimeoutMs }),
+          idleTimeoutMs,
+        );
+        return;
+      }
+
+      // stderr path.
+      if (stallSignatures && stallSignatures.length > 0) {
+        // Append to the rolling buffer and split on newlines. Keep the trailing
+        // partial so a line straddling two chunks is reassembled intact.
+        stderrRemainder += chunk.toString("utf8");
+        const lines = stderrRemainder.split("\n");
+        // The last element is the partial (may be empty if chunk ended on \n).
+        stderrRemainder = lines.pop() ?? "";
+        let matchedInBatch = false;
+        for (const line of lines) {
+          const sig = testStallLine(line);
+          if (sig === undefined) continue;
+          matchedInBatch = true;
+          stallStrikes += 1;
+          stallSignatureLast = sig;
+          const attempt = parseAttempt(sig);
+          if (attempt !== undefined) {
+            stallMaxAttempt = Math.max(stallMaxAttempt, attempt);
+          } else {
+            // Only attempt-less signatures feed the raw-strike fallback, so a
+            // legitimate reconnect that keeps resetting to "attempt 1" cannot
+            // masquerade as escalating failure.
+            stallNoAttemptStrikes += 1;
+          }
+        }
+        if (matchedInBatch) {
+          // A stall line is NOT activity: sink the bytes but never re-arm idle.
+          sink.push(chunk);
+          if (
+            productiveStdoutBytes === 0 &&
+            (stallMaxAttempt >= stallAttemptLimit || stallNoAttemptStrikes >= stallStrikeLimit)
+          ) {
+            markTerminal({
+              kind: "stall",
+              signature: stallSignatureLast,
+              strikes: stallStrikes,
+            });
+          }
+          return;
+        }
+        // No stall line matched — treat as ordinary activity (existing behavior).
+        sink.push(chunk);
+        opts.onActivity?.();
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(
+          () => markTerminal({ kind: "idle", windowMs: idleTimeoutMs }),
+          idleTimeoutMs,
+        );
+        return;
+      }
+
+      // No stall signatures armed: stderr behaves like stdout for activity.
       sink.push(chunk);
-      // ACCEPTED chunk: this counts as progress. Fire the (synchronous) activity
-      // hook and reset the idle window from now.
       opts.onActivity?.();
       clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => markTimeout("idle", idleTimeoutMs), idleTimeoutMs);
+      idleTimer = setTimeout(
+        () => markTerminal({ kind: "idle", windowMs: idleTimeoutMs }),
+        idleTimeoutMs,
+      );
     };
 
-    child.stdout?.on("data", (chunk: Buffer) => track(chunk, stdoutChunks));
-    child.stderr?.on("data", (chunk: Buffer) => track(chunk, stderrChunks));
+    child.stdout?.on("data", (chunk: Buffer) => track(chunk, stdoutChunks, true));
+    child.stderr?.on("data", (chunk: Buffer) => track(chunk, stderrChunks, false));
 
     child.on("error", (err) => {
       clearTimers();
@@ -287,26 +495,28 @@ const runCommandInner: Exec = (binary, args, opts = {}) => {
       clearTimers();
       if (settled) return;
       settled = true;
-      if (killedForOutput) {
-        // Never echo the captured bytes back — only the limit that was breached.
-        reject(
-          new OutputLimitError(
-            `"${binary}" exceeded output limit of ${maxOutputBytes} bytes`,
-            maxOutputBytes,
-          ),
-        );
-        return;
-      }
-      if (timeoutCause) {
-        if (timeoutCause.kind === "idle") {
+      if (terminalCause) {
+        if (terminalCause.kind === "output") {
+          // Never echo the captured bytes back — only the limit that was breached.
+          reject(
+            new OutputLimitError(
+              `"${binary}" exceeded output limit of ${terminalCause.maxOutputBytes} bytes`,
+              terminalCause.maxOutputBytes,
+            ),
+          );
+          return;
+        }
+        if (terminalCause.kind === "idle") {
           reject(
             new TimeoutError(
-              `"${binary}" produced no output for ${idleTimeoutMs}ms (idle) — it may be hung or its model/backend is unreachable`,
-              idleTimeoutMs,
+              `"${binary}" produced no output for ${terminalCause.windowMs}ms (idle) — it may be hung or its model/backend is unreachable`,
+              terminalCause.windowMs,
               "idle",
             ),
           );
-        } else {
+          return;
+        }
+        if (terminalCause.kind === "total") {
           reject(
             new TimeoutError(
               `"${binary}" timed out after ${timeoutMs}ms (total runtime cap)`,
@@ -314,6 +524,17 @@ const runCommandInner: Exec = (binary, args, opts = {}) => {
               "total",
             ),
           );
+          return;
+        }
+        if (terminalCause.kind === "stall") {
+          reject(
+            new AgentStalledError(
+              `"${binary}" stalled: detected diagnostic reconnect pattern — "${terminalCause.signature}" (strike ${terminalCause.strikes}). The agent cannot complete a run in this environment (common cause: TLS-intercepting proxy). Treat this agent as unavailable until the network path is fixed.`,
+              terminalCause.signature,
+              terminalCause.strikes,
+            ),
+          );
+          return;
         }
         return;
       }

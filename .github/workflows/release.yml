@@ -1,8 +1,9 @@
 name: Release
 
-# Publish the container image to GHCR when a GitHub Release is published.
-# workflow_dispatch is included so the pipeline can be test-run manually
-# (it publishes the current package.json version).
+# Verify that a GitHub Release tag matches package.json's version, then publish
+# the package to the npm registry on release. Fails the release on version drift
+# — the pre-release review flagged this as the single most common release failure
+# mode. workflow_dispatch is included so the check can be test-run manually.
 on:
   release:
     types: [published]
@@ -10,18 +11,15 @@ on:
 
 permissions:
   contents: read
-  packages: write # required to push to ghcr.io
 
 concurrency:
   group: release
   cancel-in-progress: false # never cancel an in-flight publish
 
 jobs:
-  publish-image:
+  verify-version:
     runs-on: [self-hosted, linux, x64, ubuntu-2404, "repo:agent-mcp-hub"]
-    timeout-minutes: 30
-    env:
-      IMAGE: ghcr.io/${{ github.repository }} # ghcr.io/blackaxgit/agent-mcp-hub (private, inherits repo)
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
@@ -44,73 +42,25 @@ jobs:
               exit 1
             fi
           fi
-          echo "Publishing $IMAGE:$VERSION and :latest"
+          echo "Verified version $VERSION matches release tag"
 
-      - name: Reclaim docker disk
-        run: docker system prune -af
-
-      # The runner is self-hosted, so it may sit behind a TLS-intercepting proxy.
-      # The cursor installer's curl reads the SYSTEM trust store, so without the
-      # proxy CA the build aborts. Set the PROXY_CA_PEM repo secret to the proxy's
-      # root CA (PEM) to fix that; absent the secret this is a no-op, which is the
-      # correct behaviour on a runner with a clean chain. Read via env, not inline
-      # ${{ }}, to avoid workflow injection.
-      - name: Trust proxy CA (optional)
+  publish-npm:
+    needs: verify-version
+    # Only a real GitHub Release publishes to npm; workflow_dispatch stays a dry
+    # verify-only run.
+    if: github.event_name == 'release'
+    runs-on: [self-hosted, linux, x64, ubuntu-2404, "repo:agent-mcp-hub"]
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write # required for npm provenance
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm publish --provenance --access public
         env:
-          PROXY_CA_PEM: ${{ secrets.PROXY_CA_PEM }}
-        run: |
-          if [ -n "${PROXY_CA_PEM:-}" ]; then
-            printf '%s\n' "$PROXY_CA_PEM" > certs/proxy-ca.crt
-            echo "wrote certs/proxy-ca.crt ($(wc -c < certs/proxy-ca.crt) bytes)"
-          else
-            echo "PROXY_CA_PEM not set; skipping (no intercepting proxy assumed)"
-          fi
-
-      # INSTALL_CURSOR=true publishes cursor-agent in the image. The Dockerfile
-      # installs it from a pinned URL verified against a SHA256 — never the vendor's
-      # unchecksummed `curl https://cursor.com/install | bash` — so a substituted or
-      # truncated artifact aborts the build.
-      - name: Build image
-        env:
-          VERSION: ${{ steps.ver.outputs.version }}
-        run: |
-          docker build --build-arg INSTALL_CURSOR=true \
-            -t "$IMAGE:$VERSION" \
-            -t "$IMAGE:latest" .
-
-      # Verify the image boots and serves /healthz BEFORE publishing, so a
-      # broken image is never pushed. Exercises the fail-closed HTTP path
-      # (HOST=0.0.0.0 requires MCP_TOKEN).
-      - name: Smoke-test before publishing
-        env:
-          VERSION: ${{ steps.ver.outputs.version }}
-        run: |
-          docker run -d --name rel-ci -e HOST=0.0.0.0 -e MCP_TOKEN=ci-smoke-token \
-            -p 3919:3919 "$IMAGE:$VERSION"
-          ok=0
-          for i in $(seq 1 15); do
-            if curl -fsS http://localhost:3919/healthz >/dev/null 2>&1; then ok=1; break; fi
-            sleep 2
-          done
-          docker logs rel-ci || true
-          docker rm -f rel-ci || true
-          if [ "$ok" != 1 ]; then echo "::error::image did not become healthy" >&2; exit 1; fi
-
-      - name: Log in to GHCR
-        env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ACTOR: ${{ github.actor }}
-        run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
-
-      - name: Push image
-        env:
-          VERSION: ${{ steps.ver.outputs.version }}
-        run: |
-          docker push "$IMAGE:$VERSION"
-          docker push "$IMAGE:latest"
-
-      - name: Cleanup
-        if: always()
-        run: |
-          docker logout ghcr.io || true
-          docker system prune -af || true
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
