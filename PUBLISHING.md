@@ -30,19 +30,26 @@ git tag v0.5.0 && git push origin v0.5.0
 gh release create v0.5.0 --generate-notes
 ```
 
-### 3. Wire release-please to the baseline
+### 3. Re-anchor release-please to the v0.5.0 tag
+
+`release-please-config.json` already carries an interim `bootstrap-sha` (the
+commit that was HEAD when publishing was set up). Once the `v0.5.0` tag exists,
+re-point it at that tag's commit so the baseline matches the published release:
 
 ```bash
 git rev-parse v0.5.0
 ```
 
-Copy that SHA and replace `TODO_BOOTSTRAP_SHA` in `release-please-config.json`,
+Replace the `bootstrap-sha` value in `release-please-config.json` with that SHA,
 then commit:
 
 ```bash
-git add release-please-config.json && git commit -m "chore: set bootstrap-sha for release-please"
+git add release-please-config.json && git commit -m "chore: re-anchor bootstrap-sha to v0.5.0"
 git push
 ```
+
+(Once the `v0.5.0` tag exists, release-please prefers the tag over
+`bootstrap-sha`, so this step is belt-and-suspenders.)
 
 ### 4. Configure npm Trusted Publishing
 
