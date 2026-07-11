@@ -23,7 +23,10 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm install -g npm@latest
       - run: npm ci
-      - run: npm publish
+      # --no-provenance: the repo is private, and npm provenance requires a
+      # public source repo. OIDC trusted publishing still provides auth. Drop
+      # this flag (and restore publishConfig.provenance) if the repo goes public.
+      - run: npm publish --no-provenance
 
   registry:
     needs: npm

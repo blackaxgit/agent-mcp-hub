@@ -49,8 +49,7 @@
     "prepublishOnly": "npm run build && npm run typecheck && npm run test:coverage"
   },
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    "access": "public"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
