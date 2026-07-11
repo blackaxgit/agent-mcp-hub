@@ -6,6 +6,9 @@ dist/
 # Internal process docs (plans, fixes, reviews) — kept local, not pushed
 docs/
 
+# Subagent scratch memory — local only
+.claude/
+
 # test coverage output
 coverage/
 .stryker-tmp/

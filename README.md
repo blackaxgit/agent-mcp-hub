@@ -92,20 +92,21 @@ Install and authenticate the CLIs you want to use (any subset works):
 
 ## Install
 
-Run straight from GitHub with `npx` — no clone, no global install:
+Run from the npm registry — no clone, no global install:
 
 ```
-npx -y github:blackaxgit/agent-mcp-hub
+npx -y agent-mcp-hub@0.5.0
 ```
 
-This builds from source on first fetch, so under npm v12+ you must allow the
-`prepare` install script. (An npm-registry release — `npx -y agent-mcp-hub` from
-a prebuilt tarball, no build step — is planned but not yet published.)
+> **Pre-release / fallback:** To test an unreleased commit, run directly from
+> GitHub: `npx -y github:blackaxgit/agent-mcp-hub#<tag-or-sha>`. This builds
+> from source on first fetch, so under npm v12+ you must allow the `prepare`
+> script.
 
 ### Claude Code
 
 ```bash
-claude mcp add agent-hub -- npx -y github:blackaxgit/agent-mcp-hub
+claude mcp add agent-hub -- npx -y agent-mcp-hub@0.5.0
 ```
 
 ### Cursor / generic mcp.json
@@ -115,7 +116,7 @@ claude mcp add agent-hub -- npx -y github:blackaxgit/agent-mcp-hub
   "mcpServers": {
     "agent-hub": {
       "command": "npx",
-      "args": ["-y", "github:blackaxgit/agent-mcp-hub"]
+      "args": ["-y", "agent-mcp-hub@0.5.0"]
     }
   }
 }
@@ -136,7 +137,7 @@ For stdio, set it in the client's `mcp.json`:
   "mcpServers": {
     "agent-hub": {
       "command": "npx",
-      "args": ["-y", "github:blackaxgit/agent-mcp-hub"],
+      "args": ["-y", "agent-mcp-hub@0.5.0"],
       "env": { "MCP_AGENTS": "codex,claude" }
     }
   }
@@ -161,7 +162,7 @@ transparently run without a prompt (no hang, no error).
   "mcpServers": {
     "agent-hub": {
       "command": "npx",
-      "args": ["-y", "github:blackaxgit/agent-mcp-hub"],
+      "args": ["-y", "agent-mcp-hub@0.5.0"],
       "env": { "MCP_CONFIRM": "1" }
     }
   }
@@ -194,6 +195,20 @@ request them (`_meta.progressToken`) — live feedback during long runs. Note: o
 **Claude Code (stdio)** the per-server request `timeout` in `.mcp.json` (or the
 `MCP_TOOL_TIMEOUT` env var it honors) is a hard wall-clock that progress does
 **not** reset (default ~28h) — raise it if you lowered it below your longest run.
+
+## Upgrading
+
+To upgrade, bump the pinned version in your MCP config. For example, when
+`agent-mcp-hub@0.6.0` is released, change `agent-mcp-hub@0.5.0` to
+`agent-mcp-hub@0.6.0` everywhere.
+
+**Always-latest (not recommended for shared configs):** use `agent-mcp-hub@latest`
+instead of a pinned version. Note that `npx` caches by version — it may serve a
+stale copy. Force a fresh fetch with `npx --prefer-online agent-mcp-hub` or
+`npx clear-npx-cache`.
+
+Pinning is reproducible and recommended for team-wide or checked-in
+`mcp.json` files.
 
 ## Development
 
