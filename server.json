@@ -1,0 +1,15 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.blackaxgit/agent-mcp-hub",
+  "description": "One MCP server bridging the Codex, Cursor, OpenCode, and Claude CLI agents",
+  "repository": { "url": "https://github.com/blackaxgit/agent-mcp-hub", "source": "github" },
+  "version": "0.5.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "agent-mcp-hub",
+      "version": "0.5.0",
+      "transport": { "type": "stdio" }
+    }
+  ]
+}

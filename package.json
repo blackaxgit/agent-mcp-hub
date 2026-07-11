@@ -2,6 +2,26 @@
   "name": "agent-mcp-hub",
   "version": "0.5.0",
   "description": "One MCP server bridging the Codex, Cursor, OpenCode, and Claude CLI agents",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/blackaxgit/agent-mcp-hub.git"
+  },
+  "homepage": "https://github.com/blackaxgit/agent-mcp-hub#readme",
+  "bugs": {
+    "url": "https://github.com/blackaxgit/agent-mcp-hub/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "mcp-server",
+    "codex",
+    "cursor",
+    "opencode",
+    "claude",
+    "coding-agent",
+    "stdio"
+  ],
+  "mcpName": "io.github.blackaxgit/agent-mcp-hub",
   "license": "MIT",
   "type": "module",
   "bin": {
@@ -14,6 +34,7 @@
     "node": ">=22"
   },
   "scripts": {
+    "prebuild": "rm -rf dist",
     "build": "tsc -p tsconfig.json",
     "prepare": "npm run build",
     "dev": "tsx src/index.ts",
