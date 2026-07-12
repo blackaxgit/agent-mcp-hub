@@ -362,7 +362,7 @@ describe("run_all", () => {
     );
     expect(exec).toHaveBeenCalledWith(
       "cursor-agent",
-      ["-p", "--output-format", "text", "--trust"],
+      ["-p", "--output-format", "text", "--force"],
       expect.objectContaining({ cwd: "/tmp", timeoutMs: 1234, input: "p" }),
     );
     expect(exec).toHaveBeenCalledWith(
@@ -399,7 +399,7 @@ describe("run_all", () => {
     );
     expect(exec).toHaveBeenCalledWith(
       "cursor-agent",
-      ["-p", "--output-format", "text", "--trust", "--model", "o3"],
+      ["-p", "--output-format", "text", "--force", "--model", "o3"],
       expect.objectContaining({ cwd: undefined, timeoutMs: undefined, input: "compare" }),
     );
   });

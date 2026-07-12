@@ -4,31 +4,39 @@ import { cursorAdapter } from "../../src/adapters/cursor.js";
 describe("cursorAdapter", () => {
   it("builds print-mode args and pipes the prompt via stdin", () => {
     expect(cursorAdapter.buildInvocation("explain this repo")).toEqual({
-      args: ["-p", "--output-format", "text", "--trust"],
+      args: ["-p", "--output-format", "text", "--force"],
       stdin: "explain this repo",
     });
   });
 
   it("appends --model when given", () => {
     expect(cursorAdapter.buildInvocation("explain this repo", { model: "gpt-5" })).toEqual({
-      args: ["-p", "--output-format", "text", "--trust", "--model", "gpt-5"],
+      args: ["-p", "--output-format", "text", "--force", "--model", "gpt-5"],
       stdin: "explain this repo",
     });
   });
 
   it("is injection-safe for prompts that look like flags", () => {
     const inv = cursorAdapter.buildInvocation("--force what does this flag do");
-    expect(inv.args).toEqual(["-p", "--output-format", "text", "--trust"]);
+    expect(inv.args).toEqual(["-p", "--output-format", "text", "--force"]);
     expect(inv.stdin).toBe("--force what does this flag do");
   });
 
-  // Without --trust, cursor-agent blocks on an interactive "Workspace Trust Required"
-  // prompt in any directory it has not seen before. Print mode gives it no stdin to
-  // answer with, so the run hangs until the idle timeout kills it. The server is
-  // invoked against arbitrary cwds, so this flag is load-bearing, not cosmetic.
-  it("always passes --trust so an unfamiliar cwd cannot hang the run", () => {
-    expect(cursorAdapter.buildInvocation("hi").args).toContain("--trust");
-    expect(cursorAdapter.buildInvocation("hi", { model: "gpt-5" }).args).toContain("--trust");
+  // Without --force, cursor-agent blocks on an interactive permission prompt in any
+  // directory it has not seen before. Print mode gives it no stdin to answer with, so
+  // the run hangs until the idle timeout kills it. The server is invoked against
+  // arbitrary cwds, so this flag is load-bearing, not cosmetic.
+  //
+  // It must be --force, NOT --trust: cursor-agent has no --trust flag and exits 1 with
+  // "unknown option '--trust'", which broke the cursor tool entirely in v0.5.0.
+  it("always passes --force (never --trust) so an unfamiliar cwd cannot hang the run", () => {
+    for (const args of [
+      cursorAdapter.buildInvocation("hi").args,
+      cursorAdapter.buildInvocation("hi", { model: "gpt-5" }).args,
+    ]) {
+      expect(args).toContain("--force");
+      expect(args).not.toContain("--trust");
+    }
   });
 
   it("exposes correct identity", () => {

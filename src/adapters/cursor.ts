@@ -20,11 +20,13 @@ export const cursorAdapter: AgentAdapter = {
     /^retriable\s*error:\s*connection stalled\b/i,
   ],
   buildInvocation(prompt: string, options: AgentRunOptions = {}): AgentInvocation {
-    // --trust: cursor-agent otherwise blocks on an interactive "Workspace Trust
-    // Required" prompt in any directory it has not seen before, which for a server
-    // invoked against arbitrary cwds is most of them. There is no stdin to answer
-    // it with in print mode, so the run hangs until the timeout kills it.
-    const args = ["-p", "--output-format", "text", "--trust"];
+    // --force: cursor-agent otherwise blocks on an interactive permission prompt
+    // ("Workspace Trust Required" / command approval) in any directory it has not
+    // seen before, which for a server invoked against arbitrary cwds is most of
+    // them. There is no stdin to answer it with in print mode, so the run would
+    // hang until the timeout kills it. (`--trust` is NOT a cursor-agent flag —
+    // passing it makes the CLI exit 1 with "unknown option '--trust'".)
+    const args = ["-p", "--output-format", "text", "--force"];
     if (options.model) args.push("--model", options.model);
     // No positional prompt: cursor-agent reads it from piped stdin in print mode.
     return { args, stdin: prompt };
