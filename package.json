@@ -22,7 +22,7 @@
     "stdio"
   ],
   "mcpName": "io.github.blackaxgit/agent-mcp-hub",
-  "license": "MIT",
+  "license": "MPL-2.0",
   "type": "module",
   "bin": {
     "agent-mcp-hub": "dist/index.js"
