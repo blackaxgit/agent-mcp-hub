@@ -3,11 +3,11 @@
 One MCP server that bridges multiple CLI coding agents — **Codex**, **Cursor**,
 **OpenCode**, and **Claude** — into any MCP client.
 
-> **Breaking change (v0.5.0):** The Docker image, HTTP transport, and the
-> separate HTTP binary have been removed. The hub now ships stdio-only.
-> A containerised server cannot see the caller's repository path or reuse the
-> caller's CLI logins, so the Docker deployment broke the product contract on
-> both halves.
+> **stdio only — by design.** The hub ships no Docker image and no HTTP
+> transport (both were removed during the 0.5.x line). A containerised or remote
+> server cannot see the caller's repository path and cannot reuse the caller's
+> CLI logins — it would break the product contract on both halves. The hub runs
+> as a child process of your MCP client, on your machine, as you.
 
 ## Tools
 
