@@ -6,6 +6,9 @@ dist/
 # Internal process docs (plans, fixes, reviews) — kept local, not pushed
 docs/
 
+# LLM-maintained project wiki — kept local, not pushed
+wiki/
+
 # Subagent scratch memory — local only
 .claude/
 
