@@ -38,8 +38,18 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - name: Install mcp-publisher
+      # Pin the version and verify a SHA-256 checksum (fail-closed) instead of
+      # piping `releases/latest` straight into execution — the same supply-chain
+      # discipline the `secrets` job uses for the gitleaks binary. Bumping the
+      # version requires updating MCP_PUBLISHER_SHA256 from that release's
+      # registry_<version>_checksums.txt, or this step (correctly) fails.
+      - name: Install mcp-publisher (pinned + checksum-verified)
+        env:
+          MCP_PUBLISHER_VERSION: "1.8.0"
+          MCP_PUBLISHER_SHA256: "1370446bbe74d562608e8005a6ccce02d146a661fbd78674e11cc70b9618d6cf"
         run: |
-          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
+          curl -sSfL "https://github.com/modelcontextprotocol/registry/releases/download/v${MCP_PUBLISHER_VERSION}/mcp-publisher_linux_amd64.tar.gz" -o mcp-publisher.tar.gz
+          echo "${MCP_PUBLISHER_SHA256}  mcp-publisher.tar.gz" | sha256sum -c -
+          tar xzf mcp-publisher.tar.gz mcp-publisher
       - run: ./mcp-publisher login github-oidc
       - run: ./mcp-publisher publish

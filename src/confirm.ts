@@ -4,11 +4,26 @@ import type { ElicitRequestFormParams } from "@modelcontextprotocol/sdk/types.js
 
 const ENABLING = new Set(["1", "true", "on", "all"]);
 
-/** True iff MCP_CONFIRM (case-/whitespace-insensitive) is one of 1, true, on, all. */
+/**
+ * The confirm gate has three modes:
+ *  - `"off"`   — MCP_CONFIRM unset/other → run without a gate (default).
+ *  - `"on"`    — MCP_CONFIRM in {1,true,on,all} → ask; DEGRADE OPEN (run with a
+ *    warning) if the client cannot show a form.
+ *  - `"strict"`— MCP_CONFIRM=strict → ask; FAIL CLOSED (refuse to run) if the
+ *    client cannot show a form. For operators who need "no run without a human".
+ */
+export type ConfirmMode = "off" | "on" | "strict";
+
+export function confirmMode(env: NodeJS.ProcessEnv = process.env): ConfirmMode {
+  const raw = env.MCP_CONFIRM?.trim().toLowerCase();
+  if (raw === undefined) return "off";
+  if (raw === "strict") return "strict";
+  return ENABLING.has(raw) ? "on" : "off";
+}
+
+/** True iff the confirm gate is active in any mode (`on` or `strict`). */
 export function confirmEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  const raw = env.MCP_CONFIRM;
-  if (raw === undefined) return false;
-  return ENABLING.has(raw.trim().toLowerCase());
+  return confirmMode(env) !== "off";
 }
 
 /**
@@ -37,13 +52,16 @@ export function buildConfirmMessage(
 /** Summary listing every enabled agent name for a single run_all confirmation. */
 export function buildRunAllMessage(
   agentNames: string[],
-  opts: { prompt: string; cwd?: string },
+  opts: { prompt: string; cwd?: string; model?: string },
 ): string {
   const lines = [
     `Run all agents (${agentNames.join(", ")})?`,
     `prompt: ${truncate(opts.prompt, PROMPT_MAX)}`,
   ];
   if (opts.cwd !== undefined) lines.push(`cwd: ${opts.cwd}`);
+  // `model` is shown so a caller sees exactly what is forwarded to each CLI —
+  // it is attacker-influenceable and must not be hidden from the human gate.
+  if (opts.model !== undefined) lines.push(`model: ${opts.model}`);
   return lines.join("\n");
 }
 

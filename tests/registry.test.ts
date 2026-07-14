@@ -3,12 +3,15 @@ import { describe, expect, it, vi } from "vitest";
 import type { Exec } from "../src/exec.js";
 import {
   allAdapters,
+  allCredentialEnvVars,
   checkAvailability,
+  credentialStripKeys,
   enabledAdapters,
   parseProbeIds,
   resolveOnPath,
   type ResolveBinary,
 } from "../src/registry.js";
+import { claudeAdapter } from "../src/adapters/claude.js";
 import { codexAdapter } from "../src/adapters/codex.js";
 import { cursorAdapter } from "../src/adapters/cursor.js";
 import { opencodeAdapter } from "../src/adapters/opencode.js";
@@ -101,7 +104,10 @@ describe("checkAvailability", () => {
       usable: true,
       available: true,
     });
-    expect(exec).toHaveBeenCalledWith("codex", ["--version"], { timeoutMs: 10_000 });
+    expect(exec).toHaveBeenCalledWith("codex", ["--version"], {
+      timeoutMs: 10_000,
+      stripEnvKeys: credentialStripKeys(codexAdapter),
+    });
   });
 
   // The regression this whole class of bug lives in: codex exits 0 from `--version`
@@ -154,7 +160,10 @@ describe("checkAvailability", () => {
     await expect(checkAvailability(opencodeAdapter, exec, found)).resolves.toMatchObject({
       usable: true,
     });
-    expect(exec).toHaveBeenCalledWith("opencode", ["models"], { timeoutMs: 10_000 });
+    expect(exec).toHaveBeenCalledWith("opencode", ["models"], {
+      timeoutMs: 10_000,
+      stripEnvKeys: credentialStripKeys(opencodeAdapter),
+    });
   });
 
   it("is NOT usable when a probe requiring output exits 0 but lists nothing", async () => {
@@ -180,6 +189,67 @@ describe("checkAvailability", () => {
     await expect(checkAvailability(cursorAdapter, exec, found)).resolves.toMatchObject({
       usable: true,
     });
-    expect(exec).toHaveBeenCalledWith("cursor-agent", ["models"], { timeoutMs: 10_000 });
+    expect(exec).toHaveBeenCalledWith("cursor-agent", ["models"], {
+      timeoutMs: 10_000,
+      stripEnvKeys: credentialStripKeys(cursorAdapter),
+    });
+  });
+
+  // P1-D: the probe spawns the CLI, so it must isolate credentials exactly like a
+  // real run — never handing the probe a sibling agent's key.
+  it("P1-D: probes a keyless adapter (opencode) with ALL tracked keys stripped", async () => {
+    const found: ResolveBinary = (b) => `/usr/local/bin/${b}`;
+    const exec: Exec = vi.fn(async () => ({
+      stdout: "opencode/big-pickle\n",
+      stderr: "",
+      exitCode: 0,
+    }));
+    await checkAvailability(opencodeAdapter, exec, found);
+    const opts = (
+      exec as unknown as { mock: { calls: [string, string[], { stripEnvKeys?: string[] }][] } }
+    ).mock.calls[0][2];
+    // opencode owns no apiKeyEnv, so every sibling's secret must be denied to it.
+    expect(opts.stripEnvKeys).toEqual(
+      expect.arrayContaining(["OPENAI_API_KEY", "CURSOR_API_KEY", "ANTHROPIC_API_KEY"]),
+    );
+    expect(opts.stripEnvKeys).toHaveLength(3);
+  });
+});
+
+describe("allCredentialEnvVars (P1-D)", () => {
+  it("is the exact set of every adapter's credential var", () => {
+    expect(new Set(allCredentialEnvVars())).toEqual(
+      new Set(["OPENAI_API_KEY", "CURSOR_API_KEY", "ANTHROPIC_API_KEY"]),
+    );
+  });
+
+  it("has no duplicates", () => {
+    const all = allCredentialEnvVars();
+    expect(all).toHaveLength(new Set(all).size);
+  });
+});
+
+describe("credentialStripKeys (P1-D)", () => {
+  it("strips every OTHER agent's key but keeps the adapter's own", () => {
+    const codexStrip = credentialStripKeys(codexAdapter);
+    expect(codexStrip).not.toContain("OPENAI_API_KEY");
+    expect(codexStrip).toEqual(expect.arrayContaining(["CURSOR_API_KEY", "ANTHROPIC_API_KEY"]));
+    expect(codexStrip).toHaveLength(2);
+  });
+
+  it("keeps each keyed adapter's own key and strips the two siblings", () => {
+    for (const adapter of [codexAdapter, cursorAdapter, claudeAdapter]) {
+      const strip = credentialStripKeys(adapter);
+      expect(strip).not.toContain(adapter.apiKeyEnv);
+      expect(strip).toHaveLength(2);
+    }
+  });
+
+  it("strips ALL tracked keys for a keyless adapter (opencode owns none)", () => {
+    const strip = credentialStripKeys(opencodeAdapter);
+    expect(new Set(strip)).toEqual(
+      new Set(["OPENAI_API_KEY", "CURSOR_API_KEY", "ANTHROPIC_API_KEY"]),
+    );
+    expect(strip).toHaveLength(3);
   });
 });

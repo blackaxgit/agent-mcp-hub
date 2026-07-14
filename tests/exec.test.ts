@@ -9,14 +9,33 @@ import {
   DEFAULT_TIMEOUT_MS,
   InvalidCwdError,
   MAX_CONCURRENT_AGENTS,
+  MAX_TIMEOUT_MS,
   OutputLimitError,
   ServerBusyError,
   TimeoutError,
+  clampTimer,
+  reapAllChildren,
   runCommand,
 } from "../src/exec.js";
 import { cursorAdapter } from "../src/adapters/cursor.js";
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+describe("reapAllChildren (P2-F: no orphaned children on shutdown)", () => {
+  it("is a safe no-op when nothing is live", () => {
+    expect(() => reapAllChildren()).not.toThrow();
+  });
+
+  it("SIGKILLs a still-live child's process group", async () => {
+    // A long-lived child that would otherwise be orphaned on server shutdown.
+    const pending = runCommand(process.execPath, ["-e", "setTimeout(() => {}, 60000)"]);
+    await delay(300); // let it spawn and register in liveChildren
+    reapAllChildren();
+    const result = await pending;
+    // Killed by signal → no clean exit code.
+    expect(result.exitCode).toBeNull();
+  });
+});
 
 describe("runCommand", () => {
   it("captures stdout and exit code 0 on success", async () => {
@@ -72,6 +91,35 @@ describe("runCommand", () => {
 
   it("defaults the idle timeout to 300000ms", () => {
     expect(DEFAULT_IDLE_TIMEOUT_MS).toBe(300_000);
+  });
+});
+
+describe("clampTimer (P2-E)", () => {
+  it("caps the 24h ceiling and pins MAX_TIMEOUT_MS at 24h", () => {
+    expect(MAX_TIMEOUT_MS).toBe(24 * 60 * 60 * 1000);
+    // An enormous timer must clamp DOWN to the ceiling — an unclamped delay past
+    // 2^31-1 ms truncates and fires setTimeout immediately, killing the child.
+    expect(clampTimer(Number.MAX_SAFE_INTEGER)).toBe(MAX_TIMEOUT_MS);
+    expect(clampTimer(MAX_TIMEOUT_MS + 1)).toBe(MAX_TIMEOUT_MS);
+  });
+
+  it("clamps non-positive values up to the 1ms floor", () => {
+    expect(clampTimer(0)).toBe(1);
+    expect(clampTimer(-5)).toBe(1);
+  });
+
+  it("floors fractional values toward the nearest integer", () => {
+    expect(clampTimer(1.9)).toBe(1);
+    expect(clampTimer(5000.7)).toBe(5000);
+  });
+
+  it("maps non-finite input to the ceiling (never immediate-fire)", () => {
+    expect(clampTimer(Infinity)).toBe(MAX_TIMEOUT_MS);
+    expect(clampTimer(Number.NaN)).toBe(MAX_TIMEOUT_MS);
+  });
+
+  it("passes an in-range value through unchanged", () => {
+    expect(clampTimer(5000)).toBe(5000);
   });
 });
 
@@ -607,6 +655,61 @@ describe("runCommand — stripEnvKeys least-privilege child env", () => {
     const seen = JSON.parse(r.stdout) as { a: string | null; b: string | null };
     expect(seen.a).toBe("sibling-agent-key");
     expect(seen.b).toBe("keep-me");
+  });
+});
+
+describe("runCommand — env overlay (P2-E)", () => {
+  it("sets an extra env var on the child that was not in the parent env", async () => {
+    // The var is absent from process.env, so seeing it in the child proves it came
+    // from the overlay, not inheritance.
+    expect(process.env.MCPHUB_TEST_OVERLAY).toBeUndefined();
+    const r = await runCommand(
+      process.execPath,
+      ["-e", "process.stdout.write(process.env.MCPHUB_TEST_OVERLAY ?? 'MISSING')"],
+      { env: { MCPHUB_TEST_OVERLAY: "set-by-overlay" } },
+    );
+    expect(r.stdout).toBe("set-by-overlay");
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("applies overlay AFTER strip: strips one key and overlays a different one", async () => {
+    const prev = process.env.MCPHUB_TEST_STRIP_ME;
+    process.env.MCPHUB_TEST_STRIP_ME = "should-be-stripped";
+    try {
+      const script =
+        "process.stdout.write(JSON.stringify({" +
+        "stripped:process.env.MCPHUB_TEST_STRIP_ME ?? null," +
+        "overlaid:process.env.MCPHUB_TEST_OVERLAY2 ?? null}))";
+      const r = await runCommand(process.execPath, ["-e", script], {
+        stripEnvKeys: ["MCPHUB_TEST_STRIP_ME"],
+        env: { MCPHUB_TEST_OVERLAY2: "added" },
+      });
+      const seen = JSON.parse(r.stdout) as { stripped: string | null; overlaid: string | null };
+      expect(seen.stripped).toBeNull();
+      expect(seen.overlaid).toBe("added");
+      expect(r.exitCode).toBe(0);
+    } finally {
+      if (prev === undefined) delete process.env.MCPHUB_TEST_STRIP_ME;
+      else process.env.MCPHUB_TEST_STRIP_ME = prev;
+    }
+  });
+
+  it("an overlay override WINS over a strip key of the same name", async () => {
+    // Same key stripped AND overlaid: overlay is applied last, so the child sees
+    // the overlay value, never the stripped-then-restored parent value.
+    const prev = process.env.MCPHUB_TEST_CONFLICT;
+    process.env.MCPHUB_TEST_CONFLICT = "parent-value";
+    try {
+      const r = await runCommand(
+        process.execPath,
+        ["-e", "process.stdout.write(process.env.MCPHUB_TEST_CONFLICT ?? 'MISSING')"],
+        { stripEnvKeys: ["MCPHUB_TEST_CONFLICT"], env: { MCPHUB_TEST_CONFLICT: "overlay-wins" } },
+      );
+      expect(r.stdout).toBe("overlay-wins");
+    } finally {
+      if (prev === undefined) delete process.env.MCPHUB_TEST_CONFLICT;
+      else process.env.MCPHUB_TEST_CONFLICT = prev;
+    }
   });
 });
 
