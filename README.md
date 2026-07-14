@@ -62,8 +62,9 @@ worktree), optional `model`, `timeoutMs`.
 
 - Cross-agent by design — e.g. `codex` writes, `claude` reviews.
 - Returns the concrete diff that the plain agent tools don't expose.
-- Newly-created (untracked) files are reviewed by **name only** — their contents
-  are not in the diff.
+- Newly-created (untracked) files are surfaced to the reviewer **with their
+  contents** (bounded: 64 KiB per file, 50 files; excess is truncated and
+  flagged). `git diff` alone would omit them entirely.
 - If the worktree was already dirty, the diff may include pre-existing changes
   (noted in the output).
 - Complements — does not replace — client-side stop-hooks or PR-time CI review.
