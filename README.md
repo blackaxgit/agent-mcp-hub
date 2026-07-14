@@ -244,3 +244,10 @@ npm run build      # emit dist/
 Pure adapters (`src/adapters/*` — prompt → `{args, stdin?}`, no I/O) → one
 subprocess boundary (`src/exec.ts`) → MCP stdio server (`src/server.ts`). Adding
 an agent = one ~15-line adapter file + one line in `src/registry.ts`.
+
+## License
+
+[Mozilla Public License 2.0](./LICENSE) (MPL-2.0).
+
+Versions **before 0.5.2 were released under the MIT license**; that grant stands
+for those versions. MPL-2.0 applies from 0.5.2 onward.
