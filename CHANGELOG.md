@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.3](https://github.com/blackaxgit/agent-mcp-hub/compare/agent-mcp-hub-v0.5.2...agent-mcp-hub-v0.5.3) (2026-07-14)
+
+
+### Documentation
+
+* correct review_change untracked-file claim and stdio-only note ([85ea005](https://github.com/blackaxgit/agent-mcp-hub/commit/85ea0059a05ea36800ec60112fa5821d509c9662))
+
 ## [0.5.2](https://github.com/blackaxgit/agent-mcp-hub/compare/agent-mcp-hub-v0.5.1...agent-mcp-hub-v0.5.2) (2026-07-14)
 
 
