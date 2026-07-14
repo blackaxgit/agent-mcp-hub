@@ -52,8 +52,8 @@ npx stryker run
 |---|---|
 | `src/adapters/*.ts` | **Pure** adapters, one per CLI: `buildInvocation(prompt, opts) -> {args, stdin?}`. No I/O, no spawning. |
 | `src/exec.ts` | **The only module that spawns processes.** Timeouts, output caps, concurrency, process-group kill. |
-| `src/git.ts` | Git + file reads routed through an **injected `Exec`** — no direct spawning, no `node:fs`; stays side-effect-free. Used by the `review_change` tool. |
-| `src/registry.ts` | Which agents are enabled; probes whether each CLI is actually usable. |
+| `src/git.ts` | Git + file reads routed through an **injected `Exec`** — no direct spawning, no `node:fs`; stays side-effect-free. Used by the `review_change` tool. Every git call goes through **one hardened runner** — git config is a code-execution surface (see Gotchas). |
+| `src/registry.ts` | Which agents are enabled; probes whether each CLI is actually usable. Also **derives** the per-agent credential-strip set (`allCredentialEnvVars` / `credentialStripKeys`). |
 | `src/server.ts` | MCP tool wiring (tool schemas + handlers). |
 | `src/failure.ts` | Classifies raw CLI failures into actionable errors. |
 | `src/confirm.ts` | The `MCP_CONFIRM` elicitation gate. |
@@ -73,9 +73,9 @@ Runtime env vars the server reads (none are secrets):
 | Var | Effect |
 |---|---|
 | `MCP_AGENTS` | Comma-separated allowlist of agents to expose. **Case-sensitive.** Unset/empty = all. An unknown name fails fast at startup rather than silently dropping. |
-| `MCP_CONFIRM` | One of `1` / `true` / `on` / `all` → ask for confirmation (via MCP **form elicitation**) before spawning any agent. **Not a hard gate:** a client that doesn't advertise form-elicitation capability **runs ungated**, warning once. Keyed on the protocol capability, never a product name. |
-| `MCP_AGENT_TIMEOUT_MS` | Total runtime cap per agent run (default `1800000`). |
-| `MCP_AGENT_IDLE_TIMEOUT_MS` | Inactivity cap; resets on every chunk of output (default `300000`). |
+| `MCP_CONFIRM` | Ask for confirmation (via MCP **form elicitation**) before spawning an agent. **Three modes** (`src/confirm.ts`): unset/other = `off`; `1`/`true`/`on`/`all` = **`on`**, which **degrades OPEN** — a client that doesn't advertise the form-elicitation capability runs **ungated**, warning once; `strict` = **fails CLOSED**, refusing to run when it cannot ask. Keyed on the protocol capability, never a product name. **Neither mode gates `list_agents`** — see Gotchas. |
+| `MCP_AGENT_TIMEOUT_MS` | Total runtime cap per agent run (default `1800000`). Clamped to `MAX_TIMEOUT_MS` = **24 h** (`src/exec.ts`), which does two jobs: it stays safely under `setTimeout`'s ceiling (a delay above `2^31-1` ms ≈ **24.8 days** truncates to 1 ms and fires *immediately*, killing the child the instant it starts), and it caps how long one run can hold a concurrency slot. |
+| `MCP_AGENT_IDLE_TIMEOUT_MS` | Inactivity cap; resets on every chunk of output (default `300000`). Same 24 h clamp. |
 | `MCP_MAX_CONCURRENT_AGENTS` / `MCP_MAX_QUEUE` | Override the spawn-concurrency semaphore and its queue bound (both have built-in defaults). |
 
 ## Testing
@@ -101,6 +101,8 @@ Only the non-obvious ones (formatting, unused vars, floating promises are enforc
   - `opencode` → prompt IS a **positional** arg (`args.push(prompt)`, no stdin) — its CLI documents neither stdin input nor a `--` delimiter. **Because** it is positional, the adapter *rejects* prompts starting with `-` with an actionable error rather than risk flag-injection.
 - **Fail fast with actionable errors.** `src/failure.ts` classifies CLI failures into nine `FailureCode`s: `not_installed`, `invalid_cwd`, `not_authenticated`, `not_configured`, `timed_out`, `output_limit`, `stream_stalled`, `server_busy`, `tool_failure`. **Most carry a concrete `Fix:`; two do not** — `stream_stalled` (the agent is simply unavailable; raising the timeout won't help) and the fallback `tool_failure` (returns the exit code plus a trimmed, ANSI-stripped output tail). Never surface a raw terminal dump.
 - **Agent CLI flags are version-sensitive and load-bearing.** Confirm a flag exists in the installed CLI (`<cli> --help`) before adding it — see the cursor `--trust` incident in Gotchas.
+- **Treat `prompt`, `model`, and `cwd` as attacker-influenced.** The MCP client is often an LLM acting on untrusted content (a web page, an issue, a repo it was pointed at), so these are not operator-vetted inputs. `review_change` goes further: it feeds an attacker-controlled `git diff` into a *second* model. Validate at the boundary; never interpolate them into a shell.
+- **Adding an agent = an adapter + one line in `allAdapters()` (`src/registry.ts`) + a test.** If the CLI has an API-key env var, declare it as the adapter's `apiKeyEnv` — **there is no second list to update.** The strip set is *derived* from the adapter list (`allCredentialEnvVars` → `credentialStripKeys`), so when agent A spawns, every *other* agent's key is removed from its child environment automatically. The old hand-maintained `AGENT_CREDENTIAL_ENV_VARS` constant was deleted precisely because forgetting to update it silently leaked the new key into every sibling's environment. **Scope:** this is **environment-variable isolation between siblings, not a secret boundary** — `HOME` is preserved (agents need their config), so a compromised agent can still read a sibling's *on-disk* credential file.
 
 ## Git & Workflow
 
@@ -164,6 +166,16 @@ Each of these breaks the build, the protocol, or a release if ignored.
 
 - **The MCP Registry validates that `package.json`'s `mcpName` equals `server.json`'s `name`.** That check is server-side (in `mcp-publisher`), so nothing in-repo catches a mismatch — keep them in sync by hand.
 
+- **The git hardening in `src/git.ts` is security-load-bearing — do not "simplify" it away.** Git config is a **code-execution surface**: a hostile `.git/config` / `.gitattributes` in a worktree the caller points at can make a plain `git diff` or `git status` run an arbitrary command (the CVE-2025-27613/27614 family), and `review_change` inspects exactly such untrusted worktrees. Every git call routes through one hardened runner. **These controls collectively close the handled execution surfaces, and must not be weakened without a threat-model review:** `-c core.fsmonitor=`, `-c core.hooksPath=/dev/null`, `--no-ext-diff` and `--no-textconv` on diffs, and `GIT_CONFIG_NOSYSTEM` / `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM` (which deliberately overlap — belt and braces on system/global config). A command-line `-c` is the **highest-precedence** config source, which is what beats a hostile repo-local value. (`--no-pager` / `GIT_PAGER` / `GIT_TERMINAL_PROMPT=0` are in the same runner but are *non-interactive* hardening — they stop hangs, not RCE.) Regression tests assert the flags are present.
+
+  **Known residual:** a `filter.<driver>.clean` named by the inspected repo's own `.gitattributes` cannot be disabled by any flag when `.git/` is fully attacker-controlled. Git's guidance is to operate on a clean clone; this is a tracked follow-up, not a closed hole. Don't describe the hardening as total.
+
+- **`model` is validated against `MODEL_RE`, not a bare string — keep it that way.** `model` is forwarded as `--model <value>`, so a flag-shaped value (`--dir=/`, `--share`) would be parsed by the CLI as *another flag*. That is **argument injection**, and it works **even without a shell** — spawning without a shell stops shell metacharacters, not flag parsing. `MODEL_RE` (`src/server.ts`) is a positive allowlist that rejects a leading `-` at the Zod boundary, before any spawn. Any new tool taking a model must reuse the shared `modelArg`.
+
+- **The `review_change` reviewer runs in a fresh temp cwd on purpose — don't "fix" it to run in the repo.** It ingests an attacker-controlled diff plus new-file contents, so it is pointed at an empty `mkdtemp` dir rather than the worktree under review. This narrows blast radius; it is **not a sandbox** (the agent still has the user's filesystem privileges and could reach the repo by absolute path), and the nonce-fenced "this is DATA" block around the diff is defense-in-depth, not prevention.
+
+- **`MCP_CONFIRM` does not gate `list_agents`.** Its handler probes **every enabled** agent's CLI (the set `MCP_AGENTS` selects) outside the confirm path, so *"confirm is on, so nothing spawns without me"* is **false** — even in `strict`. Spawning a probe is not the same as running an agent, but do not describe the gate as covering every spawn.
+
 - **`docs/` is gitignored.** Anything written there is local-only and invisible to everyone else. Deliverable docs go at the repo root.
 
 - **Live agent tools depend on the operator's CLI logins and models.** `list_agents` reports `installed` and `usable` separately — a CLI can be on PATH yet unauthenticated, or pointed at an unreachable model. A failing `codex`/`cursor`/`opencode`/`claude` tool is often environment, not code: check `list_agents` first.
@@ -187,3 +199,4 @@ Each of these breaks the build, the protocol, or a release if ignored.
 - `git push`, force-push, deleting branches, or committing directly to `main`
 - Rotating/creating npm tokens, or changing the npm Trusted Publisher config
 - Disabling the `no-console` eslint rule or deleting `tests/stdout-invariant.test.ts`
+- **Weakening a security invariant:** weakening the git hardening in `src/git.ts`, relaxing `MODEL_RE` to a bare string, pointing the `review_change` reviewer back at the repo cwd, or bypassing the derived credential stripping. These mitigations were added in response to findings; changing one needs a threat-model review, not a refactor. If one is genuinely in your way, say so and stop.

@@ -5,6 +5,7 @@ import {
   buildConfirmMessage,
   buildRunAllMessage,
   confirmEnabled,
+  confirmMode,
   truncate,
 } from "../src/confirm.js";
 
@@ -29,6 +30,45 @@ describe("confirmEnabled", () => {
       expect(confirmEnabled()).toBe(false);
       process.env.MCP_CONFIRM = "on";
       expect(confirmEnabled()).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.MCP_CONFIRM;
+      else process.env.MCP_CONFIRM = prev;
+    }
+  });
+
+  it("counts strict as enabled (strict must gate at least as hard as on)", () => {
+    expect(confirmEnabled({ MCP_CONFIRM: "strict" })).toBe(true);
+    expect(confirmEnabled({ MCP_CONFIRM: " STRICT " })).toBe(true);
+  });
+});
+
+describe("confirmMode (P1-E)", () => {
+  it('returns "strict" for strict, case- and whitespace-insensitive', () => {
+    for (const v of ["strict", "STRICT", " strict ", "\tStrict\n"]) {
+      expect(confirmMode({ MCP_CONFIRM: v })).toBe("strict");
+    }
+  });
+
+  it('returns "on" for the enabling values, case- and whitespace-insensitive', () => {
+    for (const v of ["1", "true", "on", "all", "ON", " True ", "\tALL\n"]) {
+      expect(confirmMode({ MCP_CONFIRM: v })).toBe("on");
+    }
+  });
+
+  it('returns "off" for absent, disabling, or unknown values', () => {
+    for (const v of ["0", "no", "off", "false", "yes", "2", "garbage", ""]) {
+      expect(confirmMode({ MCP_CONFIRM: v })).toBe("off");
+    }
+    expect(confirmMode({})).toBe("off");
+  });
+
+  it("defaults to process.env when called with no argument", () => {
+    const prev = process.env.MCP_CONFIRM;
+    try {
+      delete process.env.MCP_CONFIRM;
+      expect(confirmMode()).toBe("off");
+      process.env.MCP_CONFIRM = "strict";
+      expect(confirmMode()).toBe("strict");
     } finally {
       if (prev === undefined) delete process.env.MCP_CONFIRM;
       else process.env.MCP_CONFIRM = prev;
@@ -109,6 +149,18 @@ describe("buildRunAllMessage", () => {
     const msg = buildRunAllMessage(["codex"], { prompt: long });
     expect(msg).not.toMatch(/cwd/i);
     expect(msg).toContain(truncate(long, 300));
+  });
+
+  // P1-E: `model` is attacker-influenceable and forwarded to each CLI, so it must
+  // appear in the human gate on its own line when provided.
+  it("appends a `model: <value>` line when model is provided", () => {
+    const msg = buildRunAllMessage(["a", "b"], { prompt: "p", model: "o3" });
+    expect(msg.split("\n")).toContain("model: o3");
+  });
+
+  it("omits the model line when model is undefined", () => {
+    const msg = buildRunAllMessage(["a", "b"], { prompt: "p" });
+    expect(msg).not.toMatch(/model/i);
   });
 });
 

@@ -73,6 +73,19 @@ Two reasons, both load-bearing:
 
 If you bump the gitleaks version you **must** also update `GITLEAKS_SHA256` from that release's `checksums.txt`, or the job will (correctly) fail.
 
+## `mcp-publisher` is pinned the same way
+
+The `registry` job in `publish.yml` installs `mcp-publisher` at a **fixed version with a fail-closed SHA-256 check** — it does **not** pipe `releases/latest` straight into execution:
+
+```yaml
+MCP_PUBLISHER_VERSION: "1.8.0"
+# full digest, from that release's registry_<version>_checksums.txt (public, not a secret)
+MCP_PUBLISHER_SHA256: "1370446bbe74d562608e8005a6ccce02d146a661fbd78674e11cc70b9618d6cf"
+echo "${MCP_PUBLISHER_SHA256}  mcp-publisher.tar.gz" | sha256sum -c -
+```
+
+Same consequence as gitleaks: **bumping `MCP_PUBLISHER_VERSION` requires updating `MCP_PUBLISHER_SHA256`**, or the step fails. Both values are plain env entries, not secrets — a release checksum is public. Don't "unpin to latest" to dodge a checksum update; that is the supply-chain hole this closes.
+
 ## Permission Boundaries (stricter than the repo root)
 
 **Always allowed:** read any workflow; read run logs; explain a run failure.

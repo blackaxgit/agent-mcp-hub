@@ -1,10 +1,13 @@
 import { createRequire } from "node:module";
 import { randomBytes } from "node:crypto";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { runCommand, type Exec, type ExecResult, OutputLimitError } from "./exec.js";
 import {
-  confirmEnabled,
+  confirmMode,
   buildConfirmMessage,
   buildRunAllMessage,
   CONFIRM_SCHEMA,
@@ -12,28 +15,23 @@ import {
 } from "./confirm.js";
 import { classifyFailure } from "./failure.js";
 import { isGitRepo, worktreeDirty, captureChange } from "./git.js";
-import { checkAvailability, resolveOnPath, type ResolveBinary } from "./registry.js";
+import {
+  checkAvailability,
+  credentialStripKeys,
+  resolveOnPath,
+  type ResolveBinary,
+} from "./registry.js";
 import type { ElicitRequestFormParams } from "@modelcontextprotocol/sdk/types.js";
 import type { AgentAdapter } from "./types.js";
 
 const { version } = createRequire(import.meta.url)("../package.json") as { version: string };
 
 /**
- * Every wrapped agent's credential env var. A child is given only its own (the
- * others are stripped) so one agent can never read another's secret. Kept in one
- * place so a new adapter's key is added here alongside its `apiKeyEnv`.
- */
-const AGENT_CREDENTIAL_ENV_VARS = [
-  "OPENAI_API_KEY",
-  "ANTHROPIC_API_KEY",
-  "CURSOR_API_KEY",
-] as const;
-
-/**
  * Single execution path for every agent tool: build the invocation, run it, and
  * emit one structured audit line to stderr (never stdout — C5). Both the
  * per-agent tools and run_all funnel through here so exec-path behavior stays in
- * one place.
+ * one place. Credential isolation is DERIVED from the adapter list
+ * (`credentialStripKeys`), not a hand-maintained duplicate — see registry.ts.
  */
 async function runAdapter(
   adapter: AgentAdapter,
@@ -47,19 +45,24 @@ async function runAdapter(
   },
   onActivity?: () => void,
 ): Promise<ExecResult> {
-  const invocation = adapter.buildInvocation(params.prompt, { model: params.model });
   const start = Date.now();
-  const audit = (exitCode: number | null | undefined) =>
+  // One structured line per run. `exitCode` is always emitted (null on a
+  // spawn/timeout/invocation error, never dropped — a failed run must not log as
+  // if it had no result), and `ok`/`error` record the outcome for forensics.
+  const audit = (fields: { exitCode: number | null; ok: boolean; error?: string }) =>
     console.error(
       JSON.stringify({
         evt: "agent_run",
         agent: adapter.name,
         cwd: params.cwd ?? null,
         ms: Date.now() - start,
-        exitCode,
+        ...fields,
       }),
     );
   try {
+    // Inside the try so a buildInvocation throw (e.g. opencode's dash-guard) is
+    // audited too, rather than escaping with no run-log trace.
+    const invocation = adapter.buildInvocation(params.prompt, { model: params.model });
     const result = await exec(adapter.binary, invocation.args, {
       cwd: params.cwd,
       timeoutMs: params.timeoutMs,
@@ -67,18 +70,17 @@ async function runAdapter(
       input: invocation.stdin,
       onActivity,
       stallSignatures: adapter.stallSignatures,
-      // Least privilege: an agent with its OWN key sees only that one, never a
-      // sibling's, so a compromised or prompt-injected agent cannot read another
-      // agent's secret. Provider-agnostic agents (no apiKeyEnv, e.g. opencode)
-      // may legitimately use ANY provider key, so nothing is stripped for them.
-      stripEnvKeys: adapter.apiKeyEnv
-        ? AGENT_CREDENTIAL_ENV_VARS.filter((k) => k !== adapter.apiKeyEnv)
-        : undefined,
+      // Least privilege: strip every OTHER agent's credential key so a
+      // compromised or prompt-injected agent cannot read a sibling's secret. The
+      // set is derived from the adapters — opencode (no own key) has ALL tracked
+      // keys stripped rather than inheriting them.
+      stripEnvKeys: credentialStripKeys(adapter),
     });
-    audit(result.exitCode);
+    audit({ exitCode: result.exitCode, ok: result.exitCode === 0 });
     return result;
   } catch (err) {
-    audit(undefined);
+    const code = err instanceof Error && "code" in err ? String(err.code) : "error";
+    audit({ exitCode: null, ok: false, error: code });
     throw err;
   }
 }
@@ -132,14 +134,29 @@ function makeProgressEmitter(
   };
 }
 
+/**
+ * Model id, forwarded to the CLI as `--model <value>`. Validated with a positive
+ * allowlist (letters/digits then `. _ : / -`, ≤128 chars) so a flag-shaped value
+ * — anything starting with `-`, e.g. `--dir=/` or `--share` — is REJECTED. A CLI
+ * parses a hyphen-leading token in that position as another flag, not the model,
+ * which is argument injection even without a shell; the allowlist closes it and
+ * also bounds length. `o3`, `gpt-5.3-codex-high`, `openai/gpt-5`, `sonnet-4-thinking`
+ * all pass.
+ */
+export const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
+const modelArg = z
+  .string()
+  .refine((v) => MODEL_RE.test(v), {
+    message:
+      "invalid model id: must start with a letter or digit and contain only letters, digits, and . _ : / - (≤128 chars). A flag-shaped value (leading '-') is rejected to prevent CLI argument injection.",
+  })
+  .optional();
+
 const agentInputSchema = {
   prompt: z.string().describe("The task or question for the agent, in natural language."),
-  model: z
-    .string()
-    .optional()
-    .describe(
-      'Optional model id passed through to the CLI, overriding that CLI\'s configured/default model (e.g. "o3"). Model names are agent-specific.',
-    ),
+  model: modelArg.describe(
+    'Optional model id passed through to the CLI, overriding that CLI\'s configured/default model (e.g. "o3"). Model names are agent-specific. Must match [A-Za-z0-9][A-Za-z0-9._:/-]{0,127} — a flag-shaped value is rejected.',
+  ),
   cwd: z
     .string()
     .optional()
@@ -182,18 +199,25 @@ export function buildServer(
   // process (one server per stdio process), not on every gated call.
   let confirmDegradeWarned = false;
   async function confirmOrCancel(summary: string): Promise<boolean> {
-    if (!confirmEnabled()) return true;
+    const mode = confirmMode();
+    if (mode === "off") return true;
     const caps = server.server.getClientCapabilities();
     // Guard on .form: the SDK normalizes a client's elicitation:{} to {form:{}};
-    // clients that do not advertise it lack the capability and must degrade.
+    // clients that do not advertise it lack the capability.
     if (caps?.elicitation?.form === undefined) {
-      // The operator asked for a human gate but the client cannot render one;
-      // surface that we are proceeding ungated rather than silently pretending
-      // a confirmation occurred (stderr only — stdout is the MCP channel, C5).
+      // The operator asked for a human gate but the client cannot render one.
+      // strict → FAIL CLOSED (refuse); on → degrade open (run, warn once). Either
+      // way, surface it on stderr — stdout is the MCP channel (C5).
+      if (mode === "strict") {
+        console.error(
+          "MCP_CONFIRM=strict but this client cannot show a confirmation prompt; REFUSING to run (fail-closed).",
+        );
+        return false;
+      }
       if (!confirmDegradeWarned) {
         confirmDegradeWarned = true;
         console.error(
-          "MCP_CONFIRM is set but this client cannot show a confirmation prompt; running the agent WITHOUT a human gate.",
+          "MCP_CONFIRM is set but this client cannot show a confirmation prompt; running the agent WITHOUT a human gate. Set MCP_CONFIRM=strict to refuse instead.",
         );
       }
       return true;
@@ -285,12 +309,9 @@ export function buildServer(
         prompt: z
           .string()
           .describe("The task or question to send to every agent, in natural language."),
-        model: z
-          .string()
-          .optional()
-          .describe(
-            "Optional model id override passed through to each agent CLI. Names are agent-specific.",
-          ),
+        model: modelArg.describe(
+          "Optional model id override passed through to each agent CLI. Names are agent-specific. Must match [A-Za-z0-9][A-Za-z0-9._:/-]{0,127} — a flag-shaped value is rejected.",
+        ),
         cwd: z
           .string()
           .optional()
@@ -321,7 +342,7 @@ export function buildServer(
         !(await confirmOrCancel(
           buildRunAllMessage(
             adapters.map((a) => a.name),
-            { prompt, cwd },
+            { prompt, cwd, model },
           ),
         ))
       ) {
@@ -363,7 +384,9 @@ export function buildServer(
         reviewer: z.string().describe("Adapter name of the agent that judges the change"),
         prompt: z.string().describe("Task or question to send to the runner agent"),
         cwd: z.string().describe("Git working tree the runner operates in (REQUIRED)"),
-        model: z.string().optional().describe("Model override passed to both agents"),
+        model: modelArg.describe(
+          "Model override passed to both agents. Must match [A-Za-z0-9][A-Za-z0-9._:/-]{0,127} — a flag-shaped value is rejected.",
+        ),
         timeoutMs: z.number().int().positive().optional().describe("Per-agent timeout in ms"),
       },
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
@@ -389,7 +412,9 @@ export function buildServer(
 
       if (
         !(await confirmOrCancel(
-          `review_change: run ${runner} in ${cwd}, then review with ${reviewer}\nprompt: ${prompt}`,
+          `review_change: run ${runner} in ${cwd}, then review with ${reviewer}\nprompt: ${prompt}${
+            model === undefined ? "" : `\nmodel: ${model}`
+          }`,
         ))
       ) {
         return {
@@ -534,12 +559,22 @@ export function buildServer(
         .filter((line) => line !== "")
         .join("\n");
 
+      // Reduce the reviewer's blast radius: it ingests attacker-influenced diff +
+      // new-file bodies, so it runs in a FRESH EMPTY temp dir — never the worktree
+      // under review. If a prompt injection survives the nonce fence (fencing is
+      // defense-in-depth only), the reviewer no longer has the user's repo as its
+      // working directory. NOTE: this is a mitigation, not a hard sandbox — the
+      // reviewer is a coding agent that still runs with the user's filesystem
+      // privileges and could reach the repo by absolute path. A real sandbox
+      // (no-network / non-root / no-credentials, e.g. bwrap or a container) is a
+      // tracked follow-up; it is a larger change than this security patch.
+      const reviewerCwd = await mkdtemp(join(tmpdir(), "agent-mcp-hub-review-"));
       let reviewResult: ExecResult;
       try {
         reviewResult = await runAdapter(reviewerAdapter, exec, {
           prompt: reviewPrompt,
           model,
-          cwd,
+          cwd: reviewerCwd,
           timeoutMs,
         });
       } catch (err) {
@@ -559,6 +594,10 @@ export function buildServer(
             },
           ],
         };
+      } finally {
+        // Remove the throwaway cwd on every exit path (success, reviewer error,
+        // fall-through). Best-effort — cleanup failure must not mask the result.
+        await rm(reviewerCwd, { recursive: true, force: true }).catch(() => {});
       }
       if (reviewResult.exitCode !== 0) {
         const statSection =

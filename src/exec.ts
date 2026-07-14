@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { statSync } from "node:fs";
 import { stripAnsi } from "./ansi.js";
 
@@ -42,11 +42,22 @@ export type Exec = (
      * denylist that keeps exec generic — it never learns which adapter owns
      * which key. Callers pass the OTHER agents' credential var names (the union
      * of every agent's apiKeyEnv MINUS the one being spawned) so a compromised
-     * or prompt-injected child can never read a sibling agent's secret. Every
-     * other var (PATH, HOME, proxy/CA/XDG/locale) is preserved. Undefined or
+     * or prompt-injected child cannot read a sibling agent's key FROM THE ENV.
+     * This is env-var isolation, not a full secret boundary: `HOME` is preserved
+     * (agents need their config there), so an agent can still read a sibling's
+     * on-disk credential file — hardening the env is necessary but not sufficient.
+     * Every other var (PATH, HOME, proxy/CA/XDG/locale) is preserved. Undefined or
      * empty leaves behavior identical to inheriting the full parent env.
      */
     stripEnvKeys?: readonly string[];
+    /**
+     * Env vars to SET on the child, applied AFTER stripEnvKeys (so an override
+     * here always wins). Used to harden a subprocess against its own working
+     * tree — e.g. neutralising git's config search path so an untrusted repo's
+     * `.git/config` / global / system config cannot execute code during
+     * `git diff` / `git status`. Keys set here are never treated as strippable.
+     */
+    env?: Readonly<Record<string, string>>;
   },
 ) => Promise<ExecResult>;
 
@@ -76,6 +87,22 @@ export const DEFAULT_IDLE_TIMEOUT_MS = parsePositiveInt(
 export const DEFAULT_MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
 export const DEFAULT_STALL_ATTEMPT_LIMIT = 2;
 export const DEFAULT_STALL_STRIKE_LIMIT = 4;
+
+/**
+ * Hard ceiling on any single timer (total or idle). Two jobs:
+ *  1. Correctness — `setTimeout` truncates a delay > 2^31-1 ms (~24.8 days) to
+ *     1ms and fires it IMMEDIATELY, so an unclamped huge `timeoutMs` would kill
+ *     the child the instant it starts. 24h is safely under that boundary.
+ *  2. Load-shedding — a single run can hold a concurrency slot for at most 24h,
+ *     so a caller cannot pin all slots for weeks with an enormous `timeoutMs`.
+ */
+export const MAX_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+
+/** Clamp a caller-supplied timer to [1, MAX_TIMEOUT_MS]; floors non-integers. */
+export function clampTimer(ms: number): number {
+  if (!Number.isFinite(ms)) return MAX_TIMEOUT_MS;
+  return Math.min(Math.max(1, Math.floor(ms)), MAX_TIMEOUT_MS);
+}
 
 /** Positive finite integer only; NaN/0/negative/non-integer all fall back to 4. */
 function parseConcurrency(raw: string | undefined): number {
@@ -207,6 +234,55 @@ function killGroup(pid: number | undefined, signal: NodeJS.Signals, fallback: ()
 }
 
 /**
+ * Live children spawned by this module. Children are `detached` (their own group
+ * leaders), so if the server process dies without reaping them, their whole
+ * process tree is orphaned and keeps running. We track every live child and, on
+ * server shutdown, SIGKILL each group.
+ *
+ * Reaping uses the same POSIX `process.kill(-pid)` group kill as the rest of the
+ * module. On a platform without process groups (Windows) that falls back to
+ * killing only the direct child, so a grandchild there could still leak — a
+ * pre-existing limitation of the codebase's POSIX-oriented kill strategy, not of
+ * this reaper. The runtime target is POSIX (unix agent CLIs).
+ */
+const liveChildren = new Set<ChildProcess>();
+
+/** SIGKILL a child's whole process group, falling back to the bare child. */
+function killChildGroup(child: ChildProcess): void {
+  killGroup(child.pid, "SIGKILL", () => child.kill("SIGKILL"));
+}
+
+/** Best-effort: kill every still-live child's process group. Never throws. */
+export function reapAllChildren(): void {
+  for (const child of liveChildren) {
+    killChildGroup(child);
+  }
+}
+
+// Install the shutdown reaper exactly once, lazily on first spawn (so importing
+// this module has no global side effect). `exit` runs synchronously on any exit;
+// the SIGINT/SIGTERM/SIGHUP handlers reap first, remove themselves, then re-raise
+// the signal so the process still terminates with the default disposition.
+let shutdownHandlersInstalled = false;
+function installShutdownReaper(): void {
+  if (shutdownHandlersInstalled) return;
+  shutdownHandlersInstalled = true;
+  process.once("exit", reapAllChildren);
+  for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+    /* v8 ignore start -- the handler re-raises the signal, which would terminate
+       the test runner; the reap it performs IS covered directly via
+       reapAllChildren() in exec.test.ts. */
+    const handler = (): void => {
+      reapAllChildren();
+      process.removeListener(sig, handler);
+      process.kill(process.pid, sig);
+    };
+    /* v8 ignore stop */
+    process.on(sig, handler);
+  }
+}
+
+/**
  * FIFO async semaphore. `acquire` resolves to a release token that hands the
  * permit straight to the next waiter (never bumping the count while anyone is
  * queued) and is idempotent so a double release cannot leak an extra permit.
@@ -282,8 +358,8 @@ type TerminalCause =
   | { kind: "stall"; signature: string; strikes: number };
 
 const runCommandInner: Exec = (binary, args, opts = {}) => {
-  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const idleTimeoutMs = opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
+  const timeoutMs = clampTimer(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const idleTimeoutMs = clampTimer(opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS);
   const maxOutputBytes = opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
   const stallSignatures = opts.stallSignatures ?? null;
   const stallAttemptLimit = opts.stallAttemptLimit ?? DEFAULT_STALL_ATTEMPT_LIMIT;
@@ -295,13 +371,17 @@ const runCommandInner: Exec = (binary, args, opts = {}) => {
       reject(new InvalidCwdError(opts.cwd));
       return;
     }
-    // Only build an explicit env when there is something to strip; otherwise omit
-    // the option so the child inherits process.env verbatim (unchanged behavior).
+    // Build an explicit env only when there is something to strip OR overlay;
+    // otherwise omit the option so the child inherits process.env verbatim
+    // (unchanged behavior). Strip first, then overlay — an `env` override always
+    // wins and is never removed by a later strip key.
     const stripEnvKeys = opts.stripEnvKeys;
+    const envOverlay = opts.env;
     let childEnv: NodeJS.ProcessEnv | undefined;
-    if (stripEnvKeys && stripEnvKeys.length > 0) {
+    if ((stripEnvKeys && stripEnvKeys.length > 0) || envOverlay) {
       childEnv = { ...process.env };
-      for (const key of stripEnvKeys) delete childEnv[key];
+      if (stripEnvKeys) for (const key of stripEnvKeys) delete childEnv[key];
+      if (envOverlay) Object.assign(childEnv, envOverlay);
     }
     const child = spawn(binary, args, {
       cwd: opts.cwd,
@@ -309,7 +389,9 @@ const runCommandInner: Exec = (binary, args, opts = {}) => {
       stdio: [opts.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       ...(childEnv ? { env: childEnv } : {}),
     });
-    const killTree = () => killGroup(child.pid, "SIGKILL", () => child.kill("SIGKILL"));
+    liveChildren.add(child);
+    installShutdownReaper();
+    const killTree = () => killChildGroup(child);
 
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
@@ -481,6 +563,7 @@ const runCommandInner: Exec = (binary, args, opts = {}) => {
 
     child.on("error", (err) => {
       clearTimers();
+      liveChildren.delete(child);
       if (settled) return;
       settled = true;
       reject(
@@ -493,6 +576,7 @@ const runCommandInner: Exec = (binary, args, opts = {}) => {
 
     child.on("close", (code) => {
       clearTimers();
+      liveChildren.delete(child);
       if (settled) return;
       settled = true;
       if (terminalCause) {

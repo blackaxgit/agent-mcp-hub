@@ -5,13 +5,38 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { SpawnError, TimeoutError, OutputLimitError, type Exec } from "../src/exec.js";
-import { allAdapters, enabledAdapters, type ResolveBinary } from "../src/registry.js";
-import { buildServer } from "../src/server.js";
+import {
+  allAdapters,
+  enabledAdapters,
+  credentialStripKeys,
+  type ResolveBinary,
+} from "../src/registry.js";
+import { hardenedGitArgs, GIT_HARDENING_ENV } from "../src/git.js";
+import { buildServer, MODEL_RE } from "../src/server.js";
 
 const pkg = createRequire(import.meta.url)("../package.json") as { version: string };
 
 /** Every binary resolves, so availability turns purely on the injected exec. */
 const allResolve: ResolveBinary = (b) => `/usr/local/bin/${b}`;
+
+// src/git.ts hardens every git call: git() prepends a fixed top-level prefix
+// (`-c core.fsmonitor= -c core.hooksPath=/dev/null --no-pager`) and diff calls
+// carry `--no-ext-diff --no-textconv`, so a mock can no longer branch on
+// args[0]. Strip the prefix to recover the logical subcommand.
+const GIT_PREFIX_LEN = hardenedGitArgs([]).length;
+function gitSub(args: string[]): string[] {
+  return args.slice(GIT_PREFIX_LEN);
+}
+/** Classify a hardened git call by its logical operation (mocks branch on this). */
+function gitOp(args: string[]): string {
+  const s = gitSub(args);
+  if (s[0] === "diff") {
+    if (s.includes("--no-index")) return "read-untracked";
+    if (s.includes("--stat")) return "diff-stat";
+    return "diff";
+  }
+  return s[0] ?? "";
+}
 
 async function connectedClient(exec: Exec, resolve: ResolveBinary = allResolve) {
   const server = buildServer(allAdapters(), exec, resolve);
@@ -84,24 +109,33 @@ describe("buildServer", () => {
     expect(textOf(res)).toBe("done");
   });
 
-  it("FN-5: strips sibling agents' credential vars for a keyed agent, nothing for a keyless one", async () => {
+  it("FN-5 (P1-D): strips sibling agents' credential vars for a keyed agent, ALL of them for a keyless one", async () => {
     const exec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
     const client = await connectedClient(exec);
 
     // codex owns OPENAI_API_KEY -> the two siblings are stripped, its own kept.
+    // The exact set is DERIVED from the registry (P1-D: no hand-maintained
+    // duplicate to drift), and its own key is never in the strip list.
     await client.callTool({ name: "codex", arguments: { prompt: "x" } });
     const codexOpts = (
       exec as unknown as { mock: { calls: [string, string[], { stripEnvKeys?: string[] }][] } }
     ).mock.calls.at(-1)![2];
-    expect(codexOpts.stripEnvKeys).toEqual(["ANTHROPIC_API_KEY", "CURSOR_API_KEY"]);
+    const codexAdapter = allAdapters().find((a) => a.name === "codex")!;
+    expect(codexOpts.stripEnvKeys).toEqual([...credentialStripKeys(codexAdapter)]);
     expect(codexOpts.stripEnvKeys).not.toContain("OPENAI_API_KEY");
 
-    // opencode is provider-agnostic (no apiKeyEnv) -> nothing is stripped.
+    // opencode is provider-agnostic (no apiKeyEnv) -> it owns NO key, so under
+    // least privilege EVERY tracked credential is stripped (it must not inherit
+    // a sibling's secret), not left intact as before.
     await client.callTool({ name: "opencode", arguments: { prompt: "x" } });
     const openOpts = (
       exec as unknown as { mock: { calls: [string, string[], { stripEnvKeys?: string[] }][] } }
     ).mock.calls.at(-1)![2];
-    expect(openOpts.stripEnvKeys).toBeUndefined();
+    const opencodeAdapter = allAdapters().find((a) => a.name === "opencode")!;
+    expect(openOpts.stripEnvKeys).toEqual([...credentialStripKeys(opencodeAdapter)]);
+    expect(openOpts.stripEnvKeys).toEqual(
+      expect.arrayContaining(["OPENAI_API_KEY", "CURSOR_API_KEY", "ANTHROPIC_API_KEY"]),
+    );
   });
 
   it("forwards idleTimeoutMs from the tool input into the exec opts", async () => {
@@ -872,23 +906,22 @@ describe("review_change", () => {
   function gitCleanExec(extra: Record<string, Exec> = {}) {
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "--stat")
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat")
           return {
             stdout: " M foo.ts\n 1 file changed, 1 insertion(+)\n",
             stderr: "",
             exitCode: 0,
           };
-        if (args[0] === "diff")
+        if (gitOp(args) === "diff")
           return {
             stdout:
               "diff --git a/foo.ts b/foo.ts\n--- a/foo.ts\n+++ b/foo.ts\n@@ -1 +1 @@\n-old\n+new\n",
             stderr: "",
             exitCode: 0,
           };
-        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
       }
       return extra[binary]
         ? extra[binary](binary, args)
@@ -910,14 +943,12 @@ describe("review_change", () => {
     }));
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "--stat")
-          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
-        if (args[0] === "diff")
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff")
           return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
-        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return runnerExec(binary, args);
       if (binary === "claude") return reviewerExec(binary, args);
@@ -946,14 +977,12 @@ describe("review_change", () => {
   it("A2 verdict FAIL: text contains FAIL, isError falsy", async () => {
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "--stat")
-          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
-        if (args[0] === "diff")
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff")
           return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
-        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return { stdout: "done\n", stderr: "", exitCode: 0 };
       if (binary === "claude")
@@ -972,14 +1001,12 @@ describe("review_change", () => {
   it("A2 verdict default: no PASS/WARN/FAIL first line → WARN", async () => {
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "--stat")
-          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
-        if (args[0] === "diff")
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff")
           return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
-        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return { stdout: "done\n", stderr: "", exitCode: 0 };
       if (binary === "claude") return { stdout: "looks okay to me\n", stderr: "", exitCode: 0 };
@@ -998,7 +1025,7 @@ describe("review_change", () => {
     const runnerExec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "", stderr: "", exitCode: 128 };
+        if (gitOp(args) === "rev-parse") return { stdout: "", stderr: "", exitCode: 128 };
         return { stdout: "", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return runnerExec(binary, args);
@@ -1018,7 +1045,7 @@ describe("review_change", () => {
     const runnerExec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") throw new Error("git rev-parse boom");
+        if (gitOp(args) === "rev-parse") throw new Error("git rev-parse boom");
         return { stdout: "", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return runnerExec(binary, args);
@@ -1038,9 +1065,8 @@ describe("review_change", () => {
     const reviewerExec: Exec = vi.fn(async () => ({ stdout: "PASS\n", stderr: "", exitCode: 0 }));
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
         return { stdout: "", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") throw new Error("runner boom");
@@ -1056,7 +1082,7 @@ describe("review_change", () => {
     expect(textOf(res)).toContain("runner boom");
     expect(reviewerExec).not.toHaveBeenCalled();
     const gitCalls = (exec as ReturnType<typeof vi.fn>).mock.calls.filter((c) => c[0] === "git");
-    const diffCalls = gitCalls.filter((c) => c[1][0] === "diff");
+    const diffCalls = gitCalls.filter((c) => gitSub(c[1])[0] === "diff");
     expect(diffCalls).toHaveLength(0);
   });
 
@@ -1064,13 +1090,11 @@ describe("review_change", () => {
     const reviewerExec: Exec = vi.fn(async () => ({ stdout: "PASS\n", stderr: "", exitCode: 0 }));
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: " M x\n", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "--stat")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff") return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: " M x\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return { stdout: "no-op\n", stderr: "", exitCode: 0 };
       if (binary === "claude") return reviewerExec(binary, args);
@@ -1105,9 +1129,8 @@ describe("review_change", () => {
     const reviewerExec: Exec = vi.fn(async () => ({ stdout: "PASS\n", stderr: "", exitCode: 0 }));
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
         return { stdout: "", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return { stdout: "error output\n", stderr: "boom", exitCode: 1 };
@@ -1124,7 +1147,7 @@ describe("review_change", () => {
     expect(reviewerExec).not.toHaveBeenCalled();
     // diff --stat and diff HEAD should not have been called (runner failed before capture)
     const gitCalls = (exec as ReturnType<typeof vi.fn>).mock.calls.filter((c) => c[0] === "git");
-    const diffCalls = gitCalls.filter((c) => c[1][0] === "diff");
+    const diffCalls = gitCalls.filter((c) => gitSub(c[1])[0] === "diff");
     expect(diffCalls).toHaveLength(0);
   });
 
@@ -1132,13 +1155,11 @@ describe("review_change", () => {
     const reviewerExec: Exec = vi.fn(async () => ({ stdout: "PASS\n", stderr: "", exitCode: 0 }));
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "--stat")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff") return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return { stdout: "no-op\n", stderr: "", exitCode: 0 };
       if (binary === "claude") return reviewerExec(binary, args);
@@ -1159,14 +1180,12 @@ describe("review_change", () => {
     const reviewerExec: Exec = vi.fn(async () => ({ stdout: "PASS\n", stderr: "", exitCode: 0 }));
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: " M x\n", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "--stat")
-          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
-        if (args[0] === "diff")
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: " M x\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff")
           return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
-        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return runnerExec(binary, args);
       if (binary === "claude") return reviewerExec(binary, args);
@@ -1180,7 +1199,7 @@ describe("review_change", () => {
     expect(res.isError).toBeFalsy();
     expect(textOf(res)).toContain("worktree was already dirty");
     const calls = (exec as ReturnType<typeof vi.fn>).mock.calls;
-    const statusIdx = calls.findIndex((c) => c[0] === "git" && c[1][0] === "status");
+    const statusIdx = calls.findIndex((c) => c[0] === "git" && gitSub(c[1])[0] === "status");
     const runnerIdx = calls.findIndex((c) => c[0] === "codex");
     expect(statusIdx).toBeGreaterThan(-1);
     expect(runnerIdx).toBeGreaterThan(-1);
@@ -1217,13 +1236,11 @@ describe("review_change", () => {
     }));
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "--stat")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff") return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "ls-files") return { stdout: "new.ts\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "ls-files") return { stdout: "new.ts\0", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return { stdout: "created new.ts\n", stderr: "", exitCode: 0 };
       if (binary === "claude") return reviewerExec(binary, args);
@@ -1245,13 +1262,11 @@ describe("review_change", () => {
     const reviewerExec: Exec = vi.fn(async () => ({ stdout: "PASS\n", stderr: "", exitCode: 0 }));
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "--stat")
-          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
-        if (args[0] === "diff") throw new OutputLimitError("too big", 1000);
-        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff") throw new OutputLimitError("too big", 1000);
+        if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return { stdout: "done\n", stderr: "", exitCode: 0 };
       if (binary === "claude") return reviewerExec(binary, args);
@@ -1273,14 +1288,12 @@ describe("review_change", () => {
   it("A12 reviewer fail: reviewer exitCode 1 → isError true, text includes runner output + review-could-not-run note", async () => {
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "--stat")
-          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
-        if (args[0] === "diff")
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff")
           return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
-        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return { stdout: "done editing\n", stderr: "", exitCode: 0 };
       if (binary === "claude") return { stdout: "", stderr: "reviewer boom", exitCode: 1 };
@@ -1342,14 +1355,12 @@ describe("review_change", () => {
   it("verdict lower/mixed case: 'pass\\nlgtm' → PASS; '  fail: broken' → FAIL", async () => {
     const exec1: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "--stat")
-          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
-        if (args[0] === "diff")
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff")
           return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
-        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return { stdout: "done\n", stderr: "", exitCode: 0 };
       if (binary === "claude") return { stdout: "pass\nlgtm\n", stderr: "", exitCode: 0 };
@@ -1366,14 +1377,12 @@ describe("review_change", () => {
 
     const exec2: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "--stat")
-          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
-        if (args[0] === "diff")
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff")
           return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
-        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return { stdout: "done\n", stderr: "", exitCode: 0 };
       if (binary === "claude") return { stdout: "  fail: broken\n", stderr: "", exitCode: 0 };
@@ -1391,14 +1400,12 @@ describe("review_change", () => {
   it("reviewer THROW path: SpawnError → isError, runner output + 'Review could not run' + classified error; no '## Review by' section", async () => {
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "--stat")
-          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
-        if (args[0] === "diff")
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff")
           return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
-        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return { stdout: "done editing\n", stderr: "", exitCode: 0 };
       if (binary === "claude") throw new SpawnError("boom");
@@ -1421,13 +1428,11 @@ describe("review_change", () => {
   it("reviewer THROW with empty stat + untracked → covers true branches of both ternaries in catch block", async () => {
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "--stat")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff") return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "ls-files") return { stdout: "new.ts\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "ls-files") return { stdout: "new.ts\0", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return { stdout: "created new.ts\n", stderr: "", exitCode: 0 };
       if (binary === "claude") throw new SpawnError("boom");
@@ -1449,13 +1454,11 @@ describe("review_change", () => {
     const reviewerExec: Exec = vi.fn(async () => ({ stdout: "PASS\n", stderr: "", exitCode: 0 }));
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "--stat")
-          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
-        if (args[0] === "diff") throw new Error("git boom");
-        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff") throw new Error("git boom");
+        if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return { stdout: "done\n", stderr: "", exitCode: 0 };
       if (binary === "claude") return reviewerExec(binary, args);
@@ -1478,13 +1481,11 @@ describe("review_change", () => {
   it("reviewer-error text with empty stat + untracked: no '## Change (git diff --stat)' section but 'New files: new.ts' present", async () => {
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "--stat")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff") return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "ls-files") return { stdout: "new.ts\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "ls-files") return { stdout: "new.ts\0", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return { stdout: "created new.ts\n", stderr: "", exitCode: 0 };
       if (binary === "claude") return { stdout: "", stderr: "reviewer boom", exitCode: 1 };
@@ -1506,8 +1507,8 @@ describe("review_change", () => {
     const runnerExec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain") throw new Error("status boom");
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") throw new Error("status boom");
         return { stdout: "", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return runnerExec(binary, args);
@@ -1531,13 +1532,11 @@ describe("review_change", () => {
     }));
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "--stat")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff") return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "ls-files") return { stdout: "new.ts\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "ls-files") return { stdout: "new.ts\0", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return { stdout: "created new.ts\n", stderr: "", exitCode: 0 };
       if (binary === "claude") return reviewerExec(binary, args);
@@ -1567,13 +1566,11 @@ describe("review_change", () => {
     }));
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "--stat")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff") return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "ls-files") return { stdout: "new.ts\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "ls-files") return { stdout: "new.ts\0", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return { stdout: "created new.ts\n", stderr: "", exitCode: 0 };
       if (binary === "claude") return reviewerExec(binary, args);
@@ -1599,18 +1596,17 @@ describe("review_change", () => {
     }));
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "--stat")
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat")
           return {
             stdout: " M foo.ts\n 1 file changed, 1 insertion(+)\n",
             stderr: "",
             exitCode: 0,
           };
-        if (args[0] === "diff")
+        if (gitOp(args) === "diff")
           return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
-        if (args[0] === "ls-files") return { stdout: "extra.ts\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "ls-files") return { stdout: "extra.ts\0", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return { stdout: "done editing\n", stderr: "", exitCode: 0 };
       if (binary === "claude") return reviewerExec(binary, args);
@@ -1631,14 +1627,12 @@ describe("review_change", () => {
   it("empty reviewer output → default WARN verdict", async () => {
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "--stat")
-          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
-        if (args[0] === "diff")
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff")
           return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
-        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return { stdout: "done\n", stderr: "", exitCode: 0 };
       if (binary === "claude") return { stdout: "", stderr: "", exitCode: 0 };
@@ -1659,13 +1653,11 @@ describe("review_change", () => {
     const reviewerExec: Exec = vi.fn(async () => ({ stdout: "PASS\n", stderr: "", exitCode: 0 }));
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "--stat")
-          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
-        if (args[0] === "diff") return Promise.reject("raw string failure");
-        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff") return Promise.reject("raw string failure");
+        if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return { stdout: "done\n", stderr: "", exitCode: 0 };
       if (binary === "claude") return reviewerExec(binary, args);
@@ -1686,7 +1678,7 @@ describe("review_change", () => {
     const runnerExec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return Promise.reject("raw");
+        if (gitOp(args) === "rev-parse") return Promise.reject("raw");
         return { stdout: "", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return runnerExec(binary, args);
@@ -1707,8 +1699,8 @@ describe("review_change", () => {
     const runnerExec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain") return Promise.reject("status raw");
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return Promise.reject("status raw");
         return { stdout: "", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return runnerExec(binary, args);
@@ -1727,14 +1719,12 @@ describe("review_change", () => {
   it("reviewer catch with non-empty stat + no untracked → stat section present, no 'New files:'", async () => {
     const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "--stat")
-          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
-        if (args[0] === "diff")
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff")
           return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
-        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return { stdout: "done editing\n", stderr: "", exitCode: 0 };
       if (binary === "claude") return { stdout: "", stderr: "reviewer boom", exitCode: 1 };
@@ -1756,18 +1746,15 @@ describe("review_change", () => {
   it("FN-7 marks a truncated untracked file and notes untracked-file overflow in the fenced prompt", async () => {
     // 51 untracked files (over the 50 cap) → overflow note; the first file's
     // no-index diff overflows the per-file byte cap → its body is truncated.
-    const manyPaths = Array.from({ length: 51 }, (_, i) => `f${i}.ts`).join("\n") + "\n";
+    const manyPaths = Array.from({ length: 51 }, (_, i) => `f${i}.ts`).join("\0") + "\0";
     let reviewerInput = "";
     const exec: Exec = vi.fn(async (binary: string, args: string[], opts?: { input?: string }) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: " M x\n", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "--stat")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "HEAD")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "ls-files") return { stdout: manyPaths, stderr: "", exitCode: 0 };
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: " M x\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "ls-files") return { stdout: manyPaths, stderr: "", exitCode: 0 };
         // no-index read of an untracked file: f0 overflows the 64 KiB cap.
         const path = args[args.length - 1];
         const body = path === "f0.ts" ? "+" + "A".repeat(70 * 1024) + "\n" : `+body of ${path}\n`;
@@ -1794,18 +1781,16 @@ describe("review_change", () => {
     let reviewerInput = "";
     const exec: Exec = vi.fn(async (binary: string, args: string[], opts?: { input?: string }) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "--stat")
-          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
-        if (args[0] === "diff")
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff")
           return {
             stdout: `diff --git a/foo.ts b/foo.ts\n-old\n+// ${injection}\n`,
             stderr: "",
             exitCode: 0,
           };
-        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return { stdout: `done — ${injection}\n`, stderr: "", exitCode: 0 };
       if (binary === "claude") {
@@ -1849,13 +1834,11 @@ describe("review_change", () => {
     let reviewerInput = "";
     const exec: Exec = vi.fn(async (binary: string, args: string[], opts?: { input?: string }) => {
       if (binary === "git") {
-        if (args[0] === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (args[0] === "status" && args[1] === "--porcelain")
-          return { stdout: "", stderr: "", exitCode: 0 };
-        if (args[0] === "diff" && args[1] === "--stat")
-          return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
-        if (args[0] === "diff") return { stdout: forged, stderr: "", exitCode: 0 };
-        if (args[0] === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff") return { stdout: forged, stderr: "", exitCode: 0 };
+        if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
       }
       if (binary === "codex") return { stdout: "done\n", stderr: "", exitCode: 0 };
       if (binary === "claude") {
@@ -1878,5 +1861,199 @@ describe("review_change", () => {
     // The nonce'd end marker appears exactly once — the forgery did not create a
     // second real terminator.
     expect(reviewerInput.split(nonced![0]).length - 1).toBe(1);
+  });
+
+  it("P1-C reviewer containment: reviewer runs in a FRESH temp dir, NOT the worktree under review", async () => {
+    // The reviewer ingests attacker-influenced diff + new-file bodies, so it must
+    // never run with the worktree as its cwd. Prove the reviewer's exec cwd is a
+    // throwaway temp dir (agent-mcp-hub-review-*) while the RUNNER still uses the
+    // real worktree. Pre-fix the reviewer ran in the attacker worktree.
+    const worktree = "/tmp/attacker-worktree";
+    let runnerCwd: string | undefined;
+    let reviewerCwd: string | undefined;
+    const exec: Exec = vi.fn(async (binary: string, args: string[], opts?: { cwd?: string }) => {
+      if (binary === "git") {
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff")
+          return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") {
+        runnerCwd = opts?.cwd;
+        return { stdout: "done editing\n", stderr: "", exitCode: 0 };
+      }
+      if (binary === "claude") {
+        reviewerCwd = opts?.cwd;
+        return { stdout: "PASS\nok\n", stderr: "", exitCode: 0 };
+      }
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: worktree },
+    });
+    expect(res.isError).toBeFalsy();
+    // The runner operates on the real worktree.
+    expect(runnerCwd).toBe(worktree);
+    // The reviewer does NOT — it runs in a fresh throwaway temp dir.
+    expect(reviewerCwd).toBeDefined();
+    expect(reviewerCwd).not.toBe(worktree);
+    expect(reviewerCwd).toMatch(/agent-mcp-hub-review-/);
+  });
+
+  it("P1-C/P1-D: git calls are hardened (fsmonitor/hooks/pager + diff no-ext-diff/no-textconv, ls-files -z) with GIT_HARDENING_ENV", async () => {
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff")
+          return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return { stdout: "done\n", stderr: "", exitCode: 0 };
+      if (binary === "claude") return { stdout: "PASS\n", stderr: "", exitCode: 0 };
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp/wt" },
+    });
+    // Every git call carries the exact hardened argv + hardening env.
+    expect(exec).toHaveBeenCalledWith(
+      "git",
+      hardenedGitArgs(["rev-parse", "--is-inside-work-tree"]),
+      expect.objectContaining({ cwd: "/tmp/wt", env: GIT_HARDENING_ENV }),
+    );
+    expect(exec).toHaveBeenCalledWith(
+      "git",
+      hardenedGitArgs(["status", "--porcelain"]),
+      expect.objectContaining({ cwd: "/tmp/wt", env: GIT_HARDENING_ENV }),
+    );
+    expect(exec).toHaveBeenCalledWith(
+      "git",
+      hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "--stat", "HEAD"]),
+      expect.objectContaining({ cwd: "/tmp/wt", env: GIT_HARDENING_ENV }),
+    );
+    expect(exec).toHaveBeenCalledWith(
+      "git",
+      hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "HEAD"]),
+      expect.objectContaining({ cwd: "/tmp/wt", env: GIT_HARDENING_ENV }),
+    );
+    expect(exec).toHaveBeenCalledWith(
+      "git",
+      hardenedGitArgs(["ls-files", "--others", "--exclude-standard", "-z"]),
+      expect.objectContaining({ cwd: "/tmp/wt", env: GIT_HARDENING_ENV }),
+    );
+  });
+});
+
+// P1-B — model validation. A flag-shaped model (leading '-') is argument
+// injection: a CLI parses `--dir=/` in the model position as another flag.
+describe("model validation (P1-B)", () => {
+  it("MODEL_RE rejects flag-shaped values and accepts real model ids", () => {
+    // Rejected: anything that could be read by a CLI as a flag.
+    expect(MODEL_RE.test("--dir=/")).toBe(false);
+    expect(MODEL_RE.test("-foo")).toBe(false);
+    expect(MODEL_RE.test("--share")).toBe(false);
+    expect(MODEL_RE.test("")).toBe(false);
+    expect(MODEL_RE.test(`a${"b".repeat(128)}`)).toBe(false); // 129 chars > cap
+    // Accepted: legitimate model ids across the four CLIs.
+    expect(MODEL_RE.test("o3")).toBe(true);
+    expect(MODEL_RE.test("gpt-5.3-codex-high")).toBe(true);
+    expect(MODEL_RE.test("openai/gpt-5")).toBe(true);
+    expect(MODEL_RE.test("sonnet-4-thinking")).toBe(true);
+  });
+
+  it("a tool call with a flag-shaped model fails schema validation before exec runs", async () => {
+    const exec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
+    const client = await connectedClient(exec);
+    // The zod refine runs inside the SDK; an invalid model is rejected either as
+    // a thrown protocol error or an isError result — either way exec never runs.
+    const rejected = await client
+      .callTool({ name: "codex", arguments: { prompt: "x", model: "--dir=/" } })
+      .then((res) => res.isError === true)
+      .catch(() => true);
+    expect(rejected).toBe(true);
+    expect(exec).not.toHaveBeenCalled();
+  });
+});
+
+// P2-G — the per-run audit line must ALWAYS carry an exitCode key. A failed run
+// previously logged exitCode:undefined, which JSON.stringify DROPPED, so a
+// spawn/timeout failure was indistinguishable from a run with no result.
+describe("agent_run audit on failure (P2-G)", () => {
+  it("a failed run logs an audit line with exitCode:null and ok:false (never dropped)", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const exec: Exec = vi.fn(async () => {
+        throw new SpawnError('Failed to start "codex": ENOENT.');
+      });
+      const client = await connectedClient(exec);
+      const res = await client.callTool({
+        name: "codex",
+        arguments: { prompt: "x", cwd: "/work" },
+      });
+      expect(res.isError).toBe(true);
+      const lines = errSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((line) => line.includes('"agent_run"'));
+      expect(lines).toHaveLength(1);
+      const record = JSON.parse(lines[0]) as Record<string, unknown>;
+      // The exitCode key is PRESENT (not silently dropped) and null on failure.
+      expect(Object.prototype.hasOwnProperty.call(record, "exitCode")).toBe(true);
+      expect(record.exitCode).toBeNull();
+      expect(record.ok).toBe(false);
+      expect(record.error).toBeDefined();
+      expect(record.agent).toBe("codex");
+      expect(record.cwd).toBe("/work");
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+});
+
+// P1-E — confirm gate fail-closed vs degrade-open when the client cannot render
+// a form. connectedClient advertises NO elicitation capability, so it stands in
+// for a client lacking elicitation.form.
+describe("confirm gate fail-closed vs degrade-open (P1-E)", () => {
+  it("MCP_CONFIRM=strict + client without form elicitation → FAIL CLOSED (cancel, exec NOT called)", async () => {
+    await withConfirmEnv("strict", async () => {
+      const exec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
+      const client = await connectedClient(exec);
+      const res = await client.callTool({ name: "codex", arguments: { prompt: "hello" } });
+      expect(exec).not.toHaveBeenCalled();
+      expect(res.isError).toBe(true);
+      expect(textOf(res)).toContain("cancelled by user");
+    });
+  });
+
+  it("MCP_CONFIRM=1 + client without form elicitation → DEGRADE OPEN (runs)", async () => {
+    await withConfirmEnv("1", async () => {
+      const exec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
+      const client = await connectedClient(exec);
+      const res = await client.callTool({ name: "codex", arguments: { prompt: "hello" } });
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(res.isError).toBeFalsy();
+      expect(textOf(res)).toBe("done");
+    });
+  });
+
+  it("review_change under MCP_CONFIRM=strict without form elicitation → FAIL CLOSED (nothing spawned)", async () => {
+    await withConfirmEnv("strict", async () => {
+      const exec: Exec = vi.fn(async () => ({ stdout: "", stderr: "", exitCode: 0 }));
+      const client = await connectedClient(exec);
+      const res = await client.callTool({
+        name: "review_change",
+        arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+      });
+      expect(res.isError).toBe(true);
+      expect(textOf(res)).toContain("cancelled by user");
+      expect(exec).not.toHaveBeenCalled();
+    });
   });
 });

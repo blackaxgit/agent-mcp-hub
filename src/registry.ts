@@ -13,6 +13,33 @@ export function allAdapters(): AgentAdapter[] {
 }
 
 /**
+ * Union of every adapter's credential env var, DERIVED from the adapter list so a
+ * new agent's key is covered automatically — there is no hand-maintained
+ * duplicate to forget (forgetting one silently leaked the new key to every other
+ * agent). This is the set of secrets that must be isolated between agents.
+ */
+export function allCredentialEnvVars(): readonly string[] {
+  return [
+    ...new Set(
+      allAdapters()
+        .map((a) => a.apiKeyEnv)
+        .filter((k): k is string => Boolean(k)),
+    ),
+  ];
+}
+
+/**
+ * The credential keys to STRIP from `adapter`'s child environment: every OTHER
+ * agent's key. An adapter with its own `apiKeyEnv` keeps exactly that one. A
+ * provider-agnostic adapter (no `apiKeyEnv`, e.g. opencode) owns none, so ALL
+ * tracked keys are stripped — it must never inherit a sibling's secret. Applied
+ * to real runs AND to availability probes, so no spawn path leaks a key.
+ */
+export function credentialStripKeys(adapter: AgentAdapter): readonly string[] {
+  return allCredentialEnvVars().filter((k) => k !== adapter.apiKeyEnv);
+}
+
+/**
  * Selects which adapters to expose based on MCP_AGENTS (comma-separated,
  * whitespace-tolerant, case-sensitive). Unset or empty-after-parse yields all
  * adapters (never an empty server). Unknown names fail fast with an actionable
@@ -161,7 +188,12 @@ export async function checkAvailability(
   const probeArgs = adapter.probeArgs ?? ["--version"];
   let outcome: { stdout: string; stderr: string; exitCode: number | null };
   try {
-    outcome = await exec(adapter.binary, probeArgs, { timeoutMs: PROBE_TIMEOUT_MS });
+    // Same credential isolation as a real run: a probe spawns the CLI, so it
+    // must not hand it a sibling agent's key either.
+    outcome = await exec(adapter.binary, probeArgs, {
+      timeoutMs: PROBE_TIMEOUT_MS,
+      stripEnvKeys: credentialStripKeys(adapter),
+    });
   } catch (error) {
     // Installed (we just resolved it), but the probe could not complete.
     return result(adapter.name, true, false, classifyFailure(adapter, { error }).message);
