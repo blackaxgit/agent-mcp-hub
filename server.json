@@ -6,12 +6,12 @@
     "url": "https://github.com/blackaxgit/agent-mcp-hub",
     "source": "github"
   },
-  "version": "0.5.1",
+  "version": "0.5.2",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "agent-mcp-hub",
-      "version": "0.5.1",
+      "version": "0.5.2",
       "transport": {
         "type": "stdio"
       }

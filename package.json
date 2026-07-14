@@ -1,6 +1,6 @@
 {
   "name": "agent-mcp-hub",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "One MCP server bridging the Codex, Cursor, OpenCode, and Claude CLI agents",
   "repository": {
     "type": "git",
