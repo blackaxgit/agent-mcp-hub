@@ -1,5 +1,6 @@
 import { accessSync, constants, statSync } from "node:fs";
 import { delimiter, isAbsolute, join } from "node:path";
+import { agyAdapter } from "./adapters/agy.js";
 import { claudeAdapter } from "./adapters/claude.js";
 import { codexAdapter } from "./adapters/codex.js";
 import { cursorAdapter } from "./adapters/cursor.js";
@@ -9,7 +10,7 @@ import { classifyFailure } from "./failure.js";
 import type { AgentAdapter } from "./types.js";
 
 export function allAdapters(): AgentAdapter[] {
-  return [codexAdapter, cursorAdapter, opencodeAdapter, claudeAdapter];
+  return [codexAdapter, cursorAdapter, opencodeAdapter, claudeAdapter, agyAdapter];
 }
 
 /**
@@ -169,7 +170,7 @@ export type ResolveBinary = (binary: string) => string | undefined;
  * Probes one adapter. Never throws: a probe failure is data, not an exception.
  * The probe command is per-adapter because the CLIs disagree — `opencode models`
  * lists models, `codex models` is not a subcommand at all — so there is no single
- * command that proves usability across all four.
+ * command that proves usability across every wrapped CLI.
  */
 export async function checkAvailability(
   adapter: AgentAdapter,

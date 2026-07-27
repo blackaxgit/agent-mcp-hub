@@ -18,6 +18,14 @@ export const opencodeAdapter: AgentAdapter = {
         "opencode cannot safely run prompts that start with '-' (its CLI may parse them as flags). Rephrase the prompt to start with a word, e.g. \"explain --help ...\".",
       );
     }
+    // NOTE: `permissionMode` is deliberately IGNORED here — opencode exposes no
+    // read-only lever on `run`. `--agent <name>` could point at a restricted
+    // agent, but that agent must already exist in the operator's own config, so
+    // this adapter cannot rely on it. `--auto` is also never emitted: opencode
+    // already writes files without it (verified), so it would only widen
+    // permissions. Consequence: an opencode REVIEWER is not restricted. That gap
+    // is documented rather than papered over — see the enforcement table in
+    // AGENTS.md.
     const args = ["run"];
     if (options.model) args.push("--model", options.model);
     args.push(prompt);

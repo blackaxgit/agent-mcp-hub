@@ -22,7 +22,7 @@ import {
   type ResolveBinary,
 } from "./registry.js";
 import type { ElicitRequestFormParams } from "@modelcontextprotocol/sdk/types.js";
-import type { AgentAdapter } from "./types.js";
+import type { AgentAdapter, PermissionMode } from "./types.js";
 
 const { version } = createRequire(import.meta.url)("../package.json") as { version: string };
 
@@ -42,6 +42,8 @@ async function runAdapter(
     cwd?: string;
     timeoutMs?: number;
     idleTimeoutMs?: number;
+    /** "read-only" only for the review_change REVIEWER — see AgentRunOptions. */
+    permissionMode?: PermissionMode;
   },
   onActivity?: () => void,
 ): Promise<ExecResult> {
@@ -62,7 +64,10 @@ async function runAdapter(
   try {
     // Inside the try so a buildInvocation throw (e.g. opencode's dash-guard) is
     // audited too, rather than escaping with no run-log trace.
-    const invocation = adapter.buildInvocation(params.prompt, { model: params.model });
+    const invocation = adapter.buildInvocation(params.prompt, {
+      model: params.model,
+      permissionMode: params.permissionMode,
+    });
     const result = await exec(adapter.binary, invocation.args, {
       cwd: params.cwd,
       timeoutMs: params.timeoutMs,
@@ -576,6 +581,14 @@ export function buildServer(
           model,
           cwd: reviewerCwd,
           timeoutMs,
+          // The reviewer only needs to READ the fenced diff and return a verdict,
+          // yet its prompt is the most attacker-influenced input in the server.
+          // So it runs least-privilege. How much that actually BUYS differs per
+          // CLI — codex gets an OS sandbox, claude gets harness-level deny rules,
+          // cursor/agy get advisory narrowing, and opencode gets nothing at all.
+          // Defense-in-depth alongside the nonce fence and the temp cwd; for three
+          // of the five this is narrowing, not a guarantee. See AGENTS.md.
+          permissionMode: "read-only",
         });
       } catch (err) {
         const statSection =

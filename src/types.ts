@@ -1,5 +1,24 @@
+/**
+ * How much the agent is allowed to do on this run.
+ *
+ * - `"write"` — the agent may edit files and run commands in `cwd`. The default.
+ * - `"read-only"` — the agent should only read and answer. Used by the
+ *   `review_change` REVIEWER, whose prompt embeds an attacker-controlled diff
+ *   and which only needs to return a verdict.
+ *
+ * **Enforcement differs per CLI and must not be overstated.** Only `codex`
+ * (`--sandbox`, OS-level) and `claude` (deny rules, harness-level) genuinely
+ * restrict the agent. `cursor --mode plan` is model-advisory; `agy` simply has
+ * its permission grant withheld, which makes headless runs auto-deny write and
+ * command tools — narrowing, not a sandbox; and `opencode` has no CLI lever at
+ * all, so for it `read-only` is a documented no-op. Table in AGENTS.md.
+ */
+export type PermissionMode = "read-only" | "write";
+
 export interface AgentRunOptions {
   model?: string;
+  /** Defaults to `"write"` when undefined, so existing call sites are unchanged. */
+  permissionMode?: PermissionMode;
 }
 
 export interface AgentInvocation {

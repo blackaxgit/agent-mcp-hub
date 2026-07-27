@@ -82,6 +82,7 @@ describe("buildServer", () => {
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
     expect(names).toEqual([
+      "agy",
       "claude",
       "codex",
       "cursor",
@@ -102,7 +103,7 @@ describe("buildServer", () => {
     });
     expect(exec).toHaveBeenCalledWith(
       "codex",
-      ["exec", "--skip-git-repo-check", "--model", "o3", "-"],
+      ["exec", "--skip-git-repo-check", "--model", "o3", "-s", "workspace-write", "-"],
       expect.objectContaining({ cwd: undefined, timeoutMs: undefined, input: "hello" }),
     );
     expect(res.isError).toBeFalsy();
@@ -234,7 +235,7 @@ describe("buildServer", () => {
       reason?: string;
     }>;
 
-    expect(parsed.map((p) => p.name)).toEqual(["codex", "cursor", "opencode", "claude"]);
+    expect(parsed.map((p) => p.name)).toEqual(["codex", "cursor", "opencode", "claude", "agy"]);
     expect(parsed[0]).toEqual({ name: "codex", installed: true, usable: true, available: true });
 
     const cursor = parsed[1]!;
@@ -242,7 +243,7 @@ describe("buildServer", () => {
     expect(cursor.reason).toMatch(/not found on PATH/);
 
     // The distinction that matters: present on disk, still cannot run.
-    for (const name of ["opencode", "claude"]) {
+    for (const name of ["opencode", "claude", "agy"]) {
       const entry = parsed.find((p) => p.name === name)!;
       expect(entry).toMatchObject({ installed: true, usable: false, available: false });
       expect(entry.reason).toBeTruthy();
@@ -386,12 +387,12 @@ describe("run_all", () => {
       name: "run_all",
       arguments: { prompt: "p", cwd: "/tmp", timeoutMs: 1234 },
     });
-    await vi.waitFor(() => expect(started).toBe(4));
+    await vi.waitFor(() => expect(started).toBe(5));
     for (const resolve of resolvers) resolve({ stdout: "ok\n", stderr: "", exitCode: 0 });
     const res = await pending;
     expect(exec).toHaveBeenCalledWith(
       "codex",
-      ["exec", "--skip-git-repo-check", "-"],
+      ["exec", "--skip-git-repo-check", "-s", "workspace-write", "-"],
       expect.objectContaining({ cwd: "/tmp", timeoutMs: 1234, input: "p" }),
     );
     expect(exec).toHaveBeenCalledWith(
@@ -428,7 +429,7 @@ describe("run_all", () => {
     });
     expect(exec).toHaveBeenCalledWith(
       "codex",
-      ["exec", "--skip-git-repo-check", "--model", "o3", "-"],
+      ["exec", "--skip-git-repo-check", "--model", "o3", "-s", "workspace-write", "-"],
       expect.objectContaining({ cwd: undefined, timeoutMs: undefined, input: "compare" }),
     );
     expect(exec).toHaveBeenCalledWith(
@@ -655,7 +656,7 @@ describe("confirm-before-run gate", () => {
       };
       const client = await connectedClientWithElicit(exec, handler);
       const res = await client.callTool({ name: "run_all", arguments: { prompt: "compare" } });
-      expect(exec).toHaveBeenCalledTimes(4);
+      expect(exec).toHaveBeenCalledTimes(5);
       expect(fired).toBe(1);
       expect(res.isError).toBeFalsy();
     });
@@ -928,6 +929,85 @@ describe("review_change", () => {
         : { stdout: `${binary} default\n`, stderr: "", exitCode: 0 };
     });
     return exec;
+  }
+
+  // The REVIEWER receives permissionMode:"read-only"; the RUNNER does not. What
+  // that buys differs per CLI (codex: OS sandbox; claude: harness deny rules;
+  // cursor/agy: advisory; opencode: nothing), so each adapter is asserted against
+  // its own documented mapping rather than a blanket "is sandboxed" claim.
+  const reviewerExpectations: Record<
+    string,
+    {
+      runnerHas: string[];
+      runnerLacks?: string[];
+      reviewerHas: string[];
+      reviewerLacks: string[];
+    }
+  > = {
+    codex: {
+      runnerHas: ["workspace-write"],
+      reviewerHas: ["read-only"],
+      reviewerLacks: ["workspace-write"],
+    },
+    cursor: {
+      runnerHas: ["--force"],
+      reviewerHas: ["--trust", "--mode", "plan"],
+      reviewerLacks: ["--force"],
+    },
+    claude: {
+      // The claude RUNNER must not carry the deny list, or it could not edit.
+      runnerLacks: ["--disallowedTools=Write,Edit,NotebookEdit,Bash"],
+      runnerHas: [],
+      reviewerHas: ["--disallowedTools=Write,Edit,NotebookEdit,Bash"],
+      reviewerLacks: [],
+    },
+    agy: {
+      runnerHas: ["--dangerously-skip-permissions"],
+      reviewerHas: ["--new-project"],
+      reviewerLacks: ["--dangerously-skip-permissions"],
+    },
+    // Documented gap: opencode has no read-only lever, so both roles are identical.
+    opencode: { runnerHas: ["run"], reviewerHas: ["run"], reviewerLacks: [] },
+  };
+
+  for (const [agent, expectation] of Object.entries(reviewerExpectations)) {
+    it(`review_change runs ${agent} least-privilege as REVIEWER but not as RUNNER`, async () => {
+      const calls: Array<{ binary: string; args: string[] }> = [];
+      const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+        if (binary === "git") {
+          if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+          if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+          if (gitOp(args) === "diff-stat")
+            return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+          if (gitOp(args) === "diff")
+            return {
+              stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n",
+              stderr: "",
+              exitCode: 0,
+            };
+          if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+        }
+        calls.push({ binary, args });
+        return { stdout: "PASS\nfine\n", stderr: "", exitCode: 0 };
+      });
+      const client = await connectedClient(exec);
+      const res = await client.callTool({
+        name: "review_change",
+        arguments: { runner: agent, reviewer: agent, prompt: "fix foo", cwd: "/tmp" },
+      });
+      expect(res.isError).toBeFalsy();
+
+      const adapter = allAdapters().find((a) => a.name === agent)!;
+      const agentCalls = calls.filter((c) => c.binary === adapter.binary);
+      expect(agentCalls).toHaveLength(2);
+      const [runner, reviewer] = agentCalls;
+
+      for (const flag of expectation.runnerHas) expect(runner!.args).toContain(flag);
+      for (const flag of expectation.runnerLacks ?? []) expect(runner!.args).not.toContain(flag);
+      for (const flag of expectation.reviewerHas) expect(reviewer!.args).toContain(flag);
+      // Removing the `permissionMode: "read-only"` wiring in server.ts must fail here.
+      for (const flag of expectation.reviewerLacks) expect(reviewer!.args).not.toContain(flag);
+    });
   }
 
   it("A1 happy path: runner edits, reviewer replies PASS, all three binaries called", async () => {
@@ -1962,7 +2042,7 @@ describe("model validation (P1-B)", () => {
     expect(MODEL_RE.test("--share")).toBe(false);
     expect(MODEL_RE.test("")).toBe(false);
     expect(MODEL_RE.test(`a${"b".repeat(128)}`)).toBe(false); // 129 chars > cap
-    // Accepted: legitimate model ids across the four CLIs.
+    // Accepted: legitimate model ids across the wrapped CLIs.
     expect(MODEL_RE.test("o3")).toBe(true);
     expect(MODEL_RE.test("gpt-5.3-codex-high")).toBe(true);
     expect(MODEL_RE.test("openai/gpt-5")).toBe(true);

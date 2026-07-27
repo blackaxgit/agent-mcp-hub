@@ -1,7 +1,7 @@
 # agent-mcp-hub
 
 One MCP server that bridges multiple CLI coding agents — **Codex**, **Cursor**,
-**OpenCode**, and **Claude** — into any MCP client.
+**OpenCode**, **Claude**, and **Antigravity** — into any MCP client.
 
 > **stdio only — by design.** The hub ships no Docker image and no HTTP
 > transport (both were removed during the 0.5.x line). A containerised or remote
@@ -17,6 +17,7 @@ One MCP server that bridges multiple CLI coding agents — **Codex**, **Cursor**
 | `cursor` | Delegate a prompt to `cursor-agent -p` (prompt piped via stdin) |
 | `opencode` | Delegate a prompt to `opencode run` |
 | `claude` | Delegate a prompt to the Claude Code CLI (prompt piped via stdin) |
+| `agy` | Delegate a prompt to Google Antigravity (`agy --print=…`, prompt passed as a flag value) |
 | `run_all` | Same prompt to all agents in parallel, results side by side |
 | `list_agents` | Which agent CLIs are installed and on PATH |
 | `ping` | Health check |
@@ -37,7 +38,7 @@ class and the exact fix:
 | Class | Example remediation |
 |---|---|
 | `not_installed` | install the CLI (e.g. `npm i -g @openai/codex`) / fix PATH |
-| `not_authenticated` | `codex login` · `cursor-agent login` · `opencode auth login` · `claude` → `/login` (or set the matching API key) |
+| `not_authenticated` | `codex login` · `cursor-agent login` · `opencode auth login` · `claude` → `/login` · `agy` → sign in on first run (or set the matching API key) |
 | `not_configured` | set a model/provider in the CLI's config |
 | `timed_out` | raise `timeoutMs`, or check the agent/model is responsive |
 | `stream_stalled` | the agent reached the network but its stream keeps dropping (e.g. `cursor` behind a TLS-intercepting proxy) — treat that agent as unavailable; raising `timeoutMs` will not help |
@@ -69,6 +70,22 @@ worktree), optional `model`, `timeoutMs`.
   (noted in the output).
 - Complements — does not replace — client-side stop-hooks or PR-time CI review.
 - The confirm gate (`MCP_CONFIRM`) applies.
+- **The reviewer runs least-privilege — but how much that guarantees depends on the
+  agent.** The reviewer's prompt embeds an attacker-influenced diff, so it is run
+  read-only rather than with the write grant the runner gets. Only two of the five
+  are real restrictions:
+
+  | Reviewer | Read-only mechanism | Enforced? |
+  |---|---|---|
+  | `codex` | `-s read-only` | **Yes — OS-level sandbox** |
+  | `claude` | `--disallowedTools Write,Edit,…,Bash` | **Yes — harness-level deny** |
+  | `cursor` | `--trust --mode plan` (no `--force`) | No — model-advisory only |
+  | `agy` | permission grant withheld | Partly — headless auto-deny, not a sandbox |
+  | `opencode` | *none available* | **No — unrestricted** |
+
+  Pick `codex` or `claude` as the reviewer if you want the restriction to be real.
+  This is defense-in-depth alongside the nonce-fenced diff and the throwaway temp
+  cwd; none of it is a sandbox.
 
 ```json
 {
@@ -90,6 +107,9 @@ Install and authenticate the CLIs you want to use (any subset works):
 - Cursor: `curl https://cursor.com/install -fsS | bash && cursor-agent login`
 - OpenCode: `npm i -g opencode-ai && opencode auth login`
 - Claude Code: `npm i -g @anthropic-ai/claude-code && claude` (first run logs in)
+- Antigravity: install the Antigravity CLI (e.g. `brew install --cask antigravity-cli`),
+  then run `agy` once and sign in — it has no `login` subcommand and stores
+  credentials in the OS keyring, so there is no API-key env var to set
 
 ## Install
 
@@ -139,7 +159,7 @@ claude mcp add agent-hub -- npx -y agent-mcp-hub@0.5.0
 ## Configuration
 
 **`MCP_AGENTS`** — comma-separated allowlist of the agents to expose
-(`codex,cursor,opencode,claude`). Unset or empty exposes all agents. Disabled
+(`codex,cursor,opencode,claude,agy`). Unset or empty exposes all agents. Disabled
 agents get no tool and are absent from `list_agents`/`run_all`. An unknown name
 fails at startup with an error listing the valid names, so typos never silently
 disable an agent.
@@ -199,10 +219,17 @@ fails fast:
   default **1800000 (30 min)**. A hard upper bound regardless of activity.
 
 Whichever fires first kills the agent's process group. **Tradeoff:** the idle reset
-assumes the CLI streams intermediate output. `codex` and `opencode` do; `claude -p`
-and `cursor-agent -p` may emit only the final result, so a long **silent** task on
-those can be idle-killed at 5 min — raise `idleTimeoutMs` / `MCP_AGENT_IDLE_TIMEOUT_MS`
-for such tasks, or rely on the total cap.
+assumes the CLI streams intermediate output. `codex` and `opencode` do; `claude -p`,
+`cursor-agent -p` and `agy --print` may emit only the final result, so a long
+**silent** task on those can be idle-killed at 5 min — raise `idleTimeoutMs` /
+`MCP_AGENT_IDLE_TIMEOUT_MS` for such tasks, or rely on the total cap.
+
+`agy` is the strongest case here: it emits its entire answer in one flush at the
+end (measured — every line of a 12-line reply arrived at the same instant), and
+the hub raises its internal `--print-timeout` to 48h so that agy's own 5-minute
+default can never truncate a run. The idle timer is therefore agy's only
+protection against a genuine hang; budget `idleTimeoutMs` accordingly for long
+autonomous agy tasks.
 
 While an agent runs, the hub emits MCP **progress notifications** to clients that
 request them (`_meta.progressToken`) — live feedback during long runs. Note: on

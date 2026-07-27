@@ -11,14 +11,21 @@ import {
   resolveOnPath,
   type ResolveBinary,
 } from "../src/registry.js";
+import { agyAdapter } from "../src/adapters/agy.js";
 import { claudeAdapter } from "../src/adapters/claude.js";
 import { codexAdapter } from "../src/adapters/codex.js";
 import { cursorAdapter } from "../src/adapters/cursor.js";
 import { opencodeAdapter } from "../src/adapters/opencode.js";
 
 describe("allAdapters", () => {
-  it("returns codex, cursor, opencode, and claude in stable order", () => {
-    expect(allAdapters().map((a) => a.name)).toEqual(["codex", "cursor", "opencode", "claude"]);
+  it("returns codex, cursor, opencode, claude, and agy in stable order", () => {
+    expect(allAdapters().map((a) => a.name)).toEqual([
+      "codex",
+      "cursor",
+      "opencode",
+      "claude",
+      "agy",
+    ]);
   });
 });
 
@@ -29,6 +36,7 @@ describe("enabledAdapters", () => {
       "cursor",
       "opencode",
       "claude",
+      "agy",
     ]);
   });
 
@@ -38,7 +46,12 @@ describe("enabledAdapters", () => {
       "cursor",
       "opencode",
       "claude",
+      "agy",
     ]);
+  });
+
+  it("can select agy alone", () => {
+    expect(enabledAdapters("agy").map((a) => a.name)).toEqual(["agy"]);
   });
 
   it("returns exactly the named subset in registry order, trimming whitespace", () => {
@@ -51,7 +64,7 @@ describe("enabledAdapters", () => {
 
   it("throws naming the invalid entry and listing valid agents for unknown names", () => {
     expect(() => enabledAdapters("clade")).toThrowError(
-      'Unknown agent "clade" in MCP_AGENTS. Valid agents: codex, cursor, opencode, claude',
+      'Unknown agent "clade" in MCP_AGENTS. Valid agents: codex, cursor, opencode, claude, agy',
     );
   });
 });
@@ -251,5 +264,23 @@ describe("credentialStripKeys (P1-D)", () => {
       new Set(["OPENAI_API_KEY", "CURSOR_API_KEY", "ANTHROPIC_API_KEY"]),
     );
     expect(strip).toHaveLength(3);
+  });
+
+  it("strips ALL tracked keys for agy too — it authenticates via the OS keyring", () => {
+    const strip = credentialStripKeys(agyAdapter);
+    expect(new Set(strip)).toEqual(
+      new Set(["OPENAI_API_KEY", "CURSOR_API_KEY", "ANTHROPIC_API_KEY"]),
+    );
+    expect(strip).toHaveLength(3);
+  });
+
+  it("adding keyless agy leaves every OTHER adapter's strip set unchanged", () => {
+    // Regression guard on the DERIVED design: a fifth adapter that declares no
+    // apiKeyEnv must not grow anyone else's strip set, because it contributes
+    // nothing to allCredentialEnvVars().
+    expect(allCredentialEnvVars()).toHaveLength(3);
+    for (const adapter of [codexAdapter, cursorAdapter, claudeAdapter]) {
+      expect(credentialStripKeys(adapter)).toHaveLength(2);
+    }
   });
 });

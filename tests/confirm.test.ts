@@ -137,7 +137,7 @@ describe("buildConfirmMessage", () => {
 
 describe("buildRunAllMessage", () => {
   it("lists EVERY provided agent name and the truncated prompt", () => {
-    const names = ["codex", "cursor", "opencode", "claude"];
+    const names = ["codex", "cursor", "opencode", "claude", "agy"];
     const msg = buildRunAllMessage(names, { prompt: "run everything", cwd: "/w" });
     for (const n of names) expect(msg).toContain(n);
     expect(msg).toContain("run everything");

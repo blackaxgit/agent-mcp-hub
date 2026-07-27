@@ -22,6 +22,29 @@ describe("opencodeAdapter", () => {
     );
   });
 
+  // opencode exposes NO read-only lever on `run`, so permissionMode is a
+  // documented no-op here. This test exists to make that gap explicit and
+  // deliberate: an opencode REVIEWER is NOT restricted. If opencode ever gains a
+  // read-only flag, this test should fail and be replaced.
+  it("ignores permissionMode — argv is identical in both modes (documented gap)", () => {
+    const write = opencodeAdapter.buildInvocation("write tests", { permissionMode: "write" });
+    const readOnly = opencodeAdapter.buildInvocation("write tests", {
+      permissionMode: "read-only",
+    });
+    expect(readOnly).toEqual(write);
+    expect(readOnly.args).toEqual(opencodeAdapter.buildInvocation("write tests").args);
+  });
+
+  // Never emitted: opencode already writes files without it (verified live), so
+  // passing it would only widen permissions.
+  it("never emits --auto", () => {
+    for (const mode of ["write", "read-only"] as const) {
+      expect(opencodeAdapter.buildInvocation("x", { permissionMode: mode }).args).not.toContain(
+        "--auto",
+      );
+    }
+  });
+
   it("exposes correct identity", () => {
     expect(opencodeAdapter.name).toBe("opencode");
     expect(opencodeAdapter.binary).toBe("opencode");
