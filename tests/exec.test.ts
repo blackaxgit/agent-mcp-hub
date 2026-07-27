@@ -154,6 +154,47 @@ describe("runCommand idle timeout", () => {
     expect(r.exitCode).toBe(0);
   });
 
+  it("A2b: a child that prints then goes silent is killed by the RE-ARMED idle timer", async () => {
+    // Guards the stdout-path idle timer specifically: the one re-armed by an
+    // accepted stdout chunk, NOT the one armed at spawn. The child prints for
+    // ~200ms (every ~40ms, each line re-arming idle), then falls silent forever,
+    // so the timer that ultimately fires can only be the re-armed one.
+    //
+    // Deliberately stdout-only — no stderr, no stallSignatures. S4 also happens to
+    // reach this path, but only when the child's stderr writes coalesce into
+    // stall-matching chunks; when they split so a chunk carries no signature line,
+    // the stderr branch re-arms idle through a *different* closure and S4 still
+    // passes while leaving this one unexecuted. That made function coverage
+    // load-dependent and flaked the 97% gate. Keep this test stdout-only.
+    //
+    // The 600ms idle window is ~4× the tightest spawn-latency assumption already
+    // in this file (A2's 150ms), so a loaded machine cannot let the spawn-armed
+    // timer win the race before the first chunk lands. onActivity ≥ 1 asserts
+    // that precondition explicitly rather than leaving it implied.
+    let activity = 0;
+    const script =
+      "let n=0;const t=setInterval(()=>{console.log('tick'+n);if(++n>=5){clearInterval(t)}},40);" +
+      "setTimeout(()=>{},30000);";
+    const start = Date.now();
+    const err = await runCommand("node", ["-e", script], {
+      idleTimeoutMs: 600,
+      timeoutMs: 30_000,
+      onActivity: () => {
+        activity += 1;
+      },
+    }).catch((e: unknown) => e);
+    const elapsed = Date.now() - start;
+    // Proves stdout was accepted, i.e. the idle timer really was re-armed.
+    expect(activity).toBeGreaterThanOrEqual(1);
+    expect(err).toBeInstanceOf(TimeoutError);
+    expect((err as TimeoutError).kind).toBe("idle");
+    expect((err as TimeoutError).timeoutMs).toBe(600);
+    // Above the idle window (it only starts counting after the last chunk) and
+    // far under the 30s total cap — proves idle, not total, did the kill.
+    expect(elapsed).toBeGreaterThan(600);
+    expect(elapsed).toBeLessThan(5000);
+  });
+
   it("A3: total cap fires before idle for a continuously-printing child", async () => {
     // Small total cap, LARGE idle window (10s) that the child never approaches —
     // it prints every 10ms so the idle timer is perpetually re-armed and can never
