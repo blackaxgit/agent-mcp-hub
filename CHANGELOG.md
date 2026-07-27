@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/blackaxgit/agent-mcp-hub/compare/agent-mcp-hub-v0.5.3...agent-mcp-hub-v0.6.0) (2026-07-27)
+
+
+### Features
+
+* **adapters:** add Antigravity (agy) as the fifth agent, and balance permissions per CLI and role ([#49](https://github.com/blackaxgit/agent-mcp-hub/issues/49)) ([f527ad6](https://github.com/blackaxgit/agent-mcp-hub/commit/f527ad604e70c049394ef6093890f524737b90fc))
+
 ## [0.5.3](https://github.com/blackaxgit/agent-mcp-hub/compare/agent-mcp-hub-v0.5.2...agent-mcp-hub-v0.5.3) (2026-07-14)
 
 
