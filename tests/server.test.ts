@@ -956,9 +956,9 @@ describe("review_change", () => {
     },
     claude: {
       // The claude RUNNER must not carry the deny list, or it could not edit.
-      runnerLacks: ["--disallowedTools"],
+      runnerLacks: ["--disallowedTools=Write,Edit,NotebookEdit,Bash"],
       runnerHas: [],
-      reviewerHas: ["--disallowedTools", "Write,Edit,MultiEdit,NotebookEdit,Bash"],
+      reviewerHas: ["--disallowedTools=Write,Edit,NotebookEdit,Bash"],
       reviewerLacks: [],
     },
     agy: {

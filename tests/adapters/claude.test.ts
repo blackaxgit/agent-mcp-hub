@@ -37,13 +37,25 @@ describe("claudeAdapter", () => {
 
     // Deny rules are evaluated before the tool runs and hold in EVERY permission
     // mode, so this is a genuine harness-level restriction, not advice.
-    it("denies the write/exec tools as ONE comma-separated token in read-only mode", () => {
+    it("denies the write/exec tools as a single GLUED token in read-only mode", () => {
       const args = claudeAdapter.buildInvocation("hi", { permissionMode: "read-only" }).args;
-      const i = args.indexOf("--disallowedTools");
-      expect(i).toBeGreaterThanOrEqual(0);
-      // One token, not several: the flag is variadic, so separate argv entries
-      // could greedily swallow a following flag.
-      expect(args[i + 1]).toBe("Write,Edit,MultiEdit,NotebookEdit,Bash");
+      // Glued: the flag is variadic, so as a separate token it greedily consumes
+      // following non-flag argv entries (observed eating a positional prompt).
+      expect(args).toContain("--disallowedTools=Write,Edit,NotebookEdit,Bash");
+      expect(args).not.toContain("--disallowedTools");
+    });
+
+    // An unknown tool name does not fail — it prints `Permission deny rule "X"
+    // matches no known tool` and protects nothing. MultiEdit does not exist in
+    // current Claude Code and was silently dead weight in this list.
+    it("lists only tool names that actually exist (no MultiEdit)", () => {
+      const args = claudeAdapter.buildInvocation("hi", { permissionMode: "read-only" }).args;
+      const denied = args
+        .find((a) => a.startsWith("--disallowedTools="))!
+        .split("=")[1]!
+        .split(",");
+      expect(denied).toEqual(["Write", "Edit", "NotebookEdit", "Bash"]);
+      expect(denied).not.toContain("MultiEdit");
     });
 
     it("never emits --dangerously-skip-permissions in either mode", () => {
