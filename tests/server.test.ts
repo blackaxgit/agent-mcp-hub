@@ -103,7 +103,7 @@ describe("buildServer", () => {
     });
     expect(exec).toHaveBeenCalledWith(
       "codex",
-      ["exec", "--skip-git-repo-check", "--model", "o3", "-"],
+      ["exec", "--skip-git-repo-check", "--model", "o3", "-s", "workspace-write", "-"],
       expect.objectContaining({ cwd: undefined, timeoutMs: undefined, input: "hello" }),
     );
     expect(res.isError).toBeFalsy();
@@ -392,7 +392,7 @@ describe("run_all", () => {
     const res = await pending;
     expect(exec).toHaveBeenCalledWith(
       "codex",
-      ["exec", "--skip-git-repo-check", "-"],
+      ["exec", "--skip-git-repo-check", "-s", "workspace-write", "-"],
       expect.objectContaining({ cwd: "/tmp", timeoutMs: 1234, input: "p" }),
     );
     expect(exec).toHaveBeenCalledWith(
@@ -429,7 +429,7 @@ describe("run_all", () => {
     });
     expect(exec).toHaveBeenCalledWith(
       "codex",
-      ["exec", "--skip-git-repo-check", "--model", "o3", "-"],
+      ["exec", "--skip-git-repo-check", "--model", "o3", "-s", "workspace-write", "-"],
       expect.objectContaining({ cwd: undefined, timeoutMs: undefined, input: "compare" }),
     );
     expect(exec).toHaveBeenCalledWith(
@@ -931,38 +931,84 @@ describe("review_change", () => {
     return exec;
   }
 
-  it("agy as RUNNER gets tool auto-approval; agy as REVIEWER does not", async () => {
-    const calls: Array<{ binary: string; args: string[] }> = [];
-    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
-      if (binary === "git") {
-        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
-        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
-        if (gitOp(args) === "diff-stat") return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
-        if (gitOp(args) === "diff")
-          return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
-        if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
-      }
-      calls.push({ binary, args });
-      return { stdout: "PASS\nfine\n", stderr: "", exitCode: 0 };
-    });
-    const client = await connectedClient(exec);
-    const res = await client.callTool({
-      name: "review_change",
-      arguments: { runner: "agy", reviewer: "agy", prompt: "fix foo", cwd: "/tmp" },
-    });
-    expect(res.isError).toBeFalsy();
+  // The REVIEWER receives permissionMode:"read-only"; the RUNNER does not. What
+  // that buys differs per CLI (codex: OS sandbox; claude: harness deny rules;
+  // cursor/agy: advisory; opencode: nothing), so each adapter is asserted against
+  // its own documented mapping rather than a blanket "is sandboxed" claim.
+  const reviewerExpectations: Record<
+    string,
+    {
+      runnerHas: string[];
+      runnerLacks?: string[];
+      reviewerHas: string[];
+      reviewerLacks: string[];
+    }
+  > = {
+    codex: {
+      runnerHas: ["workspace-write"],
+      reviewerHas: ["read-only"],
+      reviewerLacks: ["workspace-write"],
+    },
+    cursor: {
+      runnerHas: ["--force"],
+      reviewerHas: ["--trust", "--mode", "plan"],
+      reviewerLacks: ["--force"],
+    },
+    claude: {
+      // The claude RUNNER must not carry the deny list, or it could not edit.
+      runnerLacks: ["--disallowedTools"],
+      runnerHas: [],
+      reviewerHas: ["--disallowedTools", "Write,Edit,MultiEdit,NotebookEdit,Bash"],
+      reviewerLacks: [],
+    },
+    agy: {
+      runnerHas: ["--dangerously-skip-permissions"],
+      reviewerHas: ["--new-project"],
+      reviewerLacks: ["--dangerously-skip-permissions"],
+    },
+    // Documented gap: opencode has no read-only lever, so both roles are identical.
+    opencode: { runnerHas: ["run"], reviewerHas: ["run"], reviewerLacks: [] },
+  };
 
-    const agyCalls = calls.filter((c) => c.binary === "agy");
-    expect(agyCalls).toHaveLength(2);
-    // The runner acts on the caller's behalf, so it may auto-approve its tools.
-    expect(agyCalls[0]!.args).toContain("--dangerously-skip-permissions");
-    // The reviewer ingests an attacker-controlled diff and only needs to judge
-    // it, so the blanket tool-use grant is WITHHELD. Removing the
-    // `autoApproveTools: false` wiring in server.ts must fail this test.
-    expect(agyCalls[1]!.args).not.toContain("--dangerously-skip-permissions");
-    // …but the reviewer is otherwise a normal run.
-    expect(agyCalls[1]!.args).toContain("--new-project");
-  });
+  for (const [agent, expectation] of Object.entries(reviewerExpectations)) {
+    it(`review_change runs ${agent} least-privilege as REVIEWER but not as RUNNER`, async () => {
+      const calls: Array<{ binary: string; args: string[] }> = [];
+      const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+        if (binary === "git") {
+          if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+          if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+          if (gitOp(args) === "diff-stat")
+            return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+          if (gitOp(args) === "diff")
+            return {
+              stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n",
+              stderr: "",
+              exitCode: 0,
+            };
+          if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+        }
+        calls.push({ binary, args });
+        return { stdout: "PASS\nfine\n", stderr: "", exitCode: 0 };
+      });
+      const client = await connectedClient(exec);
+      const res = await client.callTool({
+        name: "review_change",
+        arguments: { runner: agent, reviewer: agent, prompt: "fix foo", cwd: "/tmp" },
+      });
+      expect(res.isError).toBeFalsy();
+
+      const adapter = allAdapters().find((a) => a.name === agent)!;
+      const agentCalls = calls.filter((c) => c.binary === adapter.binary);
+      expect(agentCalls).toHaveLength(2);
+      const [runner, reviewer] = agentCalls;
+
+      for (const flag of expectation.runnerHas) expect(runner!.args).toContain(flag);
+      for (const flag of expectation.runnerLacks ?? []) expect(runner!.args).not.toContain(flag);
+      for (const flag of expectation.reviewerHas) expect(reviewer!.args).toContain(flag);
+      // Removing the `permissionMode: "read-only"` wiring in server.ts must fail here.
+      for (const flag of expectation.reviewerLacks) expect(reviewer!.args).not.toContain(flag);
+    });
+  }
 
   it("A1 happy path: runner edits, reviewer replies PASS, all three binaries called", async () => {
     const runnerExec: Exec = vi.fn(async () => ({

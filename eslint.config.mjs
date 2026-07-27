@@ -3,7 +3,11 @@ import tseslint from "typescript-eslint";
 import eslintConfigPrettier from "eslint-config-prettier";
 
 export default tseslint.config(
-  { ignores: ["dist/", "coverage/", "node_modules/", "eslint.config.mjs"] },
+  // `.claude/` holds tooling scratch space — notably `.claude/worktrees/<name>/`,
+  // a full nested checkout created when an agent task runs in its own worktree.
+  // Without this ignore eslint walks that copy and fails the gate with parser
+  // errors about a tsconfig root it does not own.
+  { ignores: ["dist/", "coverage/", "node_modules/", ".claude/", "eslint.config.mjs"] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {

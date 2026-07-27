@@ -20,13 +20,26 @@ export const cursorAdapter: AgentAdapter = {
     /^retriable\s*error:\s*connection stalled\b/i,
   ],
   buildInvocation(prompt: string, options: AgentRunOptions = {}): AgentInvocation {
-    // --force: cursor-agent otherwise blocks on an interactive permission prompt
-    // ("Workspace Trust Required" / command approval) in any directory it has not
-    // seen before, which for a server invoked against arbitrary cwds is most of
-    // them. There is no stdin to answer it with in print mode, so the run would
-    // hang until the timeout kills it. (`--trust` is NOT a cursor-agent flag —
-    // passing it makes the CLI exit 1 with "unknown option '--trust'".)
-    const args = ["-p", "--output-format", "text", "--force"];
+    const args = ["-p", "--output-format", "text"];
+    if (options.permissionMode === "read-only") {
+      // Reviewer role. `--mode plan` answers without editing, and `--trust` is
+      // REQUIRED alongside it: without a trust/force flag cursor-agent refuses to
+      // proceed in an unfamiliar directory, printing "Pass --trust, --yolo, or -f
+      // if you trust this directory" and returning NO answer at all (exit 0).
+      // `--force` is deliberately omitted here — it is the write grant.
+      // ADVISORY ONLY: plan mode is not an enforced sandbox (Cursor staff have
+      // confirmed "plan mode is not respected"), so do not describe a cursor
+      // reviewer as sandboxed. It narrows behavior; it does not guarantee it.
+      args.push("--trust", "--mode", "plan");
+    } else {
+      // --force: cursor-agent otherwise blocks on an interactive permission prompt
+      // ("Workspace Trust Required" / command approval) in any directory it has not
+      // seen before, which for a server invoked against arbitrary cwds is most of
+      // them. There is no stdin to answer it with in print mode, so the run would
+      // hang until the timeout kills it. Verified live: with `--force` on a normal
+      // path the agent does create files.
+      args.push("--force");
+    }
     if (options.model) args.push("--model", options.model);
     // No positional prompt: cursor-agent reads it from piped stdin in print mode.
     return { args, stdin: prompt };

@@ -67,17 +67,33 @@ describe("agyAdapter.buildInvocation", () => {
   it("auto-approves tool use by default, else agy exits 0 with empty output", () => {
     expect(agyAdapter.buildInvocation("x").args).toContain("--dangerously-skip-permissions");
     expect(agyAdapter.buildInvocation("x", {}).args).toContain("--dangerously-skip-permissions");
-    expect(agyAdapter.buildInvocation("x", { autoApproveTools: true }).args).toContain(
+    expect(agyAdapter.buildInvocation("x", { permissionMode: "write" }).args).toContain(
       "--dangerously-skip-permissions",
     );
   });
 
+  it("treats an omitted permissionMode exactly like an explicit write", () => {
+    expect(agyAdapter.buildInvocation("x").args).toEqual(
+      agyAdapter.buildInvocation("x", { permissionMode: "write" }).args,
+    );
+  });
+
   it("WITHHOLDS tool auto-approval when judging untrusted input (review_change reviewer)", () => {
-    const { args } = agyAdapter.buildInvocation("x", { autoApproveTools: false });
+    const { args } = agyAdapter.buildInvocation("x", { permissionMode: "read-only" });
     expect(args).not.toContain("--dangerously-skip-permissions");
     // Everything else still applies — only the approval grant is withheld.
     expect(args).toContain("--new-project");
     expect(args).toContain("--print=x");
+  });
+
+  // Upstream #36: combined with the skip flag, --sandbox lets the agent approve
+  // its own sandbox escape; alone it yields no usable read-only mode.
+  it("never emits --sandbox in either mode", () => {
+    for (const mode of ["write", "read-only"] as const) {
+      expect(agyAdapter.buildInvocation("x", { permissionMode: mode }).args).not.toContain(
+        "--sandbox",
+      );
+    }
   });
 
   it("forwards a model as --model <value> and omits it when absent", () => {

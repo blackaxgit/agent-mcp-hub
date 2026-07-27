@@ -2,6 +2,11 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
+    // Vitest's defaults, plus `.claude/` — an agent task running in its own
+    // worktree leaves a full nested checkout at `.claude/worktrees/<name>/`, and
+    // discovering it runs a SECOND copy of this suite (test count silently
+    // doubles) against a different tree. Never a source of tests for this repo.
+    exclude: ["**/node_modules/**", "**/dist/**", "**/.git/**", "**/.claude/**"],
     coverage: {
       provider: "v8",
       include: ["src/**/*.ts"],

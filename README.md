@@ -70,6 +70,22 @@ worktree), optional `model`, `timeoutMs`.
   (noted in the output).
 - Complements — does not replace — client-side stop-hooks or PR-time CI review.
 - The confirm gate (`MCP_CONFIRM`) applies.
+- **The reviewer runs least-privilege — but how much that guarantees depends on the
+  agent.** The reviewer's prompt embeds an attacker-influenced diff, so it is run
+  read-only rather than with the write grant the runner gets. Only two of the five
+  are real restrictions:
+
+  | Reviewer | Read-only mechanism | Enforced? |
+  |---|---|---|
+  | `codex` | `-s read-only` | **Yes — OS-level sandbox** |
+  | `claude` | `--disallowedTools Write,Edit,…,Bash` | **Yes — harness-level deny** |
+  | `cursor` | `--trust --mode plan` (no `--force`) | No — model-advisory only |
+  | `agy` | permission grant withheld | Partly — headless auto-deny, not a sandbox |
+  | `opencode` | *none available* | **No — unrestricted** |
+
+  Pick `codex` or `claude` as the reviewer if you want the restriction to be real.
+  This is defense-in-depth alongside the nonce-fenced diff and the throwaway temp
+  cwd; none of it is a sandbox.
 
 ```json
 {

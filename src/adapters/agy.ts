@@ -38,8 +38,11 @@ export const agyAdapter: AgentAdapter = {
     // exits 0 with EMPTY stdout — a failure that reads as success. Auto-approving
     // is what lets agy actually read and edit files (cursor's `--force` plays the
     // same role). Withheld only when the run is JUDGING attacker-controlled
-    // content — the `review_change` reviewer passes `autoApproveTools: false`.
-    if (options.autoApproveTools !== false) args.push("--dangerously-skip-permissions");
+    // content — the `review_change` reviewer passes `permissionMode: "read-only"`.
+    // `--sandbox` is NEVER emitted: upstream #36 reports that combining it with
+    // the skip flag lets the agent auto-approve its own sandbox escape, and alone
+    // it does not produce a usable read-only mode.
+    if (options.permissionMode !== "read-only") args.push("--dangerously-skip-permissions");
     if (options.model) args.push("--model", options.model);
     // The prompt is the GLUED value of `--print`. Glued (`--print=x`) rather than
     // `-p x` on purpose: the value is physically part of a single argv token, so

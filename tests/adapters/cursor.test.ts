@@ -22,21 +22,49 @@ describe("cursorAdapter", () => {
     expect(inv.stdin).toBe("--force what does this flag do");
   });
 
-  // Without --force, cursor-agent blocks on an interactive permission prompt in any
-  // directory it has not seen before. Print mode gives it no stdin to answer with, so
-  // the run hangs until the idle timeout kills it. The server is invoked against
-  // arbitrary cwds, so this flag is load-bearing, not cosmetic.
-  //
-  // It must be --force, NOT --trust: cursor-agent has no --trust flag and exits 1 with
-  // "unknown option '--trust'", which broke the cursor tool entirely in v0.5.0.
-  it("always passes --force (never --trust) so an unfamiliar cwd cannot hang the run", () => {
+  // Without a trust/force flag, cursor-agent refuses to proceed in a directory it
+  // has not seen before. The server is invoked against arbitrary cwds, so this is
+  // load-bearing, not cosmetic.
+  it("always passes --force in write mode so an unfamiliar cwd cannot block the run", () => {
     for (const args of [
       cursorAdapter.buildInvocation("hi").args,
       cursorAdapter.buildInvocation("hi", { model: "gpt-5" }).args,
+      cursorAdapter.buildInvocation("hi", { permissionMode: "write" }).args,
     ]) {
       expect(args).toContain("--force");
-      expect(args).not.toContain("--trust");
     }
+  });
+
+  describe("permission mode", () => {
+    it("treats an omitted permissionMode exactly like an explicit write", () => {
+      expect(cursorAdapter.buildInvocation("hi").args).toEqual(
+        cursorAdapter.buildInvocation("hi", { permissionMode: "write" }).args,
+      );
+    });
+
+    // A read-only run drops the write grant and switches to plan mode. --trust is
+    // REQUIRED alongside it: without a trust/force flag cursor-agent prints
+    // "Pass --trust, --yolo, or -f if you trust this directory" and returns NO
+    // answer at all, which would make the reviewer useless.
+    //
+    // NB: --trust DOES exist on cursor-agent today. An older note in this repo
+    // claimed it did not (and that passing it exits 1); that is stale — the CLI's
+    // own error message now recommends it.
+    it("uses --trust --mode plan and drops --force for a read-only run", () => {
+      const args = cursorAdapter.buildInvocation("hi", { permissionMode: "read-only" }).args;
+      expect(args).toContain("--trust");
+      expect(args).toContain("--mode");
+      expect(args[args.indexOf("--mode") + 1]).toBe("plan");
+      expect(args).not.toContain("--force");
+    });
+
+    it("still forwards --model in read-only mode", () => {
+      const args = cursorAdapter.buildInvocation("hi", {
+        permissionMode: "read-only",
+        model: "gpt-5",
+      }).args;
+      expect(args[args.indexOf("--model") + 1]).toBe("gpt-5");
+    });
   });
 
   it("exposes correct identity", () => {
