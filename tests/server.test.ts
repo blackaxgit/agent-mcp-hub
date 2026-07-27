@@ -82,6 +82,7 @@ describe("buildServer", () => {
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
     expect(names).toEqual([
+      "agy",
       "claude",
       "codex",
       "cursor",
@@ -234,7 +235,7 @@ describe("buildServer", () => {
       reason?: string;
     }>;
 
-    expect(parsed.map((p) => p.name)).toEqual(["codex", "cursor", "opencode", "claude"]);
+    expect(parsed.map((p) => p.name)).toEqual(["codex", "cursor", "opencode", "claude", "agy"]);
     expect(parsed[0]).toEqual({ name: "codex", installed: true, usable: true, available: true });
 
     const cursor = parsed[1]!;
@@ -242,7 +243,7 @@ describe("buildServer", () => {
     expect(cursor.reason).toMatch(/not found on PATH/);
 
     // The distinction that matters: present on disk, still cannot run.
-    for (const name of ["opencode", "claude"]) {
+    for (const name of ["opencode", "claude", "agy"]) {
       const entry = parsed.find((p) => p.name === name)!;
       expect(entry).toMatchObject({ installed: true, usable: false, available: false });
       expect(entry.reason).toBeTruthy();
@@ -386,7 +387,7 @@ describe("run_all", () => {
       name: "run_all",
       arguments: { prompt: "p", cwd: "/tmp", timeoutMs: 1234 },
     });
-    await vi.waitFor(() => expect(started).toBe(4));
+    await vi.waitFor(() => expect(started).toBe(5));
     for (const resolve of resolvers) resolve({ stdout: "ok\n", stderr: "", exitCode: 0 });
     const res = await pending;
     expect(exec).toHaveBeenCalledWith(
@@ -655,7 +656,7 @@ describe("confirm-before-run gate", () => {
       };
       const client = await connectedClientWithElicit(exec, handler);
       const res = await client.callTool({ name: "run_all", arguments: { prompt: "compare" } });
-      expect(exec).toHaveBeenCalledTimes(4);
+      expect(exec).toHaveBeenCalledTimes(5);
       expect(fired).toBe(1);
       expect(res.isError).toBeFalsy();
     });
@@ -929,6 +930,39 @@ describe("review_change", () => {
     });
     return exec;
   }
+
+  it("agy as RUNNER gets tool auto-approval; agy as REVIEWER does not", async () => {
+    const calls: Array<{ binary: string; args: string[] }> = [];
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: " M foo.ts\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff")
+          return { stdout: "diff --git a/foo.ts b/foo.ts\n-old\n+new\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      calls.push({ binary, args });
+      return { stdout: "PASS\nfine\n", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "agy", reviewer: "agy", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBeFalsy();
+
+    const agyCalls = calls.filter((c) => c.binary === "agy");
+    expect(agyCalls).toHaveLength(2);
+    // The runner acts on the caller's behalf, so it may auto-approve its tools.
+    expect(agyCalls[0]!.args).toContain("--dangerously-skip-permissions");
+    // The reviewer ingests an attacker-controlled diff and only needs to judge
+    // it, so the blanket tool-use grant is WITHHELD. Removing the
+    // `autoApproveTools: false` wiring in server.ts must fail this test.
+    expect(agyCalls[1]!.args).not.toContain("--dangerously-skip-permissions");
+    // …but the reviewer is otherwise a normal run.
+    expect(agyCalls[1]!.args).toContain("--new-project");
+  });
 
   it("A1 happy path: runner edits, reviewer replies PASS, all three binaries called", async () => {
     const runnerExec: Exec = vi.fn(async () => ({
@@ -1962,7 +1996,7 @@ describe("model validation (P1-B)", () => {
     expect(MODEL_RE.test("--share")).toBe(false);
     expect(MODEL_RE.test("")).toBe(false);
     expect(MODEL_RE.test(`a${"b".repeat(128)}`)).toBe(false); // 129 chars > cap
-    // Accepted: legitimate model ids across the four CLIs.
+    // Accepted: legitimate model ids across the wrapped CLIs.
     expect(MODEL_RE.test("o3")).toBe(true);
     expect(MODEL_RE.test("gpt-5.3-codex-high")).toBe(true);
     expect(MODEL_RE.test("openai/gpt-5")).toBe(true);

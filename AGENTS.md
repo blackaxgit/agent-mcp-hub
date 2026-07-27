@@ -13,7 +13,7 @@
 
 ## Overview
 
-- **Purpose:** One MCP server that bridges multiple CLI coding agents — **Codex**, **Cursor**, **OpenCode**, and **Claude** — into any MCP client.
+- **Purpose:** One MCP server that bridges multiple CLI coding agents — **Codex**, **Cursor**, **OpenCode**, **Claude**, and **Antigravity** (`agy`) — into any MCP client.
 - **Owner:** TODO: team / maintainer
 - **Type:** app — a published npm package (`agent-mcp-hub`, public on npm)
 - **Stack:** Node ESM (`"type": "module"`), TypeScript, `engines.node >= 22`, npm (`package-lock.json`)
@@ -99,10 +99,11 @@ Only the non-obvious ones (formatting, unused vars, floating promises are enforc
 - **How the prompt reaches each CLI differs per adapter — check before changing one:**
   - `codex`, `cursor`, `claude` → prompt piped via **stdin**, never a positional arg (a prompt starting with `-` would be parsed as a flag). They return `{args, stdin}`.
   - `opencode` → prompt IS a **positional** arg (`args.push(prompt)`, no stdin) — its CLI documents neither stdin input nor a `--` delimiter. **Because** it is positional, the adapter *rejects* prompts starting with `-` with an actionable error rather than risk flag-injection.
+  - `agy` → prompt is a **glued flag value** (`--print=<prompt>`, no stdin) — a third shape. Glued on purpose: the prompt is physically part of a single argv token, so it can never be re-parsed as a flag no matter how agy's flag library treats a dash-leading value. That makes the dash-prompt guarantee a property of **our** argv rather than of a third-party parser, which is why this adapter needs no opencode-style dash-guard. Do not "simplify" it to `-p <prompt>`.
 - **Fail fast with actionable errors.** `src/failure.ts` classifies CLI failures into nine `FailureCode`s: `not_installed`, `invalid_cwd`, `not_authenticated`, `not_configured`, `timed_out`, `output_limit`, `stream_stalled`, `server_busy`, `tool_failure`. **Most carry a concrete `Fix:`; two do not** — `stream_stalled` (the agent is simply unavailable; raising the timeout won't help) and the fallback `tool_failure` (returns the exit code plus a trimmed, ANSI-stripped output tail). Never surface a raw terminal dump.
 - **Agent CLI flags are version-sensitive and load-bearing.** Confirm a flag exists in the installed CLI (`<cli> --help`) before adding it — see the cursor `--trust` incident in Gotchas.
 - **Treat `prompt`, `model`, and `cwd` as attacker-influenced.** The MCP client is often an LLM acting on untrusted content (a web page, an issue, a repo it was pointed at), so these are not operator-vetted inputs. `review_change` goes further: it feeds an attacker-controlled `git diff` into a *second* model. Validate at the boundary; never interpolate them into a shell.
-- **Adding an agent = an adapter + one line in `allAdapters()` (`src/registry.ts`) + a test.** If the CLI has an API-key env var, declare it as the adapter's `apiKeyEnv` — **there is no second list to update.** The strip set is *derived* from the adapter list (`allCredentialEnvVars` → `credentialStripKeys`), so when agent A spawns, every *other* agent's key is removed from its child environment automatically. The old hand-maintained `AGENT_CREDENTIAL_ENV_VARS` constant was deleted precisely because forgetting to update it silently leaked the new key into every sibling's environment. **Scope:** this is **environment-variable isolation between siblings, not a secret boundary** — `HOME` is preserved (agents need their config), so a compromised agent can still read a sibling's *on-disk* credential file.
+- **Adding an agent = an adapter + one line in `allAdapters()` (`src/registry.ts`) + a test — plus every place that ENUMERATES the agents.** The enumerations are the easy miss: `tests/registry.test.ts` (name lists + the unknown-agent error string), `tests/server.test.ts` (registered-tool list, `list_agents` list, and two hard-coded fan-out counts in the `run_all` tests), `tests/confirm.test.ts` (the `buildRunAllMessage` list), and the docs (`README.md`, this file, `package.json` description/keywords, `server.json` description). Note `server.json` is on the **Ask first** list below. If the CLI has an API-key env var, declare it as the adapter's `apiKeyEnv` — **there is no second list to update.** The strip set is *derived* from the adapter list (`allCredentialEnvVars` → `credentialStripKeys`), so when agent A spawns, every *other* agent's key is removed from its child environment automatically. The old hand-maintained `AGENT_CREDENTIAL_ENV_VARS` constant was deleted precisely because forgetting to update it silently leaked the new key into every sibling's environment. **Scope:** this is **environment-variable isolation between siblings, not a secret boundary** — `HOME` is preserved (agents need their config), so a compromised agent can still read a sibling's *on-disk* credential file.
 
 ## Git & Workflow
 
@@ -160,6 +161,13 @@ Each of these breaks the build, the protocol, or a release if ignored.
 
 - **The `cursor` adapter must pass `--force`, never `--trust`.** `cursor-agent` has no `--trust` flag: passing it exits 1 with `unknown option '--trust'`, which shipped the `cursor` tool completely broken in v0.5.0 (fixed in 0.5.1). `-f/--force` is what suppresses the interactive permission prompt — without some such flag, a run in an unfamiliar cwd hangs until the idle timeout. Tests assert `--force` present **and** `--trust` absent.
 
+- **The `agy` adapter's three flags are load-bearing — removing any one silently breaks it.** All verified against agy 1.1.7; each is asserted by its own named test in `tests/adapters/agy.test.ts`.
+  - `--new-project` — **without it `agy` ignores the process working directory entirely** and runs in `~/.gemini/antigravity-cli/scratch`. The tool would appear to work while editing files in a global scratch dir the caller never named, so the hub's whole `cwd` contract would silently not hold for this agent. (It also survives a dot-prefixed ancestor path, which `--add-dir` reportedly does not.)
+  - `--dangerously-skip-permissions` — headless `agy` cannot prompt for tool permission, so it auto-**denies** and then **exits 0 with empty stdout**: a failure that reads as success. This is the `--force` analogue. **Exception:** `review_change` passes `autoApproveTools: false` for the **reviewer**, which ingests an attacker-controlled diff and only needs to judge it; that withholds the flag. Note this grants `agy` more privilege than `claude -p` or `codex exec` get here — it is a deliberate, reviewed choice, not parity by default.
+  - `--print-timeout 48h` — the default is **5 minutes**, which would cap every longer run regardless of the caller's `timeoutMs` and fail with the opaque `Error: timeout waiting for response` (exit 1). 48h is deliberately **above** `MAX_TIMEOUT_MS` (24h) so the hub's own total/idle timers always fire first and remain the single source of timeout truth.
+
+- **`agy` does not stream and leaves state behind.** Its entire answer is flushed at once on completion (measured), so the idle timer is its only hang protection — see the timeouts section of `README.md`. Each `--new-project` run also writes a new project file under `~/.gemini/config/projects/`, which grows unbounded on the operator's machine; the hub cannot control this. Verified: two runs against the same `cwd` share **no** conversation state, so there is no cross-caller context leak.
+
 - **`prebuild: rm -rf dist` is load-bearing — do not remove it.** `tsc` does not clean `dist/`, so files whose sources were deleted linger and get **published**. v0.5.0 shipped dead `dist/http.js` + `dist/httpServer.js` from the removed HTTP transport for exactly this reason.
 
 - **`prepublishOnly` re-runs a *subset* of the gate at publish time** — `build && typecheck && test:coverage` (no lint/format). CI covers the full gate on push-to-`main`/PR, so a red test normally stops you earlier; but a coverage dip that slips through fails the **release itself**.
@@ -178,7 +186,7 @@ Each of these breaks the build, the protocol, or a release if ignored.
 
 - **`docs/` is gitignored.** Anything written there is local-only and invisible to everyone else. Deliverable docs go at the repo root.
 
-- **Live agent tools depend on the operator's CLI logins and models.** `list_agents` reports `installed` and `usable` separately — a CLI can be on PATH yet unauthenticated, or pointed at an unreachable model. A failing `codex`/`cursor`/`opencode`/`claude` tool is often environment, not code: check `list_agents` first.
+- **Live agent tools depend on the operator's CLI logins and models.** `list_agents` reports `installed` and `usable` separately — a CLI can be on PATH yet unauthenticated, or pointed at an unreachable model. A failing `codex`/`cursor`/`opencode`/`claude`/`agy` tool is often environment, not code: check `list_agents` first.
 
 ## Permission Boundaries for AI Agents
 

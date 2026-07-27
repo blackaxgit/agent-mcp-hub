@@ -1,5 +1,16 @@
 export interface AgentRunOptions {
   model?: string;
+  /**
+   * Whether the agent may auto-approve its own tool use. `undefined` means true,
+   * so every existing call site keeps its current behavior.
+   *
+   * `review_change` passes FALSE for the REVIEWER, which ingests an
+   * attacker-controlled diff and only needs to read it and return a verdict. An
+   * adapter that would otherwise suppress its CLI's permission prompt must
+   * withhold that grant in this mode; adapters whose CLI has no such switch
+   * simply ignore it.
+   */
+  autoApproveTools?: boolean;
 }
 
 export interface AgentInvocation {

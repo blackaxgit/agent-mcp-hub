@@ -42,6 +42,8 @@ async function runAdapter(
     cwd?: string;
     timeoutMs?: number;
     idleTimeoutMs?: number;
+    /** False only for the review_change REVIEWER — see AgentRunOptions. */
+    autoApproveTools?: boolean;
   },
   onActivity?: () => void,
 ): Promise<ExecResult> {
@@ -62,7 +64,10 @@ async function runAdapter(
   try {
     // Inside the try so a buildInvocation throw (e.g. opencode's dash-guard) is
     // audited too, rather than escaping with no run-log trace.
-    const invocation = adapter.buildInvocation(params.prompt, { model: params.model });
+    const invocation = adapter.buildInvocation(params.prompt, {
+      model: params.model,
+      autoApproveTools: params.autoApproveTools,
+    });
     const result = await exec(adapter.binary, invocation.args, {
       cwd: params.cwd,
       timeoutMs: params.timeoutMs,
@@ -576,6 +581,13 @@ export function buildServer(
           model,
           cwd: reviewerCwd,
           timeoutMs,
+          // The reviewer only needs to READ the fenced diff and return a verdict,
+          // yet its prompt is the most attacker-influenced input in the server.
+          // So it does not get a blanket tool-use auto-approval: an adapter that
+          // normally suppresses its CLI's permission prompt keeps that prompt
+          // here. Defense-in-depth alongside the nonce fence and the temp cwd —
+          // narrowing, not a sandbox.
+          autoApproveTools: false,
         });
       } catch (err) {
         const statSection =
