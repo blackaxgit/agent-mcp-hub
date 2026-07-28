@@ -162,6 +162,34 @@ describe("buildRunAllMessage", () => {
     const msg = buildRunAllMessage(["a", "b"], { prompt: "p" });
     expect(msg).not.toMatch(/model/i);
   });
+
+  // Each per-agent override ends up as `--model <value>` on some CLI's argv, so
+  // it is exactly as attacker-influenceable as the scalar and must be visible
+  // in the human gate — hiding it would let a caller approve a run whose real
+  // models it never saw.
+  it("lists EVERY per-agent model override", () => {
+    const msg = buildRunAllMessage(["codex", "agy"], {
+      prompt: "p",
+      models: { codex: "o3", agy: "gemini-3.6-flash-low" },
+    });
+    expect(msg).toContain("codex=o3");
+    expect(msg).toContain("agy=gemini-3.6-flash-low");
+  });
+
+  it("shows the scalar model AND the per-agent overrides together", () => {
+    const msg = buildRunAllMessage(["codex", "agy"], {
+      prompt: "p",
+      model: "shared",
+      models: { codex: "o3" },
+    });
+    expect(msg.split("\n")).toContain("model: shared");
+    expect(msg).toContain("codex=o3");
+  });
+
+  it("omits the models line when the map is absent or empty", () => {
+    expect(buildRunAllMessage(["a"], { prompt: "p" })).not.toMatch(/models:/);
+    expect(buildRunAllMessage(["a"], { prompt: "p", models: {} })).not.toMatch(/models:/);
+  });
 });
 
 describe("CONFIRM_SCHEMA", () => {

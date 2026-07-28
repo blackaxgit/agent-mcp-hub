@@ -149,13 +149,59 @@ function makeProgressEmitter(
  * all pass.
  */
 export const MODEL_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
-const modelArg = z
-  .string()
-  .refine((v) => MODEL_RE.test(v), {
-    message:
-      "invalid model id: must start with a letter or digit and contain only letters, digits, and . _ : / - (≤128 chars). A flag-shaped value (leading '-') is rejected to prevent CLI argument injection.",
-  })
-  .optional();
+const modelValue = z.string().refine((v) => MODEL_RE.test(v), {
+  message:
+    "invalid model id: must start with a letter or digit and contain only letters, digits, and . _ : / - (≤128 chars). A flag-shaped value (leading '-') is rejected to prevent CLI argument injection.",
+});
+const modelArg = modelValue.optional();
+
+/**
+ * Per-agent model overrides, `{ "<agent>": "<model id>" }`. Every VALUE goes
+ * through the same `MODEL_RE` allowlist as the scalar `model` — a map must not
+ * become a hole in the argument-injection defence. Unknown KEYS are rejected in
+ * the handler (which knows the enabled set) rather than here.
+ *
+ * This exists because model namespaces do NOT overlap between agents — `o3` is
+ * meaningless to `agy`, `gemini-3.6-flash-low` is meaningless to `codex` — so a
+ * single scalar `model` can be valid for at most one agent in a fan-out.
+ */
+const modelsArg = z.record(z.string(), modelValue).optional();
+
+/** `models[agent]` wins over the shared `model`; undefined means the CLI's default. */
+function resolveModel(
+  agentName: string,
+  models: Record<string, string> | undefined,
+  model: string | undefined,
+): string | undefined {
+  // `Object.hasOwn`, not a bare lookup: `models` is caller-controlled, so a bare
+  // `models[agentName]` would consult Object.prototype. Safe today only because
+  // no adapter is named `toString`/`constructor`/`valueOf` — this makes the
+  // guarantee explicit instead of resting on that coincidence.
+  if (models && Object.hasOwn(models, agentName)) return models[agentName];
+  return model;
+}
+
+/**
+ * Reject agent names that are not enabled, so a typo fails fast with the valid
+ * list instead of silently doing nothing — the same contract `MCP_AGENTS` has.
+ *
+ * KNOWN LIMIT, one key only: `z.record` rebuilds its output by assigning each
+ * key onto a fresh object, and assigning `__proto__` invokes the inherited
+ * setter — so a literal `{"__proto__": …}` key is gone before this runs and is
+ * silently ignored rather than reported. Verified that `toString`,
+ * `constructor` and `valueOf` all survive intact and ARE rejected here.
+ *
+ * Left as-is deliberately: `__proto__` can never name an agent, so it cannot
+ * select a model and no value from it reaches argv — the only cost is a missing
+ * error message on an input nobody types by accident. The alternative
+ * (hand-rolling the schema with `z.custom`) makes the tool's inputSchema
+ * unrepresentable in JSON Schema — "Custom types cannot be represented in JSON
+ * Schema" — which breaks `tools/list` for every MCP client. That cure is far
+ * worse than the disease.
+ */
+function unknownAgentKeys(models: Record<string, string> | undefined, known: string[]): string[] {
+  return Object.keys(models ?? {}).filter((k) => !known.includes(k));
+}
 
 const agentInputSchema = {
   prompt: z.string().describe("The task or question for the agent, in natural language."),
@@ -315,7 +361,10 @@ export function buildServer(
           .string()
           .describe("The task or question to send to every agent, in natural language."),
         model: modelArg.describe(
-          "Optional model id override passed through to each agent CLI. Names are agent-specific. Must match [A-Za-z0-9][A-Za-z0-9._:/-]{0,127} — a flag-shaped value is rejected.",
+          "Optional model id applied to EVERY agent as a fallback. Model namespaces do not overlap between agents, so a single value is usually valid for only one of them — prefer `models` for a fan-out. Must match [A-Za-z0-9][A-Za-z0-9._:/-]{0,127} — a flag-shaped value is rejected.",
+        ),
+        models: modelsArg.describe(
+          'Per-agent model overrides, e.g. {"codex":"o3","agy":"gemini-3.6-flash-low"}. Takes precedence over `model` for the agents named; any agent not listed falls back to `model`, then to its own CLI default. Keys must be enabled agent names (an unknown name is rejected with the valid list). Each value must match [A-Za-z0-9][A-Za-z0-9._:/-]{0,127}.',
         ),
         cwd: z
           .string()
@@ -342,13 +391,25 @@ export function buildServer(
       },
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
     },
-    async ({ prompt, model, cwd, timeoutMs, idleTimeoutMs }, extra) => {
+    async ({ prompt, model, models, cwd, timeoutMs, idleTimeoutMs }, extra) => {
+      const names = adapters.map((a) => a.name);
+      const unknown = unknownAgentKeys(models, names);
+      if (unknown.length > 0) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `run_all: unknown agent${unknown.length > 1 ? "s" : ""} in \`models\`: ${unknown.join(", ")}; enabled agents: ${names.join(", ")}`,
+            },
+          ],
+        };
+      }
       if (
         !(await confirmOrCancel(
-          buildRunAllMessage(
-            adapters.map((a) => a.name),
-            { prompt, cwd, model },
-          ),
+          // Per-agent models are as attacker-influenceable as the scalar and are
+          // forwarded to a CLI, so the human gate must show them too.
+          buildRunAllMessage(names, { prompt, cwd, model, models }),
         ))
       ) {
         return { isError: true, content: [{ type: "text", text: `run_all: ${CANCEL_TAIL}` }] };
@@ -359,7 +420,18 @@ export function buildServer(
       const onActivity = makeProgressEmitter(extra, "run_all");
       const settled = await Promise.allSettled(
         adapters.map((adapter) =>
-          runAdapter(adapter, exec, { prompt, model, cwd, timeoutMs, idleTimeoutMs }, onActivity),
+          runAdapter(
+            adapter,
+            exec,
+            {
+              prompt,
+              model: resolveModel(adapter.name, models, model),
+              cwd,
+              timeoutMs,
+              idleTimeoutMs,
+            },
+            onActivity,
+          ),
         ),
       );
       const content = settled.map((outcome, i) => {
@@ -390,13 +462,23 @@ export function buildServer(
         prompt: z.string().describe("Task or question to send to the runner agent"),
         cwd: z.string().describe("Git working tree the runner operates in (REQUIRED)"),
         model: modelArg.describe(
-          "Model override passed to both agents. Must match [A-Za-z0-9][A-Za-z0-9._:/-]{0,127} — a flag-shaped value is rejected.",
+          "Fallback model for BOTH agents. Only useful when runner and reviewer are the same agent — model namespaces do not overlap, so one value cannot be valid for two different CLIs. For the cross-agent setup this tool recommends, use `runnerModel` / `reviewerModel`. Must match [A-Za-z0-9][A-Za-z0-9._:/-]{0,127}.",
+        ),
+        runnerModel: modelArg.describe(
+          "Model for the RUNNER agent, overriding `model`. Use this (not `model`) when runner and reviewer are different agents.",
+        ),
+        reviewerModel: modelArg.describe(
+          "Model for the REVIEWER agent, overriding `model`. Lets you review with a different engine/tier than the one that wrote the change.",
         ),
         timeoutMs: z.number().int().positive().optional().describe("Per-agent timeout in ms"),
       },
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
     },
-    async ({ runner, reviewer, prompt, cwd, model, timeoutMs }) => {
+    async ({ runner, reviewer, prompt, cwd, model, runnerModel, reviewerModel, timeoutMs }) => {
+      // Each role resolves independently: the whole point is that runner and
+      // reviewer are usually DIFFERENT CLIs with disjoint model namespaces.
+      const runnerModelId = runnerModel ?? model;
+      const reviewerModelId = reviewerModel ?? model;
       const runnerAdapter = adapters.find((a) => a.name === runner);
       const reviewerAdapter = adapters.find((a) => a.name === reviewer);
       if (!runnerAdapter || !reviewerAdapter) {
@@ -417,9 +499,11 @@ export function buildServer(
 
       if (
         !(await confirmOrCancel(
+          // Both resolved models are shown: they are attacker-influenceable and
+          // are forwarded to a CLI, so neither may be hidden from the human gate.
           `review_change: run ${runner} in ${cwd}, then review with ${reviewer}\nprompt: ${prompt}${
-            model === undefined ? "" : `\nmodel: ${model}`
-          }`,
+            runnerModelId === undefined ? "" : `\nrunner model: ${runnerModelId}`
+          }${reviewerModelId === undefined ? "" : `\nreviewer model: ${reviewerModelId}`}`,
         ))
       ) {
         return {
@@ -471,7 +555,12 @@ export function buildServer(
 
       let runnerResult: ExecResult;
       try {
-        runnerResult = await runAdapter(runnerAdapter, exec, { prompt, model, cwd, timeoutMs });
+        runnerResult = await runAdapter(runnerAdapter, exec, {
+          prompt,
+          model: runnerModelId,
+          cwd,
+          timeoutMs,
+        });
       } catch (err) {
         const { message } = classifyFailure(runnerAdapter, { error: err });
         return { isError: true, content: [{ type: "text", text: message }] };
@@ -578,7 +667,7 @@ export function buildServer(
       try {
         reviewResult = await runAdapter(reviewerAdapter, exec, {
           prompt: reviewPrompt,
-          model,
+          model: reviewerModelId,
           cwd: reviewerCwd,
           timeoutMs,
           // The reviewer only needs to READ the fenced diff and return a verdict,

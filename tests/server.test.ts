@@ -2137,3 +2137,213 @@ describe("confirm gate fail-closed vs degrade-open (P1-E)", () => {
     });
   });
 });
+
+// Model namespaces do NOT overlap between agents (`o3` means nothing to agy,
+// `gemini-3.6-flash-low` means nothing to codex), so a single scalar `model`
+// can be valid for at most one agent in a fan-out. These cover the per-agent
+// overrides that make the documented cross-agent workflows actually usable.
+describe("per-agent model overrides", () => {
+  /** Collect the `--model` value each binary was invoked with. */
+  function modelByBinary(exec: unknown): Record<string, string | undefined> {
+    const calls = (exec as { mock: { calls: [string, string[]][] } }).mock.calls;
+    const out: Record<string, string | undefined> = {};
+    for (const [binary, args] of calls) {
+      if (binary === "git") continue;
+      const i = args.indexOf("--model");
+      out[binary] = i === -1 ? undefined : args[i + 1];
+    }
+    return out;
+  }
+
+  describe("run_all", () => {
+    it("gives each named agent its own model", async () => {
+      const exec: Exec = vi.fn(async () => ({ stdout: "ok\n", stderr: "", exitCode: 0 }));
+      const client = await connectedClient(exec);
+      const res = await client.callTool({
+        name: "run_all",
+        arguments: { prompt: "p", models: { codex: "o3", agy: "gemini-3.6-flash-low" } },
+      });
+      expect(res.isError).toBeFalsy();
+      const m = modelByBinary(exec);
+      expect(m["codex"]).toBe("o3");
+      expect(m["agy"]).toBe("gemini-3.6-flash-low");
+      // Unlisted agents get no --model at all, so each CLI uses its own default.
+      expect(m["cursor-agent"]).toBeUndefined();
+      expect(m["opencode"]).toBeUndefined();
+      expect(m["claude"]).toBeUndefined();
+    });
+
+    it("falls back to the scalar `model` for agents absent from `models`", async () => {
+      const exec: Exec = vi.fn(async () => ({ stdout: "ok\n", stderr: "", exitCode: 0 }));
+      const client = await connectedClient(exec);
+      await client.callTool({
+        name: "run_all",
+        arguments: { prompt: "p", model: "shared-default", models: { codex: "o3" } },
+      });
+      const m = modelByBinary(exec);
+      expect(m["codex"]).toBe("o3"); // map wins over the scalar
+      expect(m["claude"]).toBe("shared-default");
+      expect(m["agy"]).toBe("shared-default");
+    });
+
+    it("keeps the old behavior when only `model` is given", async () => {
+      const exec: Exec = vi.fn(async () => ({ stdout: "ok\n", stderr: "", exitCode: 0 }));
+      const client = await connectedClient(exec);
+      await client.callTool({ name: "run_all", arguments: { prompt: "p", model: "only" } });
+      for (const v of Object.values(modelByBinary(exec))) expect(v).toBe("only");
+    });
+
+    // A typo must fail loudly with the valid list, not silently run every agent
+    // on its default — the same contract MCP_AGENTS has.
+    it("rejects an unknown agent name in `models` WITHOUT spawning anything", async () => {
+      const exec: Exec = vi.fn(async () => ({ stdout: "ok\n", stderr: "", exitCode: 0 }));
+      const client = await connectedClient(exec);
+      const res = await client.callTool({
+        name: "run_all",
+        arguments: { prompt: "p", models: { clade: "opus" } },
+      });
+      expect(res.isError).toBe(true);
+      expect(textOf(res)).toContain("clade");
+      expect(textOf(res)).toContain("codex");
+      expect(exec).not.toHaveBeenCalled();
+    });
+
+    // `models` is caller-controlled, so a bare `models[name]` lookup would
+    // consult Object.prototype. These names must be treated as unknown agents,
+    // never as a model source.
+    it("treats Object.prototype member names as unknown agents, not lookups", async () => {
+      for (const key of ["toString", "constructor", "valueOf"]) {
+        const exec: Exec = vi.fn(async () => ({ stdout: "ok\n", stderr: "", exitCode: 0 }));
+        const client = await connectedClient(exec);
+        const res = await client.callTool({
+          name: "run_all",
+          arguments: { prompt: "p", models: { [key]: "o3" } },
+        });
+        expect(res.isError).toBe(true);
+        expect(exec).not.toHaveBeenCalled();
+      }
+    });
+
+    // `__proto__` is the one key `z.record` loses (it rebuilds by assignment,
+    // which hits the inherited setter), so it cannot be REPORTED as unknown.
+    // What must still hold — and is what actually matters — is that it can
+    // never influence which model any agent receives.
+    it("cannot select a model via a `__proto__` key even though it is not reported", async () => {
+      const exec: Exec = vi.fn(async () => ({ stdout: "ok\n", stderr: "", exitCode: 0 }));
+      const client = await connectedClient(exec);
+      const res = await client.callTool({
+        name: "run_all",
+        arguments: { prompt: "p", models: JSON.parse('{"__proto__":"pwned"}') as never },
+      });
+      expect(res.isError).toBeFalsy();
+      // The decisive assertion: no agent was given a model from that key.
+      for (const [binary, args] of (exec as ReturnType<typeof vi.fn>).mock.calls as [
+        string,
+        string[],
+      ][]) {
+        expect(args, `${binary} must not receive a model`).not.toContain("--model");
+        expect(args).not.toContain("pwned");
+      }
+    });
+
+    // The map must not become a hole in the argument-injection defence.
+    it("rejects a flag-shaped model VALUE inside `models`", async () => {
+      const exec: Exec = vi.fn(async () => ({ stdout: "ok\n", stderr: "", exitCode: 0 }));
+      const client = await connectedClient(exec);
+      const res = await client.callTool({
+        name: "run_all",
+        arguments: { prompt: "p", models: { codex: "--dangerously-bypass-approvals-and-sandbox" } },
+      });
+      expect(res.isError).toBe(true);
+      expect(exec).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("review_change", () => {
+    function gitExec(extra: (b: string, a: string[]) => unknown): Exec {
+      return vi.fn(async (binary: string, args: string[]) => {
+        if (binary === "git") {
+          if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+          if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+          if (gitOp(args) === "diff-stat") return { stdout: " M a.ts\n", stderr: "", exitCode: 0 };
+          if (gitOp(args) === "diff")
+            return { stdout: "diff --git a/a.ts b/a.ts\n-x\n+y\n", stderr: "", exitCode: 0 };
+          if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+        }
+        return extra(binary, args);
+      }) as Exec;
+    }
+
+    // THE bug this fixes: the tool's own description recommends "codex writes,
+    // claude reviews", but a single `model` cannot be valid for two different
+    // CLIs, so the documented setup could never use a model override at all.
+    it("gives runner and reviewer independent models", async () => {
+      const exec = gitExec(() => ({ stdout: "PASS\nfine\n", stderr: "", exitCode: 0 }));
+      const client = await connectedClient(exec);
+      const res = await client.callTool({
+        name: "review_change",
+        arguments: {
+          runner: "codex",
+          reviewer: "claude",
+          prompt: "fix",
+          cwd: "/tmp",
+          runnerModel: "o3",
+          reviewerModel: "opus",
+        },
+      });
+      expect(res.isError).toBeFalsy();
+      const m = modelByBinary(exec);
+      expect(m["codex"]).toBe("o3");
+      expect(m["claude"]).toBe("opus");
+    });
+
+    it("still honors the shared `model` for both when the per-role fields are absent", async () => {
+      const exec = gitExec(() => ({ stdout: "PASS\n", stderr: "", exitCode: 0 }));
+      const client = await connectedClient(exec);
+      await client.callTool({
+        name: "review_change",
+        arguments: {
+          runner: "codex",
+          reviewer: "claude",
+          prompt: "fix",
+          cwd: "/tmp",
+          model: "shared",
+        },
+      });
+      const m = modelByBinary(exec);
+      expect(m["codex"]).toBe("shared");
+      expect(m["claude"]).toBe("shared");
+    });
+
+    it("lets one role override while the other keeps the shared fallback", async () => {
+      const exec = gitExec(() => ({ stdout: "PASS\n", stderr: "", exitCode: 0 }));
+      const client = await connectedClient(exec);
+      await client.callTool({
+        name: "review_change",
+        arguments: {
+          runner: "codex",
+          reviewer: "claude",
+          prompt: "fix",
+          cwd: "/tmp",
+          model: "shared",
+          reviewerModel: "haiku",
+        },
+      });
+      const m = modelByBinary(exec);
+      expect(m["codex"]).toBe("shared");
+      expect(m["claude"]).toBe("haiku");
+    });
+
+    it("rejects a flag-shaped runnerModel/reviewerModel", async () => {
+      const exec = gitExec(() => ({ stdout: "PASS\n", stderr: "", exitCode: 0 }));
+      const client = await connectedClient(exec);
+      for (const bad of [{ runnerModel: "--force" }, { reviewerModel: "-rf" }]) {
+        const res = await client.callTool({
+          name: "review_change",
+          arguments: { runner: "codex", reviewer: "claude", prompt: "p", cwd: "/tmp", ...bad },
+        });
+        expect(res.isError).toBe(true);
+      }
+    });
+  });
+});
