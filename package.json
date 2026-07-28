@@ -1,6 +1,6 @@
 {
   "name": "agent-mcp-hub",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "One MCP server bridging the Codex, Cursor, OpenCode, Claude, and Antigravity CLI agents",
   "repository": {
     "type": "git",
