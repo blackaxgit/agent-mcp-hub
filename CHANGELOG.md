@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/blackaxgit/agent-mcp-hub/compare/agent-mcp-hub-v0.6.0...agent-mcp-hub-v0.6.1) (2026-07-28)
+
+
+### Bug Fixes
+
+* **server:** allow per-agent model overrides in run_all and review_change ([#52](https://github.com/blackaxgit/agent-mcp-hub/issues/52)) ([04daed4](https://github.com/blackaxgit/agent-mcp-hub/commit/04daed481fdee87c1d2356e7c5bf4480bc6b47ce))
+
 ## [0.6.0](https://github.com/blackaxgit/agent-mcp-hub/compare/agent-mcp-hub-v0.5.3...agent-mcp-hub-v0.6.0) (2026-07-27)
 
 
