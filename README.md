@@ -29,6 +29,39 @@ cap, default 1800000 = 30 min), and `idleTimeoutMs` (inactivity cap, default 300
 Known limitation: `opencode` prompts may not start with `-` (its CLI could parse
 them as flags); the tool returns an actionable error instead of guessing.
 
+### Choosing models per agent
+
+**Model ids are agent-specific and do not overlap.** `o3` means nothing to
+`agy`, `gemini-3.6-flash-low` means nothing to `codex`, and `opencode` namespaces
+its own (`opencode/big-pickle`). So a single `model` value is valid for at most
+one agent in a fan-out.
+
+- `run_all` takes **`models`** — a per-agent map. Agents you don't list fall back
+  to `model`, then to their own CLI default.
+- `review_change` takes **`runnerModel`** and **`reviewerModel`**, so the agent
+  writing the change and the agent judging it can use different engines *and*
+  tiers. `model` remains a fallback for both.
+
+```json
+{
+  "tool": "run_all",
+  "arguments": {
+    "prompt": "Explain the retry logic in src/exec.ts",
+    "models": { "codex": "o3", "agy": "gemini-3.6-flash-low", "claude": "haiku" }
+  }
+}
+```
+
+An unknown agent name in `models` is rejected with the list of enabled agents —
+a typo never silently falls back to the default model.
+
+Where to find valid ids: `opencode models`, `cursor-agent models` and
+`agy models` list them. `codex` and `claude` have no such command — codex reads
+its default from `~/.codex/config.toml`, and claude accepts the documented
+aliases (`opus`, `sonnet`, `haiku`, `fable`). Note `claude models` is **not** a
+subcommand: it is treated as a prompt, so its "model list" is generated text,
+not a source of truth.
+
 ### Error handling
 
 When a wrapped CLI fails, the hub classifies the failure and returns a clean,
@@ -57,7 +90,8 @@ the runner's output, the diff (`--stat`), and a **PASS / WARN / FAIL** verdict
 with findings.
 
 **Inputs:** `runner`, `reviewer` (agent names), `prompt`, `cwd` (must be a git
-worktree), optional `model`, `timeoutMs`.
+worktree), optional `runnerModel`, `reviewerModel`, `model` (fallback for both),
+`timeoutMs`.
 
 **Key notes:**
 

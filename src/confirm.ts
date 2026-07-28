@@ -52,7 +52,7 @@ export function buildConfirmMessage(
 /** Summary listing every enabled agent name for a single run_all confirmation. */
 export function buildRunAllMessage(
   agentNames: string[],
-  opts: { prompt: string; cwd?: string; model?: string },
+  opts: { prompt: string; cwd?: string; model?: string; models?: Record<string, string> },
 ): string {
   const lines = [
     `Run all agents (${agentNames.join(", ")})?`,
@@ -62,6 +62,12 @@ export function buildRunAllMessage(
   // `model` is shown so a caller sees exactly what is forwarded to each CLI —
   // it is attacker-influenceable and must not be hidden from the human gate.
   if (opts.model !== undefined) lines.push(`model: ${opts.model}`);
+  // Same reasoning for the per-agent overrides: each one ends up as `--model
+  // <value>` on some CLI's argv, so every one of them must be visible here.
+  const entries = Object.entries(opts.models ?? {});
+  if (entries.length > 0) {
+    lines.push(`models: ${entries.map(([agent, id]) => `${agent}=${id}`).join(", ")}`);
+  }
   return lines.join("\n");
 }
 
