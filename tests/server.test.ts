@@ -1604,6 +1604,57 @@ describe("review_change", () => {
     expect(runnerExec).not.toHaveBeenCalled();
   });
 
+  it("post-run capture failure: git diff exits 128 → isError 'git failed capturing the diff', not a silent 'no changes'; reviewer NOT called", async () => {
+    const reviewerExec: Exec = vi.fn(async () => ({ stdout: "PASS\n", stderr: "", exitCode: 0 }));
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff-stat") return { stdout: "", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "diff")
+          return { stdout: "", stderr: "fatal: bad revision", exitCode: 128 };
+        if (gitOp(args) === "ls-files") return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return { stdout: "done\n", stderr: "", exitCode: 0 };
+      if (binary === "claude") return reviewerExec(binary, args);
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBe(true);
+    const text = textOf(res);
+    expect(text).toContain("git failed capturing the diff");
+    expect(text).toContain("git diff exited 128");
+    expect(text).not.toContain("No file changes detected");
+    expect(reviewerExec).not.toHaveBeenCalled();
+  });
+
+  it("pre-run status exits 128 → isError 'review_change: git failed'; runner NOT called", async () => {
+    const runnerExec: Exec = vi.fn(async () => ({ stdout: "done\n", stderr: "", exitCode: 0 }));
+    const exec: Exec = vi.fn(async (binary: string, args: string[]) => {
+      if (binary === "git") {
+        if (gitOp(args) === "rev-parse") return { stdout: "true\n", stderr: "", exitCode: 0 };
+        if (gitOp(args) === "status")
+          return { stdout: "", stderr: "fatal: index file corrupt", exitCode: 128 };
+        return { stdout: "", stderr: "", exitCode: 0 };
+      }
+      if (binary === "codex") return runnerExec(binary, args);
+      return { stdout: "", stderr: "", exitCode: 0 };
+    });
+    const client = await connectedClient(exec);
+    const res = await client.callTool({
+      name: "review_change",
+      arguments: { runner: "codex", reviewer: "claude", prompt: "fix foo", cwd: "/tmp" },
+    });
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toContain("review_change: git failed");
+    expect(textOf(res)).toContain("git status exited 128");
+    expect(runnerExec).not.toHaveBeenCalled();
+  });
+
   it("strengthen untracked-only: reviewer exec called with prompt containing 'New untracked files: new.ts' and '(no tracked diff)'", async () => {
     const reviewerExec: Exec = vi.fn(async () => ({
       stdout: "PASS\nlooks good\n",
@@ -2016,12 +2067,12 @@ describe("review_change", () => {
     );
     expect(exec).toHaveBeenCalledWith(
       "git",
-      hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "--stat", "HEAD"]),
+      hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "--stat", "HEAD", "--"]),
       expect.objectContaining({ cwd: "/tmp/wt", env: GIT_HARDENING_ENV }),
     );
     expect(exec).toHaveBeenCalledWith(
       "git",
-      hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "HEAD"]),
+      hardenedGitArgs(["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--"]),
       expect.objectContaining({ cwd: "/tmp/wt", env: GIT_HARDENING_ENV }),
     );
     expect(exec).toHaveBeenCalledWith(
