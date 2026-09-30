@@ -11,6 +11,11 @@ import { stripAnsi } from "./ansi.js";
 
 export { stripAnsi } from "./ansi.js";
 
+/** The message of a thrown value, whether or not it is an `Error`. */
+export function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 /** Lowercased, ANSI-free view of `s` used for phrase matching (never shown). */
 export function normalize(s: string): string {
   return stripAnsi(s).toLowerCase();
@@ -100,10 +105,14 @@ function clipTail(s: string, max: number): string {
   return s.length <= max ? s : "…" + s.slice(s.length - max);
 }
 
+/** The stream worth showing: stderr when it has content, otherwise stdout. */
+function diagnosticSource(result: ExecResult): string {
+  return result.stderr.trim().length > 0 ? result.stderr : result.stdout;
+}
+
 /** First non-empty ANSI-stripped line of stderr (falling back to stdout), clipped. */
 function causeSnippet(result: ExecResult): string {
-  const source = result.stderr.trim().length > 0 ? result.stderr : result.stdout;
-  const line = stripAnsi(source)
+  const line = stripAnsi(diagnosticSource(result))
     .split("\n")
     .map((l) => l.trim())
     .find((l) => l.length > 0);
@@ -112,8 +121,7 @@ function causeSnippet(result: ExecResult): string {
 
 /** Trimmed, ANSI-stripped stderr/stdout tail for tool_failure bodies. */
 function outputTail(result: ExecResult): string {
-  const source = result.stderr.trim().length > 0 ? result.stderr : result.stdout;
-  const cleaned = stripAnsi(source).trim();
+  const cleaned = stripAnsi(diagnosticSource(result)).trim();
   return cleaned.length === 0 ? "(no output)" : clipTail(cleaned, TAIL_MAX);
 }
 
@@ -203,7 +211,7 @@ function classifyError(adapter: AdapterMeta, error: unknown): FailureClassificat
     };
   }
   // Default class — every thrown error (incl. the opencode dash-guard) lands here.
-  const raw = error instanceof Error ? error.message : String(error);
+  const raw = errorMessage(error);
   return {
     code: "tool_failure",
     message: `${adapter.name} failed:\n${clipHead(stripAnsi(raw).trim(), TAIL_MAX)}`,

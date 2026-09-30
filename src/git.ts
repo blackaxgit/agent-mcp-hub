@@ -48,17 +48,8 @@ export function hardenedGitArgs(subcommand: string[]): string[] {
 }
 
 /** Run a read-only git subcommand hardened against the worktree's own config. */
-function git(
-  exec: Exec,
-  cwd: string,
-  subcommand: string[],
-  extra?: { timeoutMs?: number },
-): ReturnType<Exec> {
-  return exec("git", hardenedGitArgs(subcommand), {
-    cwd,
-    env: GIT_HARDENING_ENV,
-    ...extra,
-  });
+function git(exec: Exec, cwd: string, subcommand: string[]): ReturnType<Exec> {
+  return exec("git", hardenedGitArgs(subcommand), { cwd, env: GIT_HARDENING_ENV });
 }
 
 /** Diff args with the external-diff and textconv execution vectors disabled. */

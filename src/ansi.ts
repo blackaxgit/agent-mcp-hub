@@ -7,10 +7,13 @@
 const ANSI_PATTERN =
   "[\\u001B\\u009B][[\\]()#;?]*(?:(?:(?:(?:;[-a-zA-Z\\d\\/#&.:=?%@~_]+)*|[a-zA-Z\\d]+(?:;[-a-zA-Z\\d\\/#&.:=?%@~_]*)*)?\\u0007)|(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PR-TZcf-nq-uy=><~]))";
 
+const ANSI_RE = new RegExp(ANSI_PATTERN, "g");
+
 /**
  * Remove ANSI escape sequences and collapse carriage-return spinner runs so the
- * text is safe to embed in a plain MCP message. Pure: no I/O.
+ * text is safe to embed in a plain MCP message. Pure: no I/O. Sharing the global
+ * regex is safe: `String.prototype.replace` resets `lastIndex` on every call.
  */
 export function stripAnsi(s: string): string {
-  return s.replace(new RegExp(ANSI_PATTERN, "g"), "").replace(/\r+/g, "");
+  return s.replace(ANSI_RE, "").replace(/\r+/g, "");
 }
