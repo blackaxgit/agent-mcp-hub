@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.2](https://github.com/blackaxgit/agent-mcp-hub/compare/agent-mcp-hub-v0.6.1...agent-mcp-hub-v0.6.2) (2026-09-30)
+
+
+### Bug Fixes
+
+* fail review_change closed on git capture errors; stop line numbers reading as server_busy ([#74](https://github.com/blackaxgit/agent-mcp-hub/issues/74)) ([e972725](https://github.com/blackaxgit/agent-mcp-hub/commit/e9727258da58e4a7f8e89aa7ae966893b53c289e))
+
 ## [0.6.1](https://github.com/blackaxgit/agent-mcp-hub/compare/agent-mcp-hub-v0.6.0...agent-mcp-hub-v0.6.1) (2026-07-28)
 
 
