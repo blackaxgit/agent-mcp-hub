@@ -104,11 +104,6 @@ export function clampTimer(ms: number): number {
   return Math.min(Math.max(1, Math.floor(ms)), MAX_TIMEOUT_MS);
 }
 
-/** Positive finite integer only; NaN/0/negative/non-integer all fall back to 4. */
-function parseConcurrency(raw: string | undefined): number {
-  return parsePositiveInt(raw, 4);
-}
-
 /** Non-negative finite integer only; NaN/negative/non-integer all fall back to 100. */
 function parseMaxQueue(raw: string | undefined): number {
   const n = Number(raw);
@@ -119,7 +114,7 @@ function parseMaxQueue(raw: string | undefined): number {
  * Cap on children spawned concurrently across the process. Parsed once at module
  * load; override via MCP_MAX_CONCURRENT_AGENTS.
  */
-export const MAX_CONCURRENT_AGENTS = parseConcurrency(process.env.MCP_MAX_CONCURRENT_AGENTS);
+export const MAX_CONCURRENT_AGENTS = parsePositiveInt(process.env.MCP_MAX_CONCURRENT_AGENTS, 4);
 
 /**
  * Thrown when every permit is busy AND the wait queue is already full. Overload
@@ -357,11 +352,42 @@ type TerminalCause =
   | { kind: "output"; maxOutputBytes: number }
   | { kind: "stall"; signature: string; strikes: number };
 
+/** Map the recorded terminal cause to the error surfaced to the caller. */
+function terminalError(binary: string, cause: TerminalCause): Error {
+  switch (cause.kind) {
+    case "output":
+      // Never echo the captured bytes back — only the limit that was breached.
+      return new OutputLimitError(
+        `"${binary}" exceeded output limit of ${cause.maxOutputBytes} bytes`,
+        cause.maxOutputBytes,
+      );
+    case "idle":
+      return new TimeoutError(
+        `"${binary}" produced no output for ${cause.windowMs}ms (idle) — it may be hung or its model/backend is unreachable`,
+        cause.windowMs,
+        "idle",
+      );
+    case "total":
+      return new TimeoutError(
+        `"${binary}" timed out after ${cause.windowMs}ms (total runtime cap)`,
+        cause.windowMs,
+        "total",
+      );
+    case "stall":
+      return new AgentStalledError(
+        `"${binary}" stalled: detected diagnostic reconnect pattern — "${cause.signature}" (strike ${cause.strikes}). The agent cannot complete a run in this environment (common cause: TLS-intercepting proxy). Treat this agent as unavailable until the network path is fixed.`,
+        cause.signature,
+        cause.strikes,
+      );
+  }
+}
+
 const runCommandInner: Exec = (binary, args, opts = {}) => {
   const timeoutMs = clampTimer(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   const idleTimeoutMs = clampTimer(opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS);
   const maxOutputBytes = opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
-  const stallSignatures = opts.stallSignatures ?? null;
+  // Normalized once: null means "stall detection off" (unset OR empty list).
+  const stallSignatures = opts.stallSignatures?.length ? opts.stallSignatures : null;
   const stallAttemptLimit = opts.stallAttemptLimit ?? DEFAULT_STALL_ATTEMPT_LIMIT;
   const stallStrikeLimit = opts.stallStrikeLimit ?? DEFAULT_STALL_STRIKE_LIMIT;
   return new Promise<ExecResult>((resolve, reject) => {
@@ -438,10 +464,22 @@ const runCommandInner: Exec = (binary, args, opts = {}) => {
       killTree();
     }
 
-    idleTimer = setTimeout(
-      () => markTerminal({ kind: "idle", windowMs: idleTimeoutMs }),
-      idleTimeoutMs,
-    );
+    const armIdle = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(
+        () => markTerminal({ kind: "idle", windowMs: idleTimeoutMs }),
+        idleTimeoutMs,
+      );
+    };
+    armIdle();
+
+    // An ACCEPTED chunk counts as progress: sink it, fire the (synchronous)
+    // activity hook, and reset the idle window from now.
+    const acceptActivity = (chunk: Buffer, sink: Buffer[]) => {
+      sink.push(chunk);
+      opts.onActivity?.();
+      armIdle();
+    };
 
     if (opts.input !== undefined) {
       // Swallow EPIPE if the child exits before reading its stdin.
@@ -452,11 +490,10 @@ const runCommandInner: Exec = (binary, args, opts = {}) => {
 
     // Test a complete stderr line against the stall signatures. Returns the
     // matched signature text (already stripped/trimmed) or undefined.
-    const testStallLine = (line: string): string | undefined => {
-      if (!stallSignatures || stallSignatures.length === 0) return undefined;
+    const testStallLine = (signatures: readonly RegExp[], line: string): string | undefined => {
       const stripped = stripAnsi(line).trim();
       if (stripped.length === 0) return undefined;
-      for (const re of stallSignatures) {
+      for (const re of signatures) {
         if (re.test(stripped)) return stripped;
       }
       return undefined;
@@ -484,30 +521,28 @@ const runCommandInner: Exec = (binary, args, opts = {}) => {
       }
 
       if (isStdout) {
-        sink.push(chunk);
         productiveStdoutBytes += chunk.length;
-        // ACCEPTED stdout chunk: this counts as progress. Fire the (synchronous)
-        // activity hook and reset the idle window from now.
-        opts.onActivity?.();
-        clearTimeout(idleTimer);
-        idleTimer = setTimeout(
-          () => markTerminal({ kind: "idle", windowMs: idleTimeoutMs }),
-          idleTimeoutMs,
-        );
+        acceptActivity(chunk, sink);
         return;
       }
 
       // stderr path.
-      if (stallSignatures && stallSignatures.length > 0) {
-        // Append to the rolling buffer and split on newlines. Keep the trailing
-        // partial so a line straddling two chunks is reassembled intact.
-        stderrRemainder += chunk.toString("utf8");
-        const lines = stderrRemainder.split("\n");
-        // The last element is the partial (may be empty if chunk ended on \n).
-        stderrRemainder = lines.pop() ?? "";
+      if (stallSignatures) {
+        // Rolling buffer: keep the trailing partial so a line straddling two
+        // chunks is reassembled intact. Only split when this chunk completes a
+        // line, so a long newline-free stream is not rescanned on every chunk.
+        const text = chunk.toString("utf8");
+        const lastNewline = text.lastIndexOf("\n");
+        let lines: string[] = [];
+        if (lastNewline === -1) {
+          stderrRemainder += text;
+        } else {
+          lines = (stderrRemainder + text.slice(0, lastNewline)).split("\n");
+          stderrRemainder = text.slice(lastNewline + 1);
+        }
         let matchedInBatch = false;
         for (const line of lines) {
-          const sig = testStallLine(line);
+          const sig = testStallLine(stallSignatures, line);
           if (sig === undefined) continue;
           matchedInBatch = true;
           stallStrikes += 1;
@@ -537,25 +572,11 @@ const runCommandInner: Exec = (binary, args, opts = {}) => {
           }
           return;
         }
-        // No stall line matched — treat as ordinary activity (existing behavior).
-        sink.push(chunk);
-        opts.onActivity?.();
-        clearTimeout(idleTimer);
-        idleTimer = setTimeout(
-          () => markTerminal({ kind: "idle", windowMs: idleTimeoutMs }),
-          idleTimeoutMs,
-        );
-        return;
       }
 
-      // No stall signatures armed: stderr behaves like stdout for activity.
-      sink.push(chunk);
-      opts.onActivity?.();
-      clearTimeout(idleTimer);
-      idleTimer = setTimeout(
-        () => markTerminal({ kind: "idle", windowMs: idleTimeoutMs }),
-        idleTimeoutMs,
-      );
+      // No stall line matched, or no stall signatures armed: stderr counts as
+      // ordinary activity, exactly like stdout.
+      acceptActivity(chunk, sink);
     };
 
     child.stdout?.on("data", (chunk: Buffer) => track(chunk, stdoutChunks, true));
@@ -580,46 +601,7 @@ const runCommandInner: Exec = (binary, args, opts = {}) => {
       if (settled) return;
       settled = true;
       if (terminalCause) {
-        if (terminalCause.kind === "output") {
-          // Never echo the captured bytes back — only the limit that was breached.
-          reject(
-            new OutputLimitError(
-              `"${binary}" exceeded output limit of ${terminalCause.maxOutputBytes} bytes`,
-              terminalCause.maxOutputBytes,
-            ),
-          );
-          return;
-        }
-        if (terminalCause.kind === "idle") {
-          reject(
-            new TimeoutError(
-              `"${binary}" produced no output for ${terminalCause.windowMs}ms (idle) — it may be hung or its model/backend is unreachable`,
-              terminalCause.windowMs,
-              "idle",
-            ),
-          );
-          return;
-        }
-        if (terminalCause.kind === "total") {
-          reject(
-            new TimeoutError(
-              `"${binary}" timed out after ${timeoutMs}ms (total runtime cap)`,
-              timeoutMs,
-              "total",
-            ),
-          );
-          return;
-        }
-        if (terminalCause.kind === "stall") {
-          reject(
-            new AgentStalledError(
-              `"${binary}" stalled: detected diagnostic reconnect pattern — "${terminalCause.signature}" (strike ${terminalCause.strikes}). The agent cannot complete a run in this environment (common cause: TLS-intercepting proxy). Treat this agent as unavailable until the network path is fixed.`,
-              terminalCause.signature,
-              terminalCause.strikes,
-            ),
-          );
-          return;
-        }
+        reject(terminalError(binary, terminalCause));
         return;
       }
       resolve({

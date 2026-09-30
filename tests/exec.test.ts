@@ -160,12 +160,11 @@ describe("runCommand idle timeout", () => {
     // ~200ms (every ~40ms, each line re-arming idle), then falls silent forever,
     // so the timer that ultimately fires can only be the re-armed one.
     //
-    // Deliberately stdout-only — no stderr, no stallSignatures. S4 also happens to
-    // reach this path, but only when the child's stderr writes coalesce into
-    // stall-matching chunks; when they split so a chunk carries no signature line,
-    // the stderr branch re-arms idle through a *different* closure and S4 still
-    // passes while leaving this one unexecuted. That made function coverage
-    // load-dependent and flaked the 97% gate. Keep this test stdout-only.
+    // Deliberately stdout-only — no stderr, no stallSignatures — so an accepted
+    // stdout chunk is the only thing that can re-arm idle here. S4 reaches the
+    // same shared re-arm only when its stderr writes split so a chunk carries no
+    // signature line, which depends on scheduling; this test pins it
+    // deterministically. Keep this test stdout-only.
     //
     // The 600ms idle window is ~4× the tightest spawn-latency assumption already
     // in this file (A2's 150ms), so a loaded machine cannot let the spawn-armed
@@ -291,7 +290,7 @@ describe("TimeoutError back-compat", () => {
 });
 
 describe("MAX_CONCURRENT_AGENTS env parsing", () => {
-  // parseConcurrency runs once at module load off MCP_MAX_CONCURRENT_AGENTS, so
+  // MAX_CONCURRENT_AGENTS is parsed once at module load off MCP_MAX_CONCURRENT_AGENTS, so
   // to exercise both ternary arms we re-import the module with the env var set.
   // The static import at the top already covered the unset → NaN → fallback arm.
   const reimport = async (value: string | undefined) => {
@@ -995,6 +994,32 @@ describe("runCommand stall detector", () => {
     const elapsed = Date.now() - start;
     expect(err).toBeInstanceOf(AgentStalledError);
     expect(elapsed).toBeLessThan(5_000);
+  });
+
+  it("S9b: a signature split across THREE chunks is reassembled from the carried remainder", async () => {
+    // The only attempt-2 line — the one that trips stallAttemptLimit — arrives in
+    // three writes 50ms apart: a chunk ending mid-line after a complete line, a
+    // newline-free chunk, then the chunk that completes it. Dropping or
+    // overwriting the carried partial at any step loses the line, so no stall
+    // fires and the 5s total cap rejects with TimeoutError instead. The delays
+    // run inside the real child: only separate writes over a real pipe produce
+    // separate data events, which fake timers in this process cannot simulate.
+    const line =
+      "Connection lost, reconnecting to https://agentn.global.api5.cursor.sh (attempt 2)...";
+    const cut = line.indexOf("(att") + "(att".length;
+    const parts = [`noise\n${line.slice(0, cut)}`, "em", `${line.slice(cut + 2)}\n`];
+    const script =
+      `const p=${JSON.stringify(parts)};` +
+      "p.forEach((s,i)=>setTimeout(()=>process.stderr.write(s),i*50));" +
+      "setTimeout(()=>{},30000);";
+
+    const err = await runCommand(process.execPath, ["-e", script], {
+      idleTimeoutMs: 60_000,
+      timeoutMs: 5_000,
+      stallSignatures: stallSig,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(AgentStalledError);
+    expect((err as AgentStalledError).signature).toBe(line);
   });
 
   it("S10: signature line wrapped in ANSI colour codes -> still detected", async () => {

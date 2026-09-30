@@ -5,7 +5,7 @@ import { claudeAdapter } from "./adapters/claude.js";
 import { codexAdapter } from "./adapters/codex.js";
 import { cursorAdapter } from "./adapters/cursor.js";
 import { opencodeAdapter } from "./adapters/opencode.js";
-import type { Exec } from "./exec.js";
+import type { Exec, ExecResult } from "./exec.js";
 import { classifyFailure } from "./failure.js";
 import type { AgentAdapter } from "./types.js";
 
@@ -47,27 +47,21 @@ export function credentialStripKeys(adapter: AgentAdapter): readonly string[] {
  * message so typos are surfaced at wiring time rather than silently dropped.
  */
 export function enabledAdapters(agentsSpec = process.env.MCP_AGENTS): AgentAdapter[] {
-  const requested = [
-    ...new Set(
-      (agentsSpec ?? "")
-        .split(",")
-        .map((name) => name.trim())
-        .filter(Boolean),
-    ),
-  ];
-  if (requested.length === 0) return allAdapters();
-  const known = new Set(allAdapters().map((a) => a.name));
+  const all = allAdapters();
+  const requested = new Set(
+    (agentsSpec ?? "")
+      .split(",")
+      .map((name) => name.trim())
+      .filter(Boolean),
+  );
+  if (requested.size === 0) return all;
+  const names = all.map((a) => a.name);
   for (const name of requested) {
-    if (!known.has(name)) {
-      throw new Error(
-        `Unknown agent "${name}" in MCP_AGENTS. Valid agents: ${allAdapters()
-          .map((a) => a.name)
-          .join(", ")}`,
-      );
+    if (!names.includes(name)) {
+      throw new Error(`Unknown agent "${name}" in MCP_AGENTS. Valid agents: ${names.join(", ")}`);
     }
   }
-  const set = new Set(requested);
-  return allAdapters().filter((a) => set.has(a.name));
+  return all.filter((a) => requested.has(a.name));
 }
 
 /**
@@ -187,7 +181,7 @@ export async function checkAvailability(
   }
 
   const probeArgs = adapter.probeArgs ?? ["--version"];
-  let outcome: { stdout: string; stderr: string; exitCode: number | null };
+  let outcome: ExecResult;
   try {
     // Same credential isolation as a real run: a probe spawns the CLI, so it
     // must not hand it a sibling agent's key either.
