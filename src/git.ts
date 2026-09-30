@@ -1,4 +1,5 @@
-import type { Exec } from "./exec.js";
+import { stripAnsi } from "./ansi.js";
+import type { Exec, ExecResult } from "./exec.js";
 
 // Routes git AND file reads through the injected Exec — no direct process
 // spawning and no node:fs, keeping this module free of I/O side effects (C1).
@@ -52,6 +53,30 @@ function git(exec: Exec, cwd: string, subcommand: string[]): ReturnType<Exec> {
   return exec("git", hardenedGitArgs(subcommand), { cwd, env: GIT_HARDENING_ENV });
 }
 
+/**
+ * Throw on a non-zero exit. Exec RESOLVES (does not reject) on a non-zero exit,
+ * so an unchecked failed capture would come back as empty stdout and read
+ * downstream as "no changes" — fail closed instead.
+ */
+function assertExitOk(result: ExecResult, subcommand: string[]): void {
+  if (result.exitCode !== 0) {
+    // stderr reaches the MCP response unfenced and may carry attacker-controlled
+    // text (hostile .git/config values), so strip escapes and collapse to one line.
+    const cleaned = stripAnsi(result.stderr).replace(/\s+/g, " ").trim();
+    const detail = cleaned.length > 300 ? `${cleaned.slice(0, 300)}…` : cleaned;
+    throw new Error(
+      `git ${subcommand[0]} exited ${result.exitCode}${detail.length > 0 ? `: ${detail}` : ""}`,
+    );
+  }
+}
+
+/** `git()` that throws on a non-zero exit (see `assertExitOk`). */
+async function gitChecked(exec: Exec, cwd: string, subcommand: string[]): Promise<ExecResult> {
+  const result = await git(exec, cwd, subcommand);
+  assertExitOk(result, subcommand);
+  return result;
+}
+
 /** Diff args with the external-diff and textconv execution vectors disabled. */
 function diffArgs(...rest: string[]): string[] {
   return ["diff", "--no-ext-diff", "--no-textconv", ...rest];
@@ -88,7 +113,7 @@ export async function isGitRepo(exec: Exec, cwd: string): Promise<boolean> {
 }
 
 export async function worktreeDirty(exec: Exec, cwd: string): Promise<boolean> {
-  const result = await git(exec, cwd, ["status", "--porcelain"]);
+  const result = await gitChecked(exec, cwd, ["status", "--porcelain"]);
   return result.stdout.length > 0;
 }
 
@@ -131,12 +156,36 @@ export async function captureChange(
   /** True when more than MAX_UNTRACKED_FILES exist; the overflow is not read. */
   untrackedTruncated: boolean;
 }> {
-  const statResult = await git(exec, cwd, diffArgs("--stat", "HEAD"));
-  const diffResult = await git(exec, cwd, diffArgs("HEAD"));
+  // Resolve the diff base. `git diff HEAD` exits 128 when HEAD is unborn (no
+  // commits yet), which would silently drop staged files, so diff against the
+  // empty tree instead. Every other non-zero exit throws: Exec resolves on a
+  // non-zero exit and a silent empty capture would read as "no changes". Plain
+  // HEAD (no ^{commit} peel) is deliberate: the peel also exits 1 for a corrupt
+  // ref pointing at a missing object, which must fail closed, not read as unborn.
+  const headArgs = ["rev-parse", "--verify", "--quiet", "HEAD"];
+  const head = await git(exec, cwd, headArgs);
+  let base = "HEAD";
+  if (head.exitCode === 1) {
+    const emptyTree = await gitChecked(exec, cwd, [
+      "hash-object",
+      "-t",
+      "tree",
+      "--no-filters",
+      "/dev/null",
+    ]);
+    base = emptyTree.stdout.trim();
+  } else {
+    assertExitOk(head, headArgs);
+  }
+
+  // `--` ends revisions: a runner-created file named like the base (e.g. `HEAD`)
+  // must not make the argument ambiguous and deny every review.
+  const statResult = await gitChecked(exec, cwd, diffArgs("--stat", base, "--"));
+  const diffResult = await gitChecked(exec, cwd, diffArgs(base, "--"));
   // `-z`: NUL-delimited, verbatim paths. Splitting on "\n" + trim would drop or
   // corrupt filenames containing newlines/leading/trailing whitespace, letting a
   // runner hide a payload file from the review.
-  const untrackedResult = await git(exec, cwd, [
+  const untrackedResult = await gitChecked(exec, cwd, [
     "ls-files",
     "--others",
     "--exclude-standard",
