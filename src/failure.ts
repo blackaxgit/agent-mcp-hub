@@ -51,7 +51,20 @@ export interface FailureClassification {
 }
 
 /** Upstream-overload markers — checked FIRST so they never become auth. */
-const BUSY_PHRASES = ["rate limit", "429", "overloaded", "try again later", "503", "server busy"];
+const BUSY_PHRASES = [
+  "rate limit",
+  "too many requests",
+  "overloaded",
+  "try again later",
+  "service unavailable",
+  "server busy",
+];
+
+// A bare status code only counts when it follows an HTTP/status context, so line numbers and ids
+// never match. The anchor word must not be glued to a preceding letter ("unicode 429" is not
+// "code 429"), while `"error_code":429` still matches; "HTTP/1.1 429" and "status (429)" are covered.
+const BUSY_STATUS_RE =
+  /(?<![a-z])(?:http(?:\/[\d.]+)?|status|code|error)[\s:="'([]{0,4}(?:429|503)\b/;
 
 /**
  * High-confidence, adapter-specific auth phrases (R10). Only these trigger
@@ -222,7 +235,7 @@ function classifyResult(adapter: AdapterMeta, result: ExecResult): FailureClassi
   const text = normalize(`${result.stderr}\n${result.stdout}`);
 
   // 1. Overload first: these must never be read as auth.
-  if (BUSY_PHRASES.some((p) => text.includes(p))) {
+  if (BUSY_PHRASES.some((p) => text.includes(p)) || BUSY_STATUS_RE.test(text)) {
     return {
       code: "server_busy",
       message:

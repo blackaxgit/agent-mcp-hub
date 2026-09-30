@@ -220,6 +220,32 @@ describe("classifyFailure — result branch (exit != 0)", () => {
     expect(c.code).toBe("server_busy");
   });
 
+  it.each([
+    "unexpected status 503 Service Unavailable",
+    'API Error: 429 {"type":"rate_limit_error"}',
+    '{"status":503}',
+  ])("busy status in context %j -> server_busy", (stderr) => {
+    const c = classifyFailure(codex, { result: res(stderr, "", 1) });
+    expect(c.code).toBe("server_busy");
+  });
+
+  it.each(["HTTP/1.1 429", "HTTP/2 503", "status (429)", '{"error_code":429}'])(
+    "busy status variant %j -> server_busy",
+    (stderr) => {
+      const c = classifyFailure(codex, { result: res(stderr, "", 1) });
+      expect(c.code).toBe("server_busy");
+    },
+  );
+
+  it.each([
+    "Type error in src/file.ts:1429",
+    "src/app.ts:503: unexpected token",
+    "unicode 429 chars",
+  ])("bare 429/503 inside a line number %j is NOT server_busy", (stderr) => {
+    const c = classifyFailure(codex, { result: res(stderr, "", 1) });
+    expect(c.code).toBe("tool_failure");
+  });
+
   it("generic 'boom' exit 2 -> tool_failure with (exit 2) and boom", () => {
     const c = classifyFailure(codex, { result: res("boom", "", 2) });
     expect(c.code).toBe("tool_failure");
